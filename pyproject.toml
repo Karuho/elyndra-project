@@ -1,0 +1,71 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "elyndra"
+version = "0.8.9-alpha"
+description = "Local-first personal intelligence framework"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "PolyForm-Noncommercial-1.0.0"
+license-files = [
+  "LICENSE",
+  "NOTICE.md",
+]
+authors = [
+  { name = "Carlos" }
+]
+keywords = ["local-first", "personal-agent", "privacy", "offline", "assistant"]
+classifiers = [
+  "Development Status :: 2 - Pre-Alpha",
+  "Environment :: Console",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
+  "Topic :: Home Automation",
+  "Topic :: Software Development :: Libraries :: Application Frameworks",
+]
+dependencies = [
+  "argon2-cffi>=23.1,<26",
+  "cryptography>=42,<47",
+]
+
+[project.optional-dependencies]
+documents = [
+  "pypdf>=5,<7",
+  "PyYAML>=6,<7",
+]
+dev = [
+  "pytest>=8,<10",
+  "ruff>=0.9,<1",
+  "pypdf>=5,<7",
+  "PyYAML>=6,<7",
+]
+
+[project.scripts]
+elyndra = "elyndra.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+"elyndra.web.static" = ["*.html", "*.css", "*.js"]
+"elyndra.resources" = ["*.json", "*.jsonl"]
+
+[tool.pytest.ini_options]
+addopts = "-q"
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]

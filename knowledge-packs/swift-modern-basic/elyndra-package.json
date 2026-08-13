@@ -1,0 +1,25 @@
+{
+  "schema_version": 1,
+  "package_id": "programming.swift.modern-basic",
+  "name": "Swift moderno — Base práctica y verificable",
+  "version": "1.0.0",
+  "tier": "optional",
+  "domain": "programming/swift",
+  "language": "es",
+  "license_id": "CC0-1.0",
+  "publisher": "Proyecto Elyndra",
+  "tags": [
+    "swift",
+    "swiftpm",
+    "xcode",
+    "swift-format",
+    "testing"
+  ],
+  "sources": [
+    {
+      "path": "swift-modern-basic.md",
+      "title": "Swift moderno — Base práctica y verificable",
+      "sha256": "853874bb4bc002c2701039afce3924a4ea5a533c6d82a41c9103427369092c23"
+    }
+  ]
+}

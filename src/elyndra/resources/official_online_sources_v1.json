@@ -1,0 +1,20 @@
+{
+  "descriptor_version": 1,
+  "sources": [
+    {
+      "source_id": "elyndra-official-language-packs",
+      "trust_class": "official-pinned",
+      "display_name": "Elyndra official language packs",
+      "repository": "Karuho/elyndra-language-packs",
+      "release_tag": "spanish-core-2026.08.01-r1",
+      "bundle_id": "elyndra-es-core",
+      "bundle_version": "2026.08.01-r1",
+      "manifest_url": "https://github.com/Karuho/elyndra-language-packs/releases/download/spanish-core-2026.08.01-r1/elyndra-es-core-2026.08.01-r1.bundle.json",
+      "manifest_size": 5009,
+      "manifest_sha256": "b45b0aecb2c32ff5c94ad04143f90c43ff46698e6dbccbca31645c1c60f009db",
+      "bundle_content_sha256": "7253976778a27aa3eea81934bf4b897bcf0e57806bc31361a5fd8bf13e2d1bde",
+      "compatibility": ">=0.8.8a0,<0.9.0a0",
+      "enabled": true
+    }
+  ]
+}

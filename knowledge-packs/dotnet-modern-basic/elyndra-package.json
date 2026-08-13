@@ -1,0 +1,25 @@
+{
+  "schema_version": 1,
+  "package_id": "programming.dotnet.modern-basic",
+  "name": "C# y .NET modernos — Base práctica y verificable",
+  "version": "1.0.0",
+  "tier": "optional",
+  "domain": "programming/dotnet",
+  "language": "es",
+  "license_id": "CC0-1.0",
+  "publisher": "Proyecto Elyndra",
+  "tags": [
+    "csharp",
+    "dotnet",
+    "msbuild",
+    "nuget",
+    "testing"
+  ],
+  "sources": [
+    {
+      "path": "dotnet-modern-basic.md",
+      "title": "C# y .NET modernos — Base práctica y verificable",
+      "sha256": "0f00a0db0f33606dfee7b9b2331ac6899241916de71387dac68d18f60ae78f9b"
+    }
+  ]
+}

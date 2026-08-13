@@ -1,0 +1,304 @@
+{
+  "package_id": "elyndra.first-aid.core-v1",
+  "version": "1.2.0",
+  "reviewed_on": "2026-07-31",
+  "scope": "Deterministic starter first-aid cards for immediate actions during the first minutes while emergency or poison professionals are being contacted.",
+  "complete_manual": false,
+  "network_required": false,
+  "model_required": false,
+  "sources": [
+    {
+      "title": "American Red Cross — First Aid Steps",
+      "url": "https://www.redcross.org/take-a-class/first-aid/performing-first-aid/first-aid-steps"
+    },
+    {
+      "title": "American Red Cross — Life-Threatening External Bleeding",
+      "url": "https://www.redcross.org/take-a-class/resources/learn-first-aid/bleeding-life-threatening-external"
+    },
+    {
+      "title": "American College of Surgeons — Stop the Bleed",
+      "url": "https://www.stopthebleed.org/"
+    },
+    {
+      "title": "American Red Cross — CPR Steps",
+      "url": "https://www.redcross.org/take-a-class/cpr/performing-cpr/cpr-steps"
+    },
+    {
+      "title": "American Red Cross — Adult and Child Choking",
+      "url": "https://www.redcross.org/take-a-class/resources/learn-first-aid/adult-child-choking"
+    },
+    {
+      "title": "American Red Cross — Burns",
+      "url": "https://www.redcross.org/take-a-class/resources/learn-first-aid/burns"
+    },
+    {
+      "title": "Poison Control — First Aid for Poisonings",
+      "url": "https://www.poison.org/first-aid-for-poisonings"
+    },
+    {
+      "title": "American Red Cross — Respiratory Distress (Trouble Breathing)",
+      "url": "https://www.redcross.org/take-a-class/resources/learn-first-aid/respiratory-distress-trouble-breathing"
+    },
+    {
+      "title": "NHS — First aid and choking",
+      "url": "https://www.nhs.uk/tests-and-treatments/first-aid/"
+    }
+  ],
+  "topics": [
+    {
+      "id": "severe_bleeding",
+      "aliases": [
+        "desangramiento",
+        "hemorragia",
+        "sangrado grave",
+        "sangra mucho",
+        "me desangro"
+      ],
+      "title": {
+        "es": "Sangrado grave",
+        "en": "Severe bleeding"
+      },
+      "summary": {
+        "es": "Actúa mientras otra persona llama a emergencias. La presión directa continua es la prioridad.",
+        "en": "Act while another person calls emergency services. Continuous direct pressure is the priority."
+      },
+      "steps": {
+        "es": [
+          "Presiona AHORA directamente sobre la herida con fuerza usando gasa, tela limpia o la mano protegida. No levantes el material para mirar.",
+          "Mientras mantienes la presión, pide a otra persona que llame a emergencias. Si estás solo, activa el altavoz y llama sin soltar la presión.",
+          "Mantén presión continua. Si el material se empapa, coloca más encima sin retirar la primera capa.",
+          "Si es una herida profunda y sabes hacerlo, rellénala con gasa o tela limpia y continúa presionando.",
+          "Para sangrado potencialmente mortal de un brazo o pierna que no cede, usa un torniquete comercial si está disponible y sabes aplicarlo: colócalo entre la herida y el corazón, unos 5 a 7 cm por encima, nunca sobre una articulación; aprieta hasta detener el sangrado, anota la hora y no lo retires.",
+          "Mantén a la persona recostada y abrigada, vigila respiración y estado de conciencia y continúa hasta que llegue ayuda."
+        ],
+        "en": [
+          "Press NOW directly and firmly over the wound using gauze, clean cloth, or a protected hand. Do not lift the material to check.",
+          "While maintaining pressure, ask someone else to call emergency services. If alone, use speakerphone and call without releasing pressure.",
+          "Keep continuous pressure. If material soaks through, add more on top without removing the first layer.",
+          "For a deep wound, pack it with gauze or clean cloth only if you know how, then keep pressing.",
+          "For life-threatening arm or leg bleeding that does not stop, use a commercial tourniquet if available and you know how: place it between the wound and the heart, about 2 to 3 inches above the wound, never over a joint; tighten until bleeding stops, note the time, and do not remove it.",
+          "Keep the person lying down and warm, monitor breathing and responsiveness, and continue until help arrives."
+        ]
+      },
+      "avoid": {
+        "es": [
+          "No retires objetos incrustados; presiona alrededor.",
+          "No interrumpas la presión para revisar repetidamente."
+        ],
+        "en": [
+          "Do not remove embedded objects; press around them.",
+          "Do not repeatedly stop pressure to check."
+        ]
+      }
+    },
+    {
+      "id": "unresponsive_not_breathing",
+      "aliases": [
+        "no respira",
+        "inconsciente",
+        "paro cardiaco",
+        "no responde"
+      ],
+      "title": {
+        "es": "Persona inconsciente que no respira normalmente",
+        "en": "Unresponsive person not breathing normally"
+      },
+      "summary": {
+        "es": "Llama a emergencias, consigue un DEA y comienza compresiones de inmediato.",
+        "en": "Call emergency services, get an AED, and start compressions immediately."
+      },
+      "steps": {
+        "es": [
+          "Comprueba seguridad, respuesta y respiración. Si no responde y no respira o solo jadea, llama a emergencias y pide un DEA.",
+          "Acuéstala boca arriba sobre una superficie firme.",
+          "Coloca dos manos en el centro del pecho y realiza compresiones fuertes y rápidas, entre 100 y 120 por minuto y de al menos 5 cm en un adulto, dejando que el pecho vuelva a subir.",
+          "Continúa las compresiones y sigue las instrucciones del DEA en cuanto llegue. No te detengas salvo que respire normalmente, llegue ayuda o la escena sea insegura."
+        ],
+        "en": [
+          "Check scene safety, responsiveness, and breathing. If unresponsive and not breathing or only gasping, call emergency services and get an AED.",
+          "Place the person on their back on a firm surface.",
+          "Put two hands in the center of the chest and give hard, fast compressions at 100 to 120 per minute and at least 2 inches deep for an adult, allowing full chest recoil.",
+          "Continue compressions and follow the AED prompts when it arrives. Stop only if normal breathing returns, help takes over, or the scene becomes unsafe."
+        ]
+      },
+      "avoid": {
+        "es": [
+          "No retrases las compresiones esperando una respuesta del asistente."
+        ],
+        "en": [
+          "Do not delay compressions while waiting for an assistant response."
+        ]
+      }
+    },
+    {
+      "id": "choking_adult_child",
+      "aliases": [
+        "se ahoga",
+        "atragantamiento",
+        "no puede respirar por comida",
+        "asfixia por objeto",
+        "me atraganto",
+        "me estoy atragantando"
+      ],
+      "title": {
+        "es": "Atragantamiento en adulto o niño consciente",
+        "en": "Choking in a conscious adult or child"
+      },
+      "summary": {
+        "es": "Si no puede toser, hablar o respirar, llama a emergencias y alterna golpes en la espalda con compresiones abdominales.",
+        "en": "If they cannot cough, speak, or breathe, call emergency services and alternate back blows with abdominal thrusts."
+      },
+      "steps": {
+        "es": [
+          "Pide a alguien que llame a emergencias. Si la persona puede toser con fuerza, anímala a seguir tosiendo.",
+          "Si no puede toser, hablar o respirar, da 5 golpes firmes entre los omóplatos con el talón de la mano.",
+          "Si no mejora, da 5 compresiones abdominales hacia adentro y arriba.",
+          "Alterna 5 golpes y 5 compresiones hasta expulsar el objeto o hasta que pierda la conciencia.",
+          "Si pierde la conciencia, bájala con cuidado, comienza RCP y usa un DEA cuando esté disponible."
+        ],
+        "en": [
+          "Ask someone to call emergency services. If the person can cough forcefully, encourage coughing.",
+          "If unable to cough, speak, or breathe, give 5 firm back blows between the shoulder blades.",
+          "If there is no improvement, give 5 inward-and-upward abdominal thrusts.",
+          "Alternate 5 back blows and 5 thrusts until the object comes out or the person becomes unresponsive.",
+          "If unresponsive, lower them carefully, start CPR, and use an AED when available."
+        ]
+      },
+      "avoid": {
+        "es": [
+          "No hagas un barrido ciego con los dedos dentro de la boca."
+        ],
+        "en": [
+          "Do not perform a blind finger sweep inside the mouth."
+        ]
+      }
+    },
+    {
+      "id": "thermal_burn",
+      "aliases": [
+        "quemadura",
+        "me queme",
+        "se quemo",
+        "agua hirviendo"
+      ],
+      "title": {
+        "es": "Quemadura térmica",
+        "en": "Thermal burn"
+      },
+      "summary": {
+        "es": "Enfría la quemadura con agua corriente fresca y busca evaluación urgente si es extensa, profunda o afecta zonas críticas.",
+        "en": "Cool the burn with cool running water and seek urgent assessment if it is extensive, deep, or affects critical areas."
+      },
+      "steps": {
+        "es": [
+          "Aparta a la persona de la fuente de calor y retira joyas o ropa no adherida.",
+          "Enfría con agua corriente fresca durante unos 20 minutos. No uses hielo.",
+          "Cubre de forma suelta con una tela limpia o apósito no adherente.",
+          "Llama a emergencias por dificultad respiratoria, quemaduras eléctricas o químicas, o quemaduras profundas, extensas o en cara, manos, pies o genitales."
+        ],
+        "en": [
+          "Move the person away from the heat source and remove jewelry or clothing that is not stuck.",
+          "Cool with cool running water for about 20 minutes. Do not use ice.",
+          "Cover loosely with a clean cloth or non-stick dressing.",
+          "Call emergency services for breathing difficulty, electrical or chemical burns, or burns that are deep, extensive, or involve the face, hands, feet, or genitals."
+        ]
+      },
+      "avoid": {
+        "es": [
+          "No apliques hielo, mantequilla, pasta dental ni remedios caseros."
+        ],
+        "en": [
+          "Do not apply ice, butter, toothpaste, or home remedies."
+        ]
+      }
+    },
+    {
+      "id": "poison_or_corrosive_exposure",
+      "aliases": [
+        "veneno",
+        "intoxicacion",
+        "acido",
+        "quimico ingerido",
+        "corrosivo"
+      ],
+      "title": {
+        "es": "Exposición a veneno o sustancia corrosiva",
+        "en": "Poison or corrosive exposure"
+      },
+      "summary": {
+        "es": "Llama a emergencias o al centro toxicológico local. No provoques el vómito.",
+        "en": "Call emergency services or your local poison center. Do not induce vomiting."
+      },
+      "steps": {
+        "es": [
+          "Si la persona colapsa, convulsiona, tiene dificultad para respirar o no despierta, llama a emergencias inmediatamente.",
+          "No provoques el vómito y no des remedios, carbón activado ni neutralizantes salvo indicación profesional específica.",
+          "Si fue inhalado, sal a aire fresco sin exponerte. Si cayó en ojos o piel, retira ropa contaminada y enjuaga con abundante agua durante al menos 15 minutos.",
+          "Conserva el envase o nombre del producto y llama al centro toxicológico o emergencias mientras realizas las medidas inmediatas."
+        ],
+        "en": [
+          "If the person collapses, has a seizure, has trouble breathing, or cannot be awakened, call emergency services immediately.",
+          "Do not induce vomiting and do not give home remedies, activated charcoal, or neutralizers unless a professional specifically instructs you.",
+          "For inhalation, move to fresh air without exposing yourself. For eye or skin exposure, remove contaminated clothing and rinse with plenty of water for at least 15 minutes.",
+          "Keep the container or product name and call a poison center or emergency services while taking the immediate steps."
+        ]
+      },
+      "avoid": {
+        "es": [
+          "No esperes síntomas para pedir orientación especializada."
+        ],
+        "en": [
+          "Do not wait for symptoms before getting specialist guidance."
+        ]
+      }
+    },
+    {
+      "id": "breathing_emergency",
+      "aliases": [
+        "me ahogo",
+        "me estoy ahogando",
+        "no puedo respirar",
+        "me falta el aire",
+        "dificultad para respirar",
+        "me asfixio",
+        "respira con dificultad"
+      ],
+      "title": {
+        "es": "Dificultad grave para respirar",
+        "en": "Severe trouble breathing"
+      },
+      "summary": {
+        "es": "Llama a emergencias ahora, usa el altavoz y actúa según la causa visible sin retrasar la llamada.",
+        "en": "Call emergency services now, use speakerphone, and act on the visible cause without delaying the call."
+      },
+      "steps": {
+        "es": [
+          "Llama ahora a emergencias y activa el altavoz. Si hay humo, gas, agua u otro peligro, aléjate solo si puedes hacerlo sin ponerte en mayor riesgo.",
+          "Si estás consciente, siéntate erguido o adopta la posición en la que respires mejor y afloja ropa apretada.",
+          "Si puedes toser o hablar y hay algo atorado, sigue tosiendo. Si no puedes toser, hablar ni respirar, usa de inmediato la tarjeta de atragantamiento: 5 golpes en la espalda y 5 compresiones abdominales.",
+          "Usa únicamente tu medicación de rescate prescrita, como un inhalador, siguiendo tu pauta habitual; no uses medicamentos de otra persona.",
+          "Si la persona pierde la conciencia y no respira normalmente, comienza RCP y usa un DEA en cuanto esté disponible."
+        ],
+        "en": [
+          "Call emergency services now and use speakerphone. If smoke, gas, water, or another hazard is present, move away only if you can do so without creating more danger.",
+          "If conscious, sit upright or use the position that makes breathing easiest and loosen tight clothing.",
+          "If you can cough or speak and something is stuck, keep coughing. If you cannot cough, speak, or breathe, immediately use the choking steps: 5 back blows and 5 abdominal thrusts.",
+          "Use only your own prescribed rescue medication, such as an inhaler, according to your usual instructions; do not use another person’s medication.",
+          "If the person becomes unresponsive and is not breathing normally, start CPR and use an AED as soon as available."
+        ]
+      },
+      "avoid": {
+        "es": [
+          "No comas ni bebas mientras te cuesta respirar.",
+          "No introduzcas los dedos a ciegas en la boca.",
+          "No esperes una respuesta del modelo antes de llamar."
+        ],
+        "en": [
+          "Do not eat or drink while breathing is difficult.",
+          "Do not perform a blind finger sweep in the mouth.",
+          "Do not wait for a model response before calling."
+        ]
+      }
+    }
+  ]
+}

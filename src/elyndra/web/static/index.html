@@ -1,0 +1,1099 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <meta name="elyndra-token" content="__ELYNDRA_TOKEN__">
+  <title>Elyndra __ELYNDRA_VERSION__ · Agente local</title>
+  <link rel="stylesheet" href="/assets/app.css">
+  <script src="/assets/app.js" defer></script>
+</head>
+<body>
+  <section class="auth-screen" id="auth-screen">
+    <div class="auth-card">
+      <div class="dialog-brand">ELYNDRA</div>
+      <h1 id="auth-title">Bienvenido a Elyndra</h1>
+      <p id="auth-copy">Inicia sesión o registra una cuenta local aislada en esta instalación.</p>
+      <div class="auth-tabs">
+        <button class="active" id="auth-tab-login" type="button">Iniciar sesión</button>
+        <button id="auth-tab-register" type="button">Registrarse</button>
+      </div>
+      <form class="auth-form" id="login-form">
+        <label>Usuario o correo<input id="login-name" autocomplete="username" required></label>
+        <label>Contraseña<input id="login-password" type="password" autocomplete="current-password" required></label>
+        <button class="primary-button" type="submit">Iniciar sesión</button>
+      </form>
+      <form class="auth-form" id="register-form" hidden>
+        <div class="dialog-grid">
+          <label>Nombre de usuario<input id="register-username" autocomplete="username" minlength="3" maxlength="32" required></label>
+          <label>Correo<input id="register-email" type="email" autocomplete="email" required></label>
+        </div>
+        <div class="dialog-grid">
+          <label>Contraseña<input id="register-password" type="password" autocomplete="new-password" minlength="8" maxlength="64" required></label>
+          <label>Confirmar contraseña<input id="register-password-confirmation" type="password" autocomplete="new-password" minlength="8" maxlength="64" required></label>
+        </div>
+        <p class="form-help">Contraseña: 8–64 caracteres, al menos una letra, un número y un carácter especial. La mayúscula es recomendable, no obligatoria.</p>
+        <label>Fecha de nacimiento<input id="register-birth-date" type="date" autocomplete="bday" required></label>
+        <p class="form-help">Debes ser mayor de edad. La edad se calcula localmente y no se envía.</p>
+        <label>¿Cómo quieres que te llame? <span class="optional">opcional</span><input id="register-preferred-name" maxlength="80"></label>
+        <label class="consent-row"><input id="register-developer-mode" type="checkbox"><span><strong>Modo desarrollador</strong><small>Muestra Alejandría, Control, runtime y herramientas avanzadas. Quien lo activa asume responsabilidad por cambios técnicos.</small></span></label>
+        <label class="consent-row"><input id="register-telemetry" type="checkbox"><span><strong>Ayudar a mejorar Elyndra</strong><small>Comparte métricas generales y anónimas de uso. Nunca conversaciones, búsquedas, archivos, memoria, secretos, correo, salud ni identidad sensible.</small></span></label>
+        <p class="privacy-brief">La telemetría es opcional y permanece desactivada si no marcas la casilla. Puedes cambiarla después en Perfil → Privacidad.</p>
+        <details class="privacy-details">
+          <summary>Ver detalles de privacidad</summary>
+          <p>La vista previa puede incluir versión, interfaz, categoría general, duración por rango y rango etario. Nunca incluye conversaciones, búsquedas, correo, fecha de nacimiento, identidad, orientación, salud, archivos, secretos, memoria o conocimiento personal. En esta versión no existe envío por red.</p>
+        </details>
+        <label class="consent-row"><input id="register-approve" type="checkbox" required><span>Acepto crear la cuenta local, confirmo que soy mayor de edad y comprendo que mis datos locales permanecen bajo mi responsabilidad.</span></label>
+        <button class="primary-button" type="submit">Crear cuenta local</button>
+      </form>
+      <p class="auth-note">Las contraseñas se protegen con Argon2id. El respaldo remoto aún no está activo.</p>
+    </div>
+  </section>
+
+  <div class="app-shell" id="app-shell" hidden>
+    <aside class="sidebar" id="sidebar">
+      <div class="sidebar-head">
+        <button class="icon-button mobile-only" id="close-sidebar" type="button" aria-label="Cerrar historial">×</button>
+        <a class="mini-brand" href="/" aria-label="Ir al inicio de Elyndra">
+          <div>
+            <strong>Elyndra <span class="brand-version">__ELYNDRA_VERSION__</span></strong>
+            <small>asistente personal local</small>
+          </div>
+        </a>
+        <div class="connection-mode" aria-label="Modo de conexión">
+          <button class="connection-option active" id="connection-local" type="button" aria-pressed="true">Local</button>
+          <button class="connection-option" id="connection-online" type="button" aria-pressed="false">Online</button>
+        </div>
+        <button class="new-chat-button" id="new-chat" type="button">
+          <span aria-hidden="true">＋</span>
+          Nuevo chat
+        </button>
+        <button class="memory-button" id="open-memory" type="button">
+          <span aria-hidden="true">◇</span>
+          <span>Memoria</span>
+          <span class="memory-badge" id="memory-badge" hidden>0</span>
+        </button>
+        <button class="memory-button" id="open-alexandria" type="button" data-developer-technical hidden>
+          <span aria-hidden="true">▤</span>
+          <span>Alejandría</span>
+          <span class="memory-badge" id="alexandria-badge" hidden>0</span>
+        </button>
+        <button class="memory-button" id="open-personal" type="button">
+          <span aria-hidden="true">◉</span>
+          <span>Personal</span>
+        </button>
+        <button class="memory-button" id="open-profile" type="button">
+          <span aria-hidden="true">◎</span>
+          <span>Perfil</span>
+        </button>
+        <button class="memory-button" id="open-control" type="button" data-developer-technical hidden>
+          <span aria-hidden="true">⚙</span>
+          <span>Control</span>
+        </button>
+      </div>
+
+      <section class="pinned-section" id="pinned-section" hidden>
+        <div class="pinned-label">
+          <span>Anclados</span>
+          <span id="pinned-count">0/5</span>
+        </div>
+        <nav class="pinned-list" id="pinned-list" aria-label="Conversaciones ancladas"></nav>
+      </section>
+
+      <div class="history-label">
+        <select id="history-filter" aria-label="Filtrar conversaciones">
+          <option value="active">Historial</option>
+          <option value="archived">Archivados</option>
+        </select>
+        <div class="history-tools">
+          <span id="chat-count">0</span>
+          <button class="history-search-button" id="toggle-chat-search" type="button" aria-label="Buscar conversaciones" aria-expanded="false">⌕</button>
+        </div>
+      </div>
+      <label class="search-box compact-search" id="chat-search-box" for="chat-search" hidden>
+        <input id="chat-search" type="search" placeholder="Buscar conversaciones" autocomplete="off">
+      </label>
+      <nav class="chat-list" id="chat-list" aria-label="Conversaciones"></nav>
+
+      <div class="sidebar-foot">
+        <button class="sidebar-account-button" id="sidebar-account-button" type="button"
+          aria-haspopup="menu" aria-expanded="false">
+          <span class="sidebar-account-avatar" id="sidebar-account-avatar" aria-hidden="true">U</span>
+          <span class="sidebar-account-copy">
+            <strong id="sidebar-account-name">Usuario</strong>
+            <small id="sidebar-account-mode">Cuenta local</small>
+          </span>
+          <span class="sidebar-account-more" aria-hidden="true">⋯</span>
+        </button>
+      </div>
+    </aside>
+
+    <main class="main-panel">
+      <header class="topbar">
+        <button class="icon-button mobile-only" id="open-sidebar" type="button" aria-label="Abrir historial">☰</button>
+        <div class="chat-heading">
+          <h1 id="chat-title">Nuevo chat</h1>
+          <p id="chat-subtitle">Privado · local · bajo tu control</p>
+        </div>
+        <button class="quiet-button" id="rename-chat" type="button" disabled hidden>Renombrar chat</button>
+        <button class="icon-button" id="chat-actions" type="button" aria-label="Más acciones del chat" disabled hidden>⋯</button>
+      </header>
+
+      <section class="conversation" id="conversation" aria-live="polite">
+        <div class="welcome" id="welcome">
+          <pre class="ascii-logo" aria-label="Elyndra">
+███████╗██╗  ██╗   ██╗███╗   ██╗██████╗ ██████╗  █████╗
+██╔════╝██║  ╚██╗ ██╔╝████╗  ██║██╔══██╗██╔══██╗██╔══██╗
+█████╗  ██║   ╚████╔╝ ██╔██╗ ██║██║  ██║██████╔╝███████║
+██╔══╝  ██║    ╚██╔╝  ██║╚██╗██║██║  ██║██╔══██╗██╔══██║
+███████╗███████╗██║   ██║ ╚████║██████╔╝██║  ██║██║  ██║
+╚══════╝╚══════╝╚═╝   ╚═╝  ╚═══╝╚═════╝ ╚═╝  ╚═╝╚═╝  ╚═╝</pre>
+          <p class="welcome-kicker">Agente personal local-first</p>
+          <h2 id="welcome-title">¿En qué trabajamos hoy?</h2>
+          <p class="welcome-copy">
+            Tus chats, recuerdos y documentos permanecen en tu equipo. Elyndra solo recupera el contexto necesario para cada respuesta.
+          </p>
+        </div>
+      </section>
+
+      <section class="inspector" id="inspector" hidden>
+        <div class="inspector-shell">
+          <header class="inspector-intro">
+            <div>
+              <p class="inspector-kicker">Memoria jerárquica local</p>
+              <h2>El cerebro visible de Elyndra</h2>
+              <p>Revisa qué recuerda, qué propone conservar y qué acciones ha realizado. Nada de esta vista sale de tu equipo.</p>
+            </div>
+            <button class="quiet-button" id="refresh-inspector" type="button">Actualizar</button>
+          </header>
+
+          <div class="overview-grid" id="overview-grid"></div>
+
+          <nav class="inspector-tabs" id="inspector-tabs" aria-label="Secciones de memoria">
+            <button class="active" type="button" data-view="overview">Resumen</button>
+            <button type="button" data-view="memories">Memorias</button>
+            <button type="button" data-view="episodes">Episodios</button>
+            <button type="button" data-view="proposals">Propuestas</button>
+            <button type="button" data-view="corrections">Correcciones</button>
+            <button type="button" data-view="documents">Conocimiento</button>
+            <button type="button" data-view="attachments">Adjuntos</button>
+            <button type="button" data-view="archives">Archivos fríos</button>
+            <button type="button" data-view="audit">Auditoría</button>
+          </nav>
+
+          <div class="inspector-toolbar" id="inspector-toolbar" hidden>
+            <label class="inspector-search" for="inspector-search">
+              <span aria-hidden="true">⌕</span>
+              <input id="inspector-search" type="search" placeholder="Buscar en esta sección" autocomplete="off">
+            </label>
+            <select id="inspector-filter" aria-label="Filtrar sección" hidden></select>
+          </div>
+
+          <div class="inspector-content" id="inspector-content"></div>
+        </div>
+      </section>
+
+      <section class="alexandria" id="alexandria" hidden>
+        <div class="alexandria-shell">
+          <header class="inspector-intro">
+            <div>
+              <p class="inspector-kicker">Biblioteca local versionada</p>
+              <h2>Alejandría</h2>
+              <p>Organiza fuentes por biblioteca y recupera solo las unidades necesarias. Importar no equivale a aprobar como conocimiento canónico.</p>
+            </div>
+            <button class="primary-button" id="create-library" type="button">Nueva biblioteca</button>
+          </header>
+
+          <div class="overview-grid" id="alexandria-overview"></div>
+
+          <section class="library-panel" data-developer-technical>
+            <div class="section-heading">
+              <div>
+                <h3>Idiomas</h3>
+                <p>Packs lingüísticos compartidos, verificados y de solo lectura.</p>
+              </div>
+            </div>
+            <div class="library-list" id="alexandria-language-packs"></div>
+          </section>
+
+          <div class="alexandria-toolbar">
+            <label class="inspector-search" for="alexandria-search">
+              <span aria-hidden="true">⌕</span>
+              <input id="alexandria-search" type="search" placeholder="Buscar bibliotecas o contenido" autocomplete="off">
+            </label>
+            <button class="quiet-button" id="search-alexandria" type="button">Buscar contenido</button>
+          </div>
+
+          <div class="alexandria-layout">
+            <section class="library-panel">
+              <div class="section-heading">
+                <div>
+                  <h3>Bibliotecas</h3>
+                  <p>Fuentes agrupadas por dominio.</p>
+                </div>
+              </div>
+              <div class="library-list" id="alexandria-libraries"></div>
+            </section>
+            <section class="library-detail" id="alexandria-detail">
+              <div class="empty-inspector">
+                <strong>Selecciona una biblioteca</strong>
+                <span>Podrás revisar sus fuentes, estado y procedencia.</span>
+              </div>
+            </section>
+          </div>
+        </div>
+        <input id="alexandria-file" type="file" hidden
+          accept=".txt,.md,.markdown,.rst,.csv,.json,.toml,.yaml,.yml,.ini,.cfg,.conf,.log,.sql,.py,.php,.js,.mjs,.cjs,.ts,.tsx,.jsx,.html,.htm,.css,.scss,.xml,.sh,.bash,.zsh,.java,.kt,.c,.h,.cpp,.hpp,.cs,.go,.rs,.rb,.pl,.lua,.gradle,.properties,.pdf,.docx,.odt,.pptx,.xlsx">
+      </section>
+
+      <section class="control" id="personal" hidden>
+        <div class="control-shell">
+          <header class="inspector-intro">
+            <div>
+              <p class="inspector-kicker">Organización y bienestar local</p>
+              <h2>Asistente personal</h2>
+              <p>La web y la CLI usan el mismo runtime. Los cambios requieren confirmación explícita y no activan tareas en segundo plano.</p>
+            </div>
+            <button class="quiet-button" id="refresh-personal" type="button">Actualizar</button>
+          </header>
+
+          <div class="overview-grid" id="personal-overview"></div>
+
+          <div class="control-grid">
+            <section class="control-panel">
+              <div class="section-heading"><div><h3>Agenda diaria</h3><p>Compromisos, cumpleaños, rutinas y recordatorios aprobados.</p></div></div>
+              <div class="control-list" id="personal-daily-brief"></div>
+            </section>
+
+            <section class="control-panel">
+              <div class="section-heading"><div><h3>Elementos personales</h3><p>Resumen humano de los registros locales. Los identificadores técnicos solo aparecen en modo desarrollador.</p></div></div>
+              <div class="control-list" id="personal-organizer-items"></div>
+            </section>
+
+            <section class="control-panel">
+              <div class="section-heading"><div><h3>Recordatorios revisados</h3><p>Solo aparecen en agenda; no envían notificaciones.</p></div></div>
+              <div class="control-list" id="personal-reminders"></div>
+            </section>
+
+            <section class="control-panel">
+              <div class="section-heading"><div><h3>Nuevo compromiso</h3><p>Se guarda localmente después de confirmar.</p></div></div>
+              <form class="control-form" id="personal-commitment-form">
+                <label class="wide-field">Título<input id="personal-commitment-title" required autocomplete="off"></label>
+                <label>Fecha<input id="personal-commitment-date" type="date" required></label>
+                <label>Hora<input id="personal-commitment-time" type="time"></label>
+                <label>Prioridad<select id="personal-commitment-priority"><option value="normal">Normal</option><option value="high">Alta</option><option value="critical">Crítica</option><option value="low">Baja</option></select></label>
+                <button class="primary-button wide-field" type="submit">Crear compromiso</button>
+              </form>
+            </section>
+
+            <section class="control-panel">
+              <div class="section-heading"><div><h3>Nueva rutina</h3><p>La recurrencia se calcula bajo demanda.</p></div></div>
+              <form class="control-form" id="personal-routine-form">
+                <label class="wide-field">Título<input id="personal-routine-title" required autocomplete="off"></label>
+                <label>Inicio<input id="personal-routine-date" type="date" required></label>
+                <label>Hora<input id="personal-routine-time" type="time"></label>
+                <label>Recurrencia<select id="personal-routine-recurrence"><option value="daily">Diaria</option><option value="weekly">Semanal</option><option value="monthly">Mensual</option></select></label>
+                <button class="primary-button wide-field" type="submit">Crear rutina</button>
+              </form>
+            </section>
+
+            <section class="control-panel">
+              <div class="section-heading"><div><h3>Check-in de rutina</h3><p>Usa el ID visible de una rutina y una ocurrencia válida.</p></div></div>
+              <form class="control-form" id="personal-routine-checkin-form" data-developer-technical>
+                <label class="wide-field">ID de rutina<input id="personal-routine-checkin-id" required autocomplete="off"></label>
+                <label>Fecha<input id="personal-routine-checkin-date" type="date" required></label>
+                <label>Estado<select id="personal-routine-checkin-status"><option value="completed">Completada</option><option value="skipped">Omitida</option><option value="partial">Parcial</option></select></label>
+                <label class="wide-field">Nota<textarea id="personal-routine-checkin-note" rows="2" maxlength="1000"></textarea></label>
+                <button class="primary-button wide-field" type="submit">Registrar check-in</button>
+              </form>
+            </section>
+
+            <section class="control-panel">
+              <div class="section-heading"><div><h3>Proponer recordatorio</h3><p>La revisión se realiza en un segundo paso.</p></div></div>
+              <form class="control-form" id="personal-reminder-form" data-developer-technical>
+                <label class="wide-field">ID del elemento<input id="personal-reminder-item-id" required autocomplete="off"></label>
+                <label>Minutos antes<input id="personal-reminder-minutes" type="number" min="0" max="43200" required></label>
+                <button class="primary-button wide-field" type="submit">Proponer recordatorio</button>
+              </form>
+              <form class="control-form" id="personal-reminder-review-form" data-developer-technical>
+                <label class="wide-field">ID del recordatorio<input id="personal-reminder-review-id" required autocomplete="off"></label>
+                <label>Decisión<select id="personal-reminder-decision"><option value="approve">Aprobar</option><option value="reject">Rechazar</option></select></label>
+                <button class="primary-button wide-field" type="submit">Revisar recordatorio</button>
+              </form>
+            </section>
+
+            <section class="control-panel">
+              <div class="section-heading"><div><h3>Cumpleaños</h3><p>La fecha permanece en el almacenamiento local.</p></div></div>
+              <form class="control-form" id="personal-birthday-form">
+                <label class="wide-field">Persona<input id="personal-birthday-person" required autocomplete="off"></label>
+                <label>Mes<input id="personal-birthday-month" type="number" min="1" max="12" required></label>
+                <label>Día<input id="personal-birthday-day" type="number" min="1" max="31" required></label>
+                <label>Año opcional<input id="personal-birthday-year" type="number" min="1900" max="2100"></label>
+                <button class="primary-button wide-field" type="submit">Registrar cumpleaños</button>
+              </form>
+            </section>
+
+            <section class="control-panel">
+              <div class="section-heading"><div><h3>Check-in de bienestar</h3><p>Escala 1–5. Es seguimiento orientativo, no diagnóstico.</p></div></div>
+              <form class="control-form" id="personal-wellbeing-form">
+                <label>Fecha<input id="personal-wellbeing-date" type="date" required></label>
+                <label>Ánimo<input id="personal-wellbeing-mood" type="number" min="1" max="5" required></label>
+                <label>Energía<input id="personal-wellbeing-energy" type="number" min="1" max="5" required></label>
+                <label>Estrés<input id="personal-wellbeing-stress" type="number" min="1" max="5" required></label>
+                <label>Concentración<input id="personal-wellbeing-focus" type="number" min="1" max="5" required></label>
+                <label>Horas de sueño<input id="personal-wellbeing-sleep" type="number" min="0" max="24" step="0.25"></label>
+                <label>Actividad (min)<input id="personal-wellbeing-activity" type="number" min="0" max="1440"></label>
+                <label class="wide-field">Nota<textarea id="personal-wellbeing-note" rows="3" maxlength="1200"></textarea></label>
+                <button class="primary-button wide-field" type="submit">Guardar check-in</button>
+              </form>
+            </section>
+
+            <section class="control-panel">
+              <div class="section-heading"><div><h3>Nuevo plan de coaching</h3><p>Acciones explícitas, sin progreso ni intervención automática.</p></div></div>
+              <form class="control-form" id="personal-coaching-form">
+                <label class="wide-field">Título<input id="personal-coaching-title" required autocomplete="off"></label>
+                <label>Foco<input id="personal-coaching-focus" required autocomplete="off"></label>
+                <label>Inicio<input id="personal-coaching-start" type="date" required></label>
+                <label>Revisión<input id="personal-coaching-review" type="date"></label>
+                <label class="wide-field">Objetivo<textarea id="personal-coaching-objective" rows="3" maxlength="1000" required></textarea></label>
+                <label class="wide-field">Acciones, una por línea<textarea id="personal-coaching-actions" rows="4" maxlength="3600" required></textarea></label>
+                <button class="primary-button wide-field" type="submit">Crear plan</button>
+              </form>
+            </section>
+
+            <section class="control-panel">
+              <div class="section-heading"><div><h3>Planes de coaching</h3><p>IDs de plan y acciones para revisión explícita.</p></div></div>
+              <div class="control-list" id="personal-coaching-plans"></div>
+              <form class="control-form" id="personal-coaching-status-form" data-developer-technical>
+                <label class="wide-field">ID del plan<input id="personal-coaching-status-id" required autocomplete="off"></label>
+                <label>Estado<select id="personal-coaching-status"><option value="active">Activo</option><option value="paused">Pausado</option><option value="completed">Completado</option><option value="cancelled">Cancelado</option></select></label>
+                <button class="primary-button wide-field" type="submit">Actualizar plan</button>
+              </form>
+              <form class="control-form" id="personal-coaching-action-form" data-developer-technical>
+                <label class="wide-field">ID de acción<input id="personal-coaching-action-id" required autocomplete="off"></label>
+                <label>Estado<select id="personal-coaching-action-status"><option value="pending">Pendiente</option><option value="completed">Completada</option><option value="skipped">Omitida</option></select></label>
+                <button class="primary-button wide-field" type="submit">Actualizar acción</button>
+              </form>
+            </section>
+
+            <section class="control-panel">
+              <div class="section-heading"><div><h3>Resumen de bienestar</h3><p>Promedios locales de los últimos siete días.</p></div></div>
+              <div class="control-list" id="personal-wellbeing-summary"></div>
+            </section>
+
+            <section class="control-panel">
+              <div class="section-heading"><div><h3>Automatización supervisada</h3><p>Despacho manual en primer plano; sin red, skills, archivos ni notificaciones externas.</p></div></div>
+              <div class="control-list" id="personal-automation-policies"></div>
+              <div class="control-list" id="personal-automations"></div>
+              <button class="primary-button" id="personal-automation-scan" type="button">Escanear vencimientos</button>
+            </section>
+
+            <section class="control-panel">
+              <div class="section-heading"><div><h3>Nueva política</h3><p>La política limita una única acción local de bajo riesgo.</p></div></div>
+              <form class="control-form" id="personal-automation-policy-form">
+                <label class="wide-field">Título<input id="personal-automation-policy-title" required autocomplete="off"></label>
+                <label>Acción<select id="personal-automation-policy-action"><option value="daily_brief.prepare">Preparar agenda diaria</option><option value="organizer.upcoming.prepare">Preparar próximos eventos</option><option value="wellbeing.weekly_summary.prepare">Preparar bienestar semanal</option><option value="coaching.review.prepare">Preparar revisión de coaching</option><option value="goal.review.prepare">Preparar revisión de objetivos</option><option value="routine.missed_checkin.suggest">Sugerir check-ins faltantes</option></select></label>
+                <label>Nivel<select id="personal-automation-policy-level"><option value="observe">Observar</option><option value="suggest">Sugerir</option><option value="prepare">Preparar</option><option value="execute_with_approval">Ejecutar con aprobación por vez</option><option value="execute_under_policy">Ejecutar bajo política</option></select></label>
+                <label>Máximo diario<input id="personal-automation-policy-limit" type="number" min="1" max="48" value="1" required></label>
+                <label>Ventana inicio<input id="personal-automation-policy-window-start" type="time"></label>
+                <label>Ventana fin<input id="personal-automation-policy-window-end" type="time"></label>
+                <button class="primary-button wide-field" type="submit">Crear política</button>
+              </form>
+            </section>
+
+            <section class="control-panel">
+              <div class="section-heading"><div><h3>Nueva automatización</h3><p>Usa el ID visible de una política activa.</p></div></div>
+              <form class="control-form" id="personal-automation-form" data-developer-technical>
+                <label class="wide-field">ID de política<input id="personal-automation-policy-id" required autocomplete="off"></label>
+                <label class="wide-field">Título<input id="personal-automation-title" required autocomplete="off"></label>
+                <label>Recurrencia<select id="personal-automation-schedule"><option value="once">Una vez</option><option value="daily">Diaria</option><option value="weekly">Semanal</option><option value="monthly">Mensual</option></select></label>
+                <label>Inicio<input id="personal-automation-start" type="date" required></label>
+                <label>Hora<input id="personal-automation-time" type="time" required></label>
+                <label>Día semanal<input id="personal-automation-weekday" placeholder="lunes"></label>
+                <label>Día mensual<input id="personal-automation-month-day" type="number" min="1" max="31"></label>
+                <label class="wide-field">Parámetros JSON<textarea id="personal-automation-params" rows="2" maxlength="4000">{}</textarea></label>
+                <button class="primary-button wide-field" type="submit">Crear automatización</button>
+              </form>
+            </section>
+
+            <section class="control-panel">
+              <div class="section-heading"><div><h3>Ejecuciones y bandeja local</h3><p>Las ejecuciones con aprobación individual y los resultados preparados aparecen aquí.</p></div></div>
+              <div class="control-list" id="personal-automation-runs"></div>
+              <form class="control-form" id="personal-automation-run-form" data-developer-technical>
+                <label class="wide-field">ID de ejecución pendiente<input id="personal-automation-run-id" required autocomplete="off"></label>
+                <button class="primary-button wide-field" type="submit">Aprobar ejecución</button>
+              </form>
+              <div class="control-list" id="personal-automation-inbox"></div>
+              <form class="control-form" id="personal-automation-inbox-form" data-developer-technical>
+                <label class="wide-field">ID de bandeja<input id="personal-automation-inbox-id" required autocomplete="off"></label>
+                <label>Estado<select id="personal-automation-inbox-status"><option value="read">Leído</option><option value="dismissed">Descartado</option><option value="unread">No leído</option></select></label>
+                <button class="primary-button wide-field" type="submit">Actualizar bandeja</button>
+              </form>
+            </section>
+
+            <section class="control-panel">
+              <div class="section-heading"><div><h3>Scheduler local opcional</h3><p>Se ejecuta solo en este proceso, usa bloqueo exclusivo y se detiene al cerrar la web.</p></div></div>
+              <div class="control-list" id="personal-scheduler-status"></div>
+              <label>Intervalo en segundos<input id="personal-scheduler-interval" type="number" min="15" max="3600" value="60"></label>
+              <div class="memory-item-actions">
+                <button class="primary-button" id="personal-scheduler-start" type="button">Iniciar scheduler</button>
+                <button class="quiet-button" id="personal-scheduler-cycle" type="button">Ejecutar un ciclo</button>
+                <button class="danger-button" id="personal-scheduler-stop" type="button">Detener scheduler</button>
+              </div>
+              <button class="quiet-button" id="personal-notifications-enable" type="button">Activar avisos del navegador</button>
+            </section>
+
+            <section class="control-panel">
+              <div class="section-heading"><div><h3>Notificaciones locales</h3><p>Persisten en SQLite y pueden mostrarse en el navegador mientras la web esté abierta.</p></div></div>
+              <div class="control-list" id="personal-local-notifications"></div>
+              <form class="control-form" id="personal-notification-form" data-developer-technical>
+                <label class="wide-field">ID de notificación<input id="personal-notification-id" required autocomplete="off"></label>
+                <label>Estado<select id="personal-notification-status"><option value="seen">Vista</option><option value="dismissed">Descartada</option><option value="pending">Pendiente</option></select></label>
+                <button class="primary-button wide-field" type="submit">Actualizar notificación</button>
+              </form>
+            </section>
+
+            <section class="control-panel" data-developer-technical>
+              <div class="section-heading"><div><h3>Comprensión semántica</h3><p>Intenciones, resoluciones y aprendizaje lingüístico revisable. No guarda el prompt crudo.</p></div></div>
+              <div class="control-list" id="personal-intent-status"></div>
+              <div class="control-list" id="personal-intent-resolutions"></div>
+              <div class="control-list" id="personal-intent-proposals"></div>
+              <form class="control-form" id="personal-intent-propose-form">
+                <label class="wide-field">Frase corregida<input id="personal-intent-phrase" required maxlength="300" autocomplete="off"></label>
+                <label class="wide-field">Intención<select id="personal-intent-name">
+                  <option value="wellbeing.current">Bienestar actual</option>
+                  <option value="wellbeing.period_summary">Resumen de bienestar</option>
+                  <option value="organizer.today">Agenda de hoy</option>
+                  <option value="organizer.tomorrow">Agenda de mañana</option>
+                  <option value="organizer.upcoming">Próximos elementos</option>
+                  <option value="routine.status">Estado de rutinas</option>
+                  <option value="coaching.progress">Progreso de coaching</option>
+                  <option value="goal.status">Estado de objetivos</option>
+                  <option value="automation.status">Estado de automatización</option>
+                  <option value="automation.last_result">Último resultado automatizado</option>
+                  <option value="notification.status">Estado de notificaciones</option>
+                  <option value="scheduler.status">Estado del scheduler</option>
+                  <option value="knowledge.lookup">Consulta de conocimiento</option>
+                  <option value="knowledge.explain">Explicación de conocimiento</option>
+                  <option value="memory.recall">Recuerdo personal</option>
+                </select></label>
+                <button class="primary-button wide-field" type="submit">Proponer aprendizaje</button>
+              </form>
+              <form class="control-form" id="personal-intent-review-form" data-developer-technical>
+                <label class="wide-field">ID de propuesta<input id="personal-intent-proposal-id" required autocomplete="off"></label>
+                <label>Decisión<select id="personal-intent-decision"><option value="approve">Aprobar</option><option value="reject">Rechazar</option></select></label>
+                <button class="primary-button wide-field" type="submit">Revisar aprendizaje</button>
+              </form>
+            </section>
+          </div>
+        </div>
+      </section>
+
+      <section class="control" id="control" hidden>
+        <div class="control-shell">
+          <header class="inspector-intro">
+            <div>
+              <p class="inspector-kicker">Permisos y ejecución local</p>
+              <h2>Centro de control</h2>
+              <p>Administra proyectos, toolchains y paquetes de conocimiento sin conceder acceso al shell.</p>
+            </div>
+            <button class="quiet-button" id="refresh-control" type="button">Actualizar</button>
+          </header>
+
+          <div class="overview-grid" id="control-overview"></div>
+
+          <div class="control-grid">
+            <section class="control-panel">
+              <div class="section-heading">
+                <div>
+                  <h3>Proyectos confiables</h3>
+                  <p>La confianza es persistente y debe concederse explícitamente.</p>
+                </div>
+              </div>
+              <form class="control-form compact-form" id="trust-project-form">
+                <label>Ruta del proyecto
+                  <input id="trust-project-path" type="text" required placeholder="/home/user/Escritorio/mi-proyecto" autocomplete="off">
+                </label>
+                <button class="primary-button" type="submit">Confiar en proyecto</button>
+              </form>
+              <div class="control-list" id="control-projects"></div>
+            </section>
+
+            <section class="control-panel">
+              <div class="section-heading">
+                <div>
+                  <h3>Perfil PHP por proyecto</h3>
+                  <p>Guarda solo parámetros seguros; no instala herramientas ni ejecuta comandos.</p>
+                </div>
+              </div>
+              <form class="control-form" id="php-profile-form">
+                <label class="wide-field">Proyecto autorizado
+                  <input id="profile-project-root" type="text" required placeholder="/home/user/Proyectos/proyecto" autocomplete="off">
+                </label>
+                <label>PHPStan config
+                  <input id="profile-phpstan-config" type="text" placeholder="phpstan.neon" autocomplete="off">
+                </label>
+                <label>Nivel PHPStan
+                  <select id="profile-phpstan-level">
+                    <option value="">Automático</option>
+                    <option value="0">0</option><option value="1">1</option>
+                    <option value="2">2</option><option value="3">3</option>
+                    <option value="4">4</option><option value="5">5</option>
+                    <option value="6">6</option><option value="7">7</option>
+                    <option value="8">8</option><option value="9">9</option>
+                    <option value="10">10</option><option value="max">max</option>
+                  </select>
+                </label>
+                <label>PHPUnit config
+                  <input id="profile-phpunit-config" type="text" placeholder="phpunit.xml" autocomplete="off">
+                </label>
+                <label>Suite PHPUnit
+                  <input id="profile-phpunit-testsuite" type="text" placeholder="unit" autocomplete="off">
+                </label>
+                <label>Timeout (segundos)
+                  <input id="profile-timeout" type="number" min="5" max="600" placeholder="120">
+                </label>
+                <label>Límite de salida
+                  <input id="profile-output-limit" type="number" min="1000" max="50000" placeholder="12000">
+                </label>
+                <label>Máximo de archivos PHP
+                  <input id="profile-max-php-files" type="number" min="1" max="20000" placeholder="2000">
+                </label>
+                <label>Rutas excluidas
+                  <input id="profile-exclude-paths" type="text" placeholder="vendor, node_modules, var/cache" autocomplete="off">
+                </label>
+                <label class="check-field">
+                  <input id="profile-composer-strict" type="checkbox">
+                  Composer validate estricto
+                </label>
+                <label class="check-field">
+                  <input id="profile-composer-enabled" type="checkbox" checked>
+                  Ejecutar Composer
+                </label>
+                <label class="check-field">
+                  <input id="profile-syntax-enabled" type="checkbox" checked>
+                  Escanear sintaxis PHP
+                </label>
+                <label class="check-field">
+                  <input id="profile-phpstan-enabled" type="checkbox" checked>
+                  Ejecutar PHPStan
+                </label>
+                <label class="check-field">
+                  <input id="profile-phpunit-enabled" type="checkbox" checked>
+                  Ejecutar PHPUnit
+                </label>
+                <label class="check-field">
+                  <input id="profile-fail-fast" type="checkbox">
+                  Detener al primer fallo
+                </label>
+                <label class="check-field">
+                  <input id="profile-require-tools" type="checkbox">
+                  Exigir todas las herramientas
+                </label>
+                <div class="control-form-actions wide-field">
+                  <button class="quiet-button" id="clear-profile-form" type="button">Limpiar</button>
+                  <button class="primary-button" type="submit">Guardar perfil</button>
+                </div>
+              </form>
+              <div class="control-list" id="control-profiles"></div>
+            </section>
+
+            <section class="control-panel">
+              <div class="section-heading">
+                <div>
+                  <h3>Perfil Python por proyecto</h3>
+                  <p>Configura compilación, Ruff, mypy y Pytest sin instalar herramientas.</p>
+                </div>
+              </div>
+              <form class="control-form" id="python-profile-form">
+                <label class="wide-field">Proyecto autorizado
+                  <input id="python-profile-project-root" type="text" required placeholder="/home/user/Proyectos/proyecto" autocomplete="off">
+                </label>
+                <label>Ruff config
+                  <input id="python-profile-ruff-config" type="text" placeholder="pyproject.toml" autocomplete="off">
+                </label>
+                <label>mypy config
+                  <input id="python-profile-mypy-config" type="text" placeholder="mypy.ini" autocomplete="off">
+                </label>
+                <label>Ruta de Pytest
+                  <input id="python-profile-pytest-path" type="text" placeholder="tests" autocomplete="off">
+                </label>
+                <label>Timeout (segundos)
+                  <input id="python-profile-timeout" type="number" min="5" max="900" placeholder="180">
+                </label>
+                <label>Límite de salida
+                  <input id="python-profile-output-limit" type="number" min="1000" max="50000" placeholder="12000">
+                </label>
+                <label>Máximo de archivos Python
+                  <input id="python-profile-max-files" type="number" min="1" max="20000" placeholder="3000">
+                </label>
+                <label>Rutas excluidas
+                  <input id="python-profile-exclude-paths" type="text" placeholder=".venv, build, dist" autocomplete="off">
+                </label>
+                <label class="check-field">
+                  <input id="python-profile-pyproject-enabled" type="checkbox" checked>
+                  Validar pyproject.toml
+                </label>
+                <label class="check-field">
+                  <input id="python-profile-compile-enabled" type="checkbox" checked>
+                  Compilar sintaxis Python
+                </label>
+                <label class="check-field">
+                  <input id="python-profile-ruff-enabled" type="checkbox" checked>
+                  Ejecutar Ruff
+                </label>
+                <label class="check-field">
+                  <input id="python-profile-mypy-enabled" type="checkbox" checked>
+                  Ejecutar mypy
+                </label>
+                <label class="check-field">
+                  <input id="python-profile-pytest-enabled" type="checkbox" checked>
+                  Ejecutar Pytest
+                </label>
+                <label class="check-field">
+                  <input id="python-profile-fail-fast" type="checkbox">
+                  Detener al primer fallo
+                </label>
+                <label class="check-field">
+                  <input id="python-profile-require-tools" type="checkbox">
+                  Exigir todas las herramientas
+                </label>
+                <div class="control-form-actions wide-field">
+                  <button class="quiet-button" id="clear-python-profile-form" type="button">Limpiar</button>
+                  <button class="primary-button" type="submit">Guardar perfil</button>
+                </div>
+              </form>
+            </section>
+          </div>
+
+          <section class="control-panel control-audit-panel">
+            <div class="section-heading">
+              <div>
+                <h3>Verificaciones PHP recientes</h3>
+                <p>Resultados comparables del flujo Composer, sintaxis, PHPStan y PHPUnit.</p>
+              </div>
+            </div>
+            <div class="control-list audit-list" id="control-php-verifications"></div>
+          </section>
+
+          <section class="control-panel control-audit-panel">
+            <div class="section-heading">
+              <div>
+                <h3>Verificaciones web recientes</h3>
+                <p>Resultados de HTML, CSS, JavaScript y TypeScript sin scripts npm.</p>
+              </div>
+            </div>
+            <div class="control-list audit-list" id="control-web-verifications"></div>
+          </section>
+
+          <section class="control-panel control-audit-panel">
+            <div class="section-heading">
+              <div>
+                <h3>Verificaciones Python recientes</h3>
+                <p>Resultados de pyproject, compilación, Ruff, mypy y Pytest.</p>
+              </div>
+            </div>
+            <div class="control-list audit-list" id="control-python-verifications"></div>
+          </section>
+
+          <section class="control-panel control-audit-panel">
+            <div class="section-heading">
+              <div>
+                <h3>Verificaciones Java recientes</h3>
+                <p>Resultados de descriptores, javac, Maven y Gradle sin wrappers.</p>
+              </div>
+            </div>
+            <div class="control-list audit-list" id="control-java-verifications"></div>
+          </section>
+
+          <section class="control-panel control-audit-panel">
+            <div class="section-heading">
+              <div>
+                <h3>Verificaciones Kotlin recientes</h3>
+                <p>Resultados de descriptores, kotlinc, Maven y Gradle sin wrappers.</p>
+              </div>
+            </div>
+            <div class="control-list audit-list" id="control-kotlin-verifications"></div>
+          </section>
+
+          <section class="control-panel control-audit-panel">
+            <div class="section-heading">
+              <div>
+                <h3>Verificaciones C#/.NET recientes</h3>
+                <p>Resultados de descriptores, formato, build y tests sin restore automático.</p>
+              </div>
+            </div>
+            <div class="control-list audit-list" id="control-dotnet-verifications"></div>
+          </section>
+
+          <section class="control-panel control-audit-panel">
+            <div class="section-heading">
+              <div>
+                <h3>Verificaciones C/C++ recientes</h3>
+                <p>Resultados de CMake, compiladores, cppcheck y CTest controlados.</p>
+              </div>
+            </div>
+            <div class="control-list audit-list" id="control-native-verifications"></div>
+          </section>
+
+          <section class="control-panel control-audit-panel">
+            <div class="section-heading">
+              <div>
+                <h3>Verificaciones Ruby recientes</h3>
+                <p>Resultados de Bundler, sintaxis, RuboCop y tests Ruby controlados.</p>
+              </div>
+            </div>
+            <div class="control-list audit-list" id="control-ruby-verifications"></div>
+          </section>
+
+          <section class="control-panel control-audit-panel">
+            <div class="section-heading">
+              <div>
+                <h3>Verificaciones Go recientes</h3>
+                <p>Resultados de gofmt, vet, build y tests con red desactivada.</p>
+              </div>
+            </div>
+            <div class="control-list audit-list" id="control-go-verifications"></div>
+          </section>
+
+          <section class="control-panel control-audit-panel">
+            <div class="section-heading">
+              <div>
+                <h3>Verificaciones Rust recientes</h3>
+                <p>Resultados de Cargo, rustfmt, Clippy y tests en modo offline.</p>
+              </div>
+            </div>
+            <div class="control-list audit-list" id="control-rust-verifications"></div>
+          </section>
+
+          <section class="control-panel control-audit-panel">
+            <div class="section-heading">
+              <div>
+                <h3>Verificaciones Swift recientes</h3>
+                <p>Resultados de manifiesto, sintaxis, swift-format, build y tests SwiftPM.</p>
+              </div>
+            </div>
+            <div class="control-list audit-list" id="control-swift-verifications"></div>
+          </section>
+
+          <section class="control-panel control-audit-panel">
+            <div class="section-heading">
+              <div>
+                <h3>Verificaciones Dart/Flutter recientes</h3>
+                <p>Resultados de descriptores, formato, análisis y tests sin pub get automático.</p>
+              </div>
+            </div>
+            <div class="control-list audit-list" id="control-dart-verifications"></div>
+          </section>
+
+          <section class="control-panel control-audit-panel">
+            <div class="section-heading">
+              <div>
+                <h3>Verificaciones SQL recientes</h3>
+                <p>SQL estático, migraciones y esquemas SQLite inspeccionados en modo solo lectura.</p>
+              </div>
+            </div>
+            <div class="control-list audit-list" id="control-sql-verifications"></div>
+          </section>
+
+          <section class="control-panel control-audit-panel">
+            <div class="section-heading">
+              <div>
+                <h3>Constitución ética profesional</h3>
+                <p>Núcleo local de no-daño, privacidad, integridad profesional y alternativas seguras. No puede desactivarse.</p>
+              </div>
+            </div>
+            <div class="control-list audit-list" id="control-ethics"></div>
+          </section>
+
+          <section class="control-panel control-audit-panel">
+            <div class="section-heading">
+              <div>
+                <h3>Planes supervisados recientes</h3>
+                <p>Propuestas aprobadas una sola vez, pasos exactos y resultados reales sin escritura autónoma.</p>
+              </div>
+            </div>
+            <div class="control-list audit-list" id="control-action-runs"></div>
+          </section>
+
+          <section class="control-panel control-audit-panel">
+            <div class="section-heading">
+              <div>
+                <h3>Propuestas de cambios recientes</h3>
+                <p>Diffs exactos generados para archivos explícitos, pendientes, aplicados, rechazados u obsoletos.</p>
+              </div>
+            </div>
+            <div class="control-list audit-list" id="control-change-proposals"></div>
+          </section>
+
+          <section class="control-panel control-audit-panel">
+            <div class="section-heading">
+              <div>
+                <h3>Ciclos de validación y reparación</h3>
+                <p>Cambios aplicados, validaciones aprobadas y reparaciones nuevas sin bucles autónomos.</p>
+              </div>
+            </div>
+            <div class="control-list audit-list" id="control-validation-cycles"></div>
+          </section>
+
+          <section class="control-panel control-audit-panel">
+            <div class="section-heading">
+              <div>
+                <h3>Sesiones de desarrollo supervisadas</h3>
+                <p>Línea de tiempo local de cambios revisados, validaciones aprobadas y reparaciones sin continuidad autónoma.</p>
+              </div>
+            </div>
+            <div class="control-list audit-list" id="control-development-sessions"></div>
+          </section>
+
+          <section class="control-panel control-audit-panel">
+            <div class="section-heading">
+              <div>
+                <h3>Paquetes opcionales de Alejandría</h3>
+                <p>Crear, instalar o exportar conocimiento local sin red ni ejecución de código.</p>
+              </div>
+            </div>
+            <div class="control-grid">
+              <form class="control-form compact-form" id="package-install-form">
+                <label class="wide-field">Carpeta del paquete local
+                  <input id="package-install-path" type="text" required placeholder="/home/user/Descargas/paquete" autocomplete="off">
+                </label>
+                <button class="primary-button" type="submit">Instalar paquete</button>
+              </form>
+              <form class="control-form" id="package-create-form">
+                <label>Destino
+                  <input id="package-create-destination" type="text" required placeholder="/home/user/Descargas/mi-paquete" autocomplete="off">
+                </label>
+                <label>ID del paquete
+                  <input id="package-create-id" type="text" required placeholder="programming.web.html" autocomplete="off">
+                </label>
+                <label>Nombre
+                  <input id="package-create-name" type="text" required placeholder="HTML — Fundamentos" autocomplete="off">
+                </label>
+                <label>Versión
+                  <input id="package-create-version" type="text" required placeholder="1.0.0" autocomplete="off">
+                </label>
+                <label>Dominio
+                  <input id="package-create-domain" type="text" required placeholder="programming/web/html" autocomplete="off">
+                </label>
+                <label>Idioma
+                  <input id="package-create-language" type="text" value="es" autocomplete="off">
+                </label>
+                <label>Licencia
+                  <input id="package-create-license" type="text" required placeholder="CC-BY-4.0" autocomplete="off">
+                </label>
+                <label>Nivel
+                  <select id="package-create-tier">
+                    <option value="optional">Opcional</option>
+                    <option value="basic">Básico</option>
+                  </select>
+                </label>
+                <label class="wide-field">Fuentes locales, una ruta por línea
+                  <textarea id="package-create-sources" required rows="3" placeholder="/ruta/libro.md"></textarea>
+                </label>
+                <label class="wide-field">Etiquetas separadas por coma
+                  <input id="package-create-tags" type="text" placeholder="html, web, programación" autocomplete="off">
+                </label>
+                <button class="primary-button wide-field" type="submit">Crear paquete</button>
+              </form>
+              <form class="control-form compact-form" id="package-export-form">
+                <label>ID instalado
+                  <input id="package-export-id" type="text" required placeholder="programming.web.html" autocomplete="off">
+                </label>
+                <label>Destino
+                  <input id="package-export-destination" type="text" required placeholder="/home/user/Descargas/exportado" autocomplete="off">
+                </label>
+                <button class="primary-button" type="submit">Exportar paquete</button>
+              </form>
+            </div>
+            <div class="control-list audit-list" id="control-packages"></div>
+          </section>
+
+          <section class="control-panel control-audit-panel">
+            <div class="section-heading">
+              <div>
+                <h3>Historial de ejecución y autorizaciones</h3>
+                <p>Los detalles sensibles se redactan antes de guardarse.</p>
+              </div>
+            </div>
+            <div class="control-audit-toolbar">
+              <input id="control-audit-search" type="search" placeholder="Buscar ruta, skill o resultado" autocomplete="off">
+              <input id="control-audit-action" type="text" placeholder="Acción exacta, opcional" autocomplete="off">
+              <select id="control-audit-outcome">
+                <option value="">Todos los resultados</option>
+                <option value="success">success</option>
+                <option value="failed">failed</option>
+                <option value="denied">denied</option>
+                <option value="not_found">not_found</option>
+              </select>
+              <button class="quiet-button" id="refresh-control-audit" type="button">Filtrar</button>
+            </div>
+            <div class="control-list audit-list" id="control-audit"></div>
+          </section>
+        </div>
+      </section>
+
+      <section class="control" id="profile" hidden>
+        <div class="control-shell">
+          <header class="inspector-intro">
+            <div>
+              <p class="inspector-kicker">Cuenta, privacidad y seguridad local</p>
+              <h2>Perfil</h2>
+              <p>Los campos opcionales vacíos no se muestran ni se entregan al modelo.</p>
+            </div>
+            <button class="quiet-button" id="logout-button" type="button">Cerrar sesión</button>
+          </header>
+          <div class="overview-grid" id="profile-overview"></div>
+          <div class="control-grid">
+            <section class="control-panel">
+              <div class="section-heading"><div><h3>Perfil personal</h3><p>Define cómo quieres que Elyndra se dirija a ti.</p></div></div>
+              <form class="control-form" id="profile-form">
+                <label>Nombre de usuario<input id="profile-username" disabled></label>
+                <label>Nombre preferido<input id="profile-preferred-name" maxlength="80"></label>
+                <div class="dialog-grid">
+                  <label>Pronombres<input id="profile-pronouns" maxlength="40"></label>
+                  <label>Sexo <span class="optional">opcional</span><input id="profile-sex" maxlength="40"></label>
+                </div>
+                <label>Identidad de género <span class="optional">opcional</span><input id="profile-gender-identity" maxlength="80"></label>
+                <label>Orientación sexual <span class="optional">opcional y sensible</span><input id="profile-sexual-orientation" maxlength="80"></label>
+                <div class="dialog-grid">
+                  <label>Zona horaria<input id="profile-timezone" maxlength="80"></label>
+                  <label>Idioma<input id="profile-language" maxlength="20"></label>
+                </div>
+                <label class="consent-row"><input id="profile-birthday-greeting" type="checkbox"><span>Permitir saludo de cumpleaños</span></label>
+                <label class="consent-row"><input id="profile-developer-mode" type="checkbox"><span>Modo desarrollador</span></label>
+                <label class="consent-row"><input id="profile-telemetry" type="checkbox"><span>Telemetría opcional</span></label>
+                <button class="primary-button" type="submit">Guardar perfil</button>
+              </form>
+            </section>
+            <section class="control-panel">
+              <div class="section-heading"><div><h3>Seguridad</h3><p>Argon2id, sesiones locales y base preparada para 2FA.</p></div></div>
+              <div class="control-list" id="profile-security"></div>
+              <form class="control-form" id="change-email-form">
+                <h4>Cambiar correo</h4>
+                <label>Nuevo correo<input id="change-email" type="email" required></label>
+                <label>Contraseña actual<input id="change-email-password" type="password" required></label>
+                <button class="primary-button" type="submit">Cambiar correo</button>
+              </form>
+              <form class="control-form" id="change-password-form">
+                <h4>Cambiar contraseña</h4>
+                <label>Contraseña actual<input id="current-password" type="password" required></label>
+                <label>Nueva contraseña<input id="new-password" type="password" minlength="8" maxlength="64" required></label>
+                <label>Confirmar nueva contraseña<input id="new-password-confirmation" type="password" minlength="8" maxlength="64" required></label>
+                <p class="form-help">Debe incluir una letra, un número y un carácter especial.</p>
+                <button class="primary-button" type="submit">Cambiar contraseña</button>
+              </form>
+            </section>
+            <section class="control-panel">
+              <div class="section-heading"><div><h3>Privacidad y recuperación</h3><p>Exportación cifrada local descargable. Respaldo remoto todavía no implementado.</p></div></div>
+              <div class="control-list" id="profile-telemetry-preview"></div>
+              <form class="control-form" id="account-export-form">
+                <h4>Exportar datos cifrados</h4>
+                <p class="form-help">La frase de exportación no se guarda. Necesitarás conservarla para una futura restauración.</p>
+                <label>Contraseña de cuenta<input id="account-export-password" type="password" autocomplete="current-password" required></label>
+                <label>Frase de exportación<input id="account-export-passphrase" type="password" minlength="12" maxlength="128" required></label>
+                <button class="primary-button" type="submit">Descargar exportación cifrada</button>
+              </form>
+            </section>
+          </div>
+        </div>
+      </section>
+
+      <div class="drop-overlay" id="drop-overlay" hidden>
+        <div class="drop-card">
+          <span class="drop-icon" aria-hidden="true">⇩</span>
+          <strong>Suelta los archivos para adjuntarlos</strong>
+          <small>Se almacenarán únicamente en este equipo.</small>
+        </div>
+      </div>
+
+      <div class="composer-area" id="composer-area">
+        <div class="processing" id="processing" hidden>
+          <span class="processing-orb" aria-hidden="true"></span>
+          <span id="processing-text">Elyn está formulando una respuesta…</span>
+          <span id="processing-time">0.0 s</span>
+        </div>
+        <div class="attachment-tray" id="attachment-tray" hidden></div>
+        <form class="composer" id="composer">
+          <input id="file-input" type="file" multiple hidden
+            accept=".txt,.md,.markdown,.rst,.csv,.json,.toml,.yaml,.yml,.ini,.cfg,.conf,.log,.sql,.py,.php,.js,.mjs,.cjs,.ts,.tsx,.jsx,.html,.htm,.css,.scss,.xml,.sh,.bash,.zsh,.java,.kt,.c,.h,.cpp,.hpp,.cs,.go,.rs,.rb,.pl,.lua,.gradle,.properties,.pdf,.docx,.odt,.pptx,.xlsx,.png,.jpg,.jpeg,.webp,.gif">
+          <button class="attach-button" id="attach-file" type="button" aria-label="Adjuntar archivo" title="Adjuntar archivo">
+            <span aria-hidden="true">＋</span>
+          </button>
+          <textarea id="message-input" rows="1" maxlength="12000" placeholder="Escribe un mensaje para Elyn…" aria-label="Mensaje"></textarea>
+          <button class="send-button" id="send-message" type="submit" aria-label="Enviar mensaje">
+            <span aria-hidden="true">↑</span>
+          </button>
+        </form>
+        <p class="composer-note" id="composer-note">Elyndra puede equivocarse. Las acciones sensibles requieren autorización explícita.</p>
+      </div>
+    </main>
+  </div>
+
+  <div class="context-menu" id="chat-context-menu" role="menu" hidden>
+    <button type="button" data-action="rename" role="menuitem">Renombrar chat</button>
+    <button type="button" data-action="pin" role="menuitem">Anclar chat</button>
+    <button type="button" data-action="export" role="menuitem">Exportar / imprimir PDF</button>
+    <button type="button" data-action="archive" role="menuitem">Archivar</button>
+    <div class="context-separator"></div>
+    <button class="danger" type="button" data-action="delete" role="menuitem">Eliminar definitivamente</button>
+  </div>
+
+  <div class="context-menu account-context-menu" id="account-context-menu" role="menu" hidden>
+    <button type="button" data-account-action="profile" role="menuitem">Perfil y configuración</button>
+    <button type="button" data-account-action="register" role="menuitem">Registrar otra cuenta</button>
+    <button type="button" data-account-action="switch" role="menuitem">Cambiar de cuenta</button>
+    <div class="context-separator"></div>
+    <button class="danger" type="button" data-account-action="logout" role="menuitem">Cerrar sesión</button>
+  </div>
+
+  <dialog class="confirm-dialog" id="delete-dialog" aria-labelledby="delete-dialog-title">
+    <form method="dialog">
+      <div class="dialog-brand">ELYNDRA</div>
+      <h2 id="delete-dialog-title">Eliminar chat</h2>
+      <p id="delete-dialog-text"></p>
+      <div class="dialog-actions">
+        <button class="quiet-button" id="delete-cancel" value="cancel">Cancelar</button>
+        <button class="danger-button" id="delete-confirm" value="confirm">Eliminar definitivamente</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog class="confirm-dialog edit-dialog" id="edit-dialog" aria-labelledby="edit-dialog-title">
+    <form method="dialog">
+      <div class="dialog-brand">ELYNDRA</div>
+      <h2 id="edit-dialog-title">Editar elemento</h2>
+      <label class="dialog-field" for="edit-dialog-content">Contenido</label>
+      <textarea id="edit-dialog-content" rows="7" maxlength="3000"></textarea>
+      <div class="dialog-actions">
+        <button class="quiet-button" value="cancel">Cancelar</button>
+        <button class="primary-button" value="confirm">Guardar cambios</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog class="confirm-dialog library-dialog" id="library-dialog" aria-labelledby="library-dialog-title">
+    <form method="dialog">
+      <div class="dialog-brand">ALEJANDRÍA</div>
+      <h2 id="library-dialog-title">Nueva biblioteca</h2>
+      <label class="dialog-field" for="library-name">Nombre</label>
+      <input id="library-name" maxlength="100" placeholder="Ej.: PHP">
+      <label class="dialog-field" for="library-description">Descripción</label>
+      <textarea id="library-description" rows="3" maxlength="1000" placeholder="Qué conocimiento contiene"></textarea>
+      <div class="dialog-grid">
+        <label>Dominio<input id="library-domain" value="general" maxlength="80"></label>
+        <label>Idioma<input id="library-language" value="auto" maxlength="30"></label>
+        <label>Versión<input id="library-version" value="1" maxlength="80"></label>
+        <label>Licencia<input id="library-license" value="unverified" maxlength="120"></label>
+      </div>
+      <div class="dialog-actions">
+        <button class="quiet-button" value="cancel">Cancelar</button>
+        <button class="primary-button" id="library-dialog-confirm" value="confirm">Crear biblioteca</button>
+      </div>
+    </form>
+  </dialog>
+
+  <div class="toast" id="toast" role="status" hidden></div>
+</body>
+</html>

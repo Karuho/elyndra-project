@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "package_id": "programming.python.modern-basic",
+  "name": "Python moderno — Base práctica y verificable",
+  "version": "1.0.0",
+  "tier": "optional",
+  "domain": "programming/python",
+  "language": "es",
+  "license_id": "CC0-1.0",
+  "publisher": "Proyecto Elyndra",
+  "tags": [
+    "python",
+    "programming",
+    "quality",
+    "testing"
+  ],
+  "sources": [
+    {
+      "path": "python-modern-basic.md",
+      "title": "Python moderno — Base práctica y verificable",
+      "sha256": "e714e80d51286182219735cc0696a8fb6a1f3e1bec5bdd8544cdda2651612ca6"
+    }
+  ]
+}

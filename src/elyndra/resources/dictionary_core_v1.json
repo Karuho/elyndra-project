@@ -1,0 +1,942 @@
+{
+  "id": "elyndra.dictionary.core-v1",
+  "version": "1.1.0",
+  "license": "CC0-1.0",
+  "description": "Lexicón multilingüe inicial, local y verificable de Elyndra.",
+  "languages": {
+    "es": "Español",
+    "en": "English",
+    "ja": "日本語",
+    "zh": "中文",
+    "it": "Italiano",
+    "fr": "Français",
+    "pt": "Português",
+    "de": "Deutsch"
+  },
+  "entries": [
+    {
+      "id": "hello",
+      "pos": "interjection",
+      "forms": {
+        "es": [
+          "hola"
+        ],
+        "en": [
+          "hello",
+          "hi"
+        ],
+        "ja": [
+          "こんにちは"
+        ],
+        "zh": [
+          "你好"
+        ],
+        "it": [
+          "ciao",
+          "salve"
+        ],
+        "fr": [
+          "bonjour",
+          "salut"
+        ],
+        "pt": [
+          "olá",
+          "oi"
+        ],
+        "de": [
+          "hallo"
+        ]
+      },
+      "glosses": {
+        "es": "Saludo usado al iniciar una conversación.",
+        "en": "A greeting used to begin a conversation.",
+        "ja": "会話を始めるときに使う挨拶。",
+        "zh": "开始交谈时使用的问候语。",
+        "it": "Saluto usato per iniziare una conversazione.",
+        "fr": "Salutation utilisée pour commencer une conversation.",
+        "pt": "Saudação usada para iniciar uma conversa.",
+        "de": "Grußformel zum Beginn eines Gesprächs."
+      }
+    },
+    {
+      "id": "goodbye",
+      "pos": "interjection",
+      "forms": {
+        "es": [
+          "adiós",
+          "hasta luego"
+        ],
+        "en": [
+          "goodbye",
+          "bye"
+        ],
+        "ja": [
+          "さようなら"
+        ],
+        "zh": [
+          "再见"
+        ],
+        "it": [
+          "arrivederci"
+        ],
+        "fr": [
+          "au revoir"
+        ],
+        "pt": [
+          "adeus",
+          "até logo"
+        ],
+        "de": [
+          "auf wiedersehen",
+          "tschüss"
+        ]
+      },
+      "glosses": {
+        "es": "Despedida usada al terminar una conversación.",
+        "en": "A farewell used when ending a conversation.",
+        "ja": "会話を終えるときに使う別れの挨拶。",
+        "zh": "结束交谈时使用的告别语。",
+        "it": "Saluto usato per concludere una conversazione.",
+        "fr": "Formule utilisée pour terminer une conversation.",
+        "pt": "Despedida usada ao terminar uma conversa.",
+        "de": "Abschiedsformel am Ende eines Gesprächs."
+      }
+    },
+    {
+      "id": "yes",
+      "pos": "adverb",
+      "forms": {
+        "es": [
+          "sí"
+        ],
+        "en": [
+          "yes"
+        ],
+        "ja": [
+          "はい"
+        ],
+        "zh": [
+          "是",
+          "对"
+        ],
+        "it": [
+          "sì"
+        ],
+        "fr": [
+          "oui"
+        ],
+        "pt": [
+          "sim"
+        ],
+        "de": [
+          "ja"
+        ]
+      },
+      "glosses": {
+        "es": "Respuesta afirmativa o expresión de acuerdo.",
+        "en": "An affirmative answer or expression of agreement.",
+        "ja": "肯定や同意を表す返答。",
+        "zh": "表示肯定或同意的回答。",
+        "it": "Risposta affermativa o espressione di accordo.",
+        "fr": "Réponse affirmative ou expression d’accord.",
+        "pt": "Resposta afirmativa ou expressão de concordância.",
+        "de": "Bejahende Antwort oder Ausdruck der Zustimmung."
+      }
+    },
+    {
+      "id": "no",
+      "pos": "adverb",
+      "forms": {
+        "es": [
+          "no"
+        ],
+        "en": [
+          "no"
+        ],
+        "ja": [
+          "いいえ"
+        ],
+        "zh": [
+          "不",
+          "不是"
+        ],
+        "it": [
+          "no"
+        ],
+        "fr": [
+          "non"
+        ],
+        "pt": [
+          "não"
+        ],
+        "de": [
+          "nein"
+        ]
+      },
+      "glosses": {
+        "es": "Respuesta negativa o expresión de desacuerdo.",
+        "en": "A negative answer or expression of disagreement.",
+        "ja": "否定や不同意を表す返答。",
+        "zh": "表示否定或不同意的回答。",
+        "it": "Risposta negativa o espressione di disaccordo.",
+        "fr": "Réponse négative ou expression de désaccord.",
+        "pt": "Resposta negativa ou expressão de discordância.",
+        "de": "Verneinende Antwort oder Ausdruck der Ablehnung."
+      }
+    },
+    {
+      "id": "please",
+      "pos": "expression",
+      "forms": {
+        "es": [
+          "por favor"
+        ],
+        "en": [
+          "please"
+        ],
+        "ja": [
+          "お願いします"
+        ],
+        "zh": [
+          "请"
+        ],
+        "it": [
+          "per favore"
+        ],
+        "fr": [
+          "s'il vous plaît",
+          "s’il vous plaît"
+        ],
+        "pt": [
+          "por favor"
+        ],
+        "de": [
+          "bitte"
+        ]
+      },
+      "glosses": {
+        "es": "Expresión cortés usada al realizar una petición.",
+        "en": "A polite expression used when making a request.",
+        "ja": "依頼をするときに使う丁寧な表現。",
+        "zh": "提出请求时使用的礼貌表达。",
+        "it": "Espressione cortese usata per fare una richiesta.",
+        "fr": "Expression polie utilisée pour faire une demande.",
+        "pt": "Expressão educada usada ao fazer um pedido.",
+        "de": "Höflicher Ausdruck bei einer Bitte."
+      }
+    },
+    {
+      "id": "thanks",
+      "pos": "expression",
+      "forms": {
+        "es": [
+          "gracias"
+        ],
+        "en": [
+          "thanks",
+          "thank you"
+        ],
+        "ja": [
+          "ありがとう"
+        ],
+        "zh": [
+          "谢谢"
+        ],
+        "it": [
+          "grazie"
+        ],
+        "fr": [
+          "merci"
+        ],
+        "pt": [
+          "obrigado",
+          "obrigada"
+        ],
+        "de": [
+          "danke"
+        ]
+      },
+      "glosses": {
+        "es": "Expresión de agradecimiento.",
+        "en": "An expression of gratitude.",
+        "ja": "感謝を表す言葉。",
+        "zh": "表达感谢的用语。",
+        "it": "Espressione di gratitudine.",
+        "fr": "Expression de gratitude.",
+        "pt": "Expressão de gratidão.",
+        "de": "Ausdruck des Dankes."
+      }
+    },
+    {
+      "id": "help",
+      "pos": "noun_verb",
+      "forms": {
+        "es": [
+          "ayuda",
+          "ayudar"
+        ],
+        "en": [
+          "help"
+        ],
+        "ja": [
+          "助け",
+          "助ける"
+        ],
+        "zh": [
+          "帮助"
+        ],
+        "it": [
+          "aiuto",
+          "aiutare"
+        ],
+        "fr": [
+          "aide",
+          "aider"
+        ],
+        "pt": [
+          "ajuda",
+          "ajudar"
+        ],
+        "de": [
+          "hilfe",
+          "helfen"
+        ]
+      },
+      "glosses": {
+        "es": "Apoyo que permite resolver una dificultad o necesidad.",
+        "en": "Support that helps resolve a difficulty or need.",
+        "ja": "困難や必要を解決するための支援。",
+        "zh": "用于解决困难或需求的支持。",
+        "it": "Sostegno che aiuta a risolvere una difficoltà o necessità.",
+        "fr": "Soutien permettant de résoudre une difficulté ou un besoin.",
+        "pt": "Apoio que ajuda a resolver uma dificuldade ou necessidade.",
+        "de": "Unterstützung zur Lösung einer Schwierigkeit oder eines Bedarfs."
+      }
+    },
+    {
+      "id": "safety",
+      "pos": "noun",
+      "forms": {
+        "es": [
+          "seguridad"
+        ],
+        "en": [
+          "safety"
+        ],
+        "ja": [
+          "安全"
+        ],
+        "zh": [
+          "安全"
+        ],
+        "it": [
+          "sicurezza"
+        ],
+        "fr": [
+          "sécurité"
+        ],
+        "pt": [
+          "segurança"
+        ],
+        "de": [
+          "sicherheit"
+        ]
+      },
+      "glosses": {
+        "es": "Condición en la que los riesgos de daño están controlados.",
+        "en": "A condition in which risks of harm are controlled.",
+        "ja": "危害のリスクが管理されている状態。",
+        "zh": "伤害风险受到控制的状态。",
+        "it": "Condizione in cui i rischi di danno sono controllati.",
+        "fr": "État dans lequel les risques de dommage sont maîtrisés.",
+        "pt": "Condição em que os riscos de dano estão controlados.",
+        "de": "Zustand, in dem Schadensrisiken beherrscht werden."
+      }
+    },
+    {
+      "id": "project",
+      "pos": "noun",
+      "forms": {
+        "es": [
+          "proyecto"
+        ],
+        "en": [
+          "project"
+        ],
+        "ja": [
+          "プロジェクト"
+        ],
+        "zh": [
+          "项目"
+        ],
+        "it": [
+          "progetto"
+        ],
+        "fr": [
+          "projet"
+        ],
+        "pt": [
+          "projeto"
+        ],
+        "de": [
+          "projekt"
+        ]
+      },
+      "glosses": {
+        "es": "Trabajo planificado con un objetivo, alcance y resultados definidos.",
+        "en": "Planned work with a defined goal, scope, and outcomes.",
+        "ja": "目的、範囲、成果が定められた計画的な作業。",
+        "zh": "具有明确目标、范围和成果的计划性工作。",
+        "it": "Lavoro pianificato con obiettivo, ambito e risultati definiti.",
+        "fr": "Travail planifié avec un objectif, un périmètre et des résultats définis.",
+        "pt": "Trabalho planejado com objetivo, escopo e resultados definidos.",
+        "de": "Geplante Arbeit mit festgelegtem Ziel, Umfang und Ergebnissen."
+      }
+    },
+    {
+      "id": "code",
+      "pos": "noun",
+      "forms": {
+        "es": [
+          "código"
+        ],
+        "en": [
+          "code"
+        ],
+        "ja": [
+          "コード"
+        ],
+        "zh": [
+          "代码"
+        ],
+        "it": [
+          "codice"
+        ],
+        "fr": [
+          "code"
+        ],
+        "pt": [
+          "código"
+        ],
+        "de": [
+          "code",
+          "quellcode"
+        ]
+      },
+      "glosses": {
+        "es": "Instrucciones escritas que un sistema informático puede interpretar o ejecutar.",
+        "en": "Written instructions that a computer system can interpret or execute.",
+        "ja": "コンピューターが解釈または実行できる記述された命令。",
+        "zh": "计算机系统可以解释或执行的书面指令。",
+        "it": "Istruzioni scritte che un sistema informatico può interpretare o eseguire.",
+        "fr": "Instructions écrites qu’un système informatique peut interpréter ou exécuter.",
+        "pt": "Instruções escritas que um sistema pode interpretar ou executar.",
+        "de": "Geschriebene Anweisungen, die ein Computersystem interpretieren oder ausführen kann."
+      }
+    },
+    {
+      "id": "memory",
+      "pos": "noun",
+      "forms": {
+        "es": [
+          "memoria"
+        ],
+        "en": [
+          "memory"
+        ],
+        "ja": [
+          "記憶"
+        ],
+        "zh": [
+          "记忆"
+        ],
+        "it": [
+          "memoria"
+        ],
+        "fr": [
+          "mémoire"
+        ],
+        "pt": [
+          "memória"
+        ],
+        "de": [
+          "gedächtnis",
+          "speicher"
+        ]
+      },
+      "glosses": {
+        "es": "Capacidad o sistema para conservar y recuperar información.",
+        "en": "A capacity or system for retaining and retrieving information.",
+        "ja": "情報を保持し取り出す能力または仕組み。",
+        "zh": "保存和检索信息的能力或系统。",
+        "it": "Capacità o sistema per conservare e recuperare informazioni.",
+        "fr": "Capacité ou système permettant de conserver et retrouver des informations.",
+        "pt": "Capacidade ou sistema para conservar e recuperar informações.",
+        "de": "Fähigkeit oder System zum Speichern und Abrufen von Informationen."
+      }
+    },
+    {
+      "id": "language",
+      "pos": "noun",
+      "forms": {
+        "es": [
+          "idioma",
+          "lenguaje"
+        ],
+        "en": [
+          "language"
+        ],
+        "ja": [
+          "言語"
+        ],
+        "zh": [
+          "语言"
+        ],
+        "it": [
+          "lingua",
+          "linguaggio"
+        ],
+        "fr": [
+          "langue",
+          "langage"
+        ],
+        "pt": [
+          "idioma",
+          "linguagem"
+        ],
+        "de": [
+          "sprache"
+        ]
+      },
+      "glosses": {
+        "es": "Sistema de signos y reglas usado para comunicar significado.",
+        "en": "A system of signs and rules used to communicate meaning.",
+        "ja": "意味を伝えるための記号と規則の体系。",
+        "zh": "用于传达意义的符号和规则系统。",
+        "it": "Sistema di segni e regole usato per comunicare significato.",
+        "fr": "Système de signes et de règles utilisé pour communiquer du sens.",
+        "pt": "Sistema de sinais e regras usado para comunicar significado.",
+        "de": "System aus Zeichen und Regeln zur Vermittlung von Bedeutung."
+      }
+    },
+    {
+      "id": "dictionary",
+      "pos": "noun",
+      "forms": {
+        "es": [
+          "diccionario"
+        ],
+        "en": [
+          "dictionary"
+        ],
+        "ja": [
+          "辞書"
+        ],
+        "zh": [
+          "词典",
+          "字典"
+        ],
+        "it": [
+          "dizionario"
+        ],
+        "fr": [
+          "dictionnaire"
+        ],
+        "pt": [
+          "dicionário"
+        ],
+        "de": [
+          "wörterbuch"
+        ]
+      },
+      "glosses": {
+        "es": "Recurso que organiza palabras y explica sus significados o equivalencias.",
+        "en": "A resource that organizes words and explains their meanings or equivalents.",
+        "ja": "単語を整理し意味や対応語を説明する資料。",
+        "zh": "整理词语并解释其含义或对应词的资源。",
+        "it": "Risorsa che organizza parole e ne spiega significati o equivalenti.",
+        "fr": "Ressource qui organise les mots et explique leurs sens ou équivalents.",
+        "pt": "Recurso que organiza palavras e explica significados ou equivalentes.",
+        "de": "Nachschlagewerk, das Wörter ordnet und ihre Bedeutungen oder Entsprechungen erklärt."
+      }
+    },
+    {
+      "id": "food",
+      "pos": "noun",
+      "forms": {
+        "es": [
+          "comida",
+          "alimento"
+        ],
+        "en": [
+          "food"
+        ],
+        "ja": [
+          "食べ物"
+        ],
+        "zh": [
+          "食物"
+        ],
+        "it": [
+          "cibo"
+        ],
+        "fr": [
+          "nourriture",
+          "aliment"
+        ],
+        "pt": [
+          "comida",
+          "alimento"
+        ],
+        "de": [
+          "essen",
+          "nahrung"
+        ]
+      },
+      "glosses": {
+        "es": "Sustancia que se consume para obtener nutrición o energía.",
+        "en": "A substance consumed for nutrition or energy.",
+        "ja": "栄養やエネルギーを得るために摂取するもの。",
+        "zh": "为获得营养或能量而食用的物质。",
+        "it": "Sostanza consumata per nutrimento o energia.",
+        "fr": "Substance consommée pour la nutrition ou l’énergie.",
+        "pt": "Substância consumida para nutrição ou energia.",
+        "de": "Stoff, der zur Ernährung oder Energiegewinnung aufgenommen wird."
+      }
+    },
+    {
+      "id": "water",
+      "pos": "noun",
+      "forms": {
+        "es": [
+          "agua"
+        ],
+        "en": [
+          "water"
+        ],
+        "ja": [
+          "水"
+        ],
+        "zh": [
+          "水"
+        ],
+        "it": [
+          "acqua"
+        ],
+        "fr": [
+          "eau"
+        ],
+        "pt": [
+          "água"
+        ],
+        "de": [
+          "wasser"
+        ]
+      },
+      "glosses": {
+        "es": "Líquido esencial para la vida, formado por hidrógeno y oxígeno.",
+        "en": "A liquid essential for life, made of hydrogen and oxygen.",
+        "ja": "水素と酸素から成る生命に不可欠な液体。",
+        "zh": "由氢和氧组成、生命必需的液体。",
+        "it": "Liquido essenziale per la vita, composto da idrogeno e ossigeno.",
+        "fr": "Liquide essentiel à la vie, composé d’hydrogène et d’oxygène.",
+        "pt": "Líquido essencial à vida, formado por hidrogênio e oxigênio.",
+        "de": "Für das Leben wesentliche Flüssigkeit aus Wasserstoff und Sauerstoff."
+      }
+    },
+    {
+      "id": "plant",
+      "pos": "noun",
+      "forms": {
+        "es": [
+          "planta"
+        ],
+        "en": [
+          "plant"
+        ],
+        "ja": [
+          "植物"
+        ],
+        "zh": [
+          "植物"
+        ],
+        "it": [
+          "pianta"
+        ],
+        "fr": [
+          "plante"
+        ],
+        "pt": [
+          "planta"
+        ],
+        "de": [
+          "pflanze"
+        ]
+      },
+      "glosses": {
+        "es": "Organismo vivo que normalmente realiza fotosíntesis.",
+        "en": "A living organism that typically performs photosynthesis.",
+        "ja": "通常は光合成を行う生物。",
+        "zh": "通常进行光合作用的生物。",
+        "it": "Organismo vivente che normalmente svolge la fotosintesi.",
+        "fr": "Organisme vivant qui réalise généralement la photosynthèse.",
+        "pt": "Organismo vivo que normalmente realiza fotossíntese.",
+        "de": "Lebewesen, das normalerweise Photosynthese betreibt."
+      }
+    },
+    {
+      "id": "computer",
+      "pos": "noun",
+      "forms": {
+        "es": [
+          "computador",
+          "ordenador",
+          "computadora"
+        ],
+        "en": [
+          "computer"
+        ],
+        "ja": [
+          "コンピューター"
+        ],
+        "zh": [
+          "计算机",
+          "电脑"
+        ],
+        "it": [
+          "computer"
+        ],
+        "fr": [
+          "ordinateur"
+        ],
+        "pt": [
+          "computador"
+        ],
+        "de": [
+          "computer",
+          "rechner"
+        ]
+      },
+      "glosses": {
+        "es": "Dispositivo electrónico programable que procesa información.",
+        "en": "A programmable electronic device that processes information.",
+        "ja": "情報を処理するプログラム可能な電子機器。",
+        "zh": "处理信息的可编程电子设备。",
+        "it": "Dispositivo elettronico programmabile che elabora informazioni.",
+        "fr": "Appareil électronique programmable qui traite des informations.",
+        "pt": "Dispositivo eletrônico programável que processa informações.",
+        "de": "Programmierbares elektronisches Gerät zur Verarbeitung von Informationen."
+      }
+    },
+    {
+      "id": "learn",
+      "pos": "verb",
+      "forms": {
+        "es": [
+          "aprender"
+        ],
+        "en": [
+          "learn"
+        ],
+        "ja": [
+          "学ぶ"
+        ],
+        "zh": [
+          "学习"
+        ],
+        "it": [
+          "imparare"
+        ],
+        "fr": [
+          "apprendre"
+        ],
+        "pt": [
+          "aprender"
+        ],
+        "de": [
+          "lernen"
+        ]
+      },
+      "glosses": {
+        "es": "Adquirir conocimiento, habilidad o comprensión mediante experiencia o estudio.",
+        "en": "To acquire knowledge, skill, or understanding through experience or study.",
+        "ja": "経験や学習によって知識、技能、理解を得ること。",
+        "zh": "通过经验或学习获得知识、技能或理解。",
+        "it": "Acquisire conoscenza, abilità o comprensione tramite esperienza o studio.",
+        "fr": "Acquérir une connaissance, une compétence ou une compréhension par l’expérience ou l’étude.",
+        "pt": "Adquirir conhecimento, habilidade ou compreensão por experiência ou estudo.",
+        "de": "Wissen, Fähigkeiten oder Verständnis durch Erfahrung oder Studium erwerben."
+      }
+    },
+    {
+      "id": "owner",
+      "pos": "noun",
+      "forms": {
+        "es": [
+          "propietario",
+          "dueño"
+        ],
+        "en": [
+          "owner"
+        ],
+        "ja": [
+          "所有者"
+        ],
+        "zh": [
+          "所有者"
+        ],
+        "it": [
+          "proprietario"
+        ],
+        "fr": [
+          "propriétaire"
+        ],
+        "pt": [
+          "proprietário",
+          "dono"
+        ],
+        "de": [
+          "eigentümer",
+          "besitzer"
+        ]
+      },
+      "glosses": {
+        "es": "Persona que posee o administra legítimamente algo.",
+        "en": "A person who legitimately owns or administers something.",
+        "ja": "何かを正当に所有または管理する人。",
+        "zh": "合法拥有或管理某物的人。",
+        "it": "Persona che possiede o amministra legittimamente qualcosa.",
+        "fr": "Personne qui possède ou administre légitimement quelque chose.",
+        "pt": "Pessoa que possui ou administra legitimamente algo.",
+        "de": "Person, die etwas rechtmäßig besitzt oder verwaltet."
+      }
+    },
+    {
+      "id": "privacy",
+      "pos": "noun",
+      "forms": {
+        "es": [
+          "privacidad"
+        ],
+        "en": [
+          "privacy"
+        ],
+        "ja": [
+          "プライバシー"
+        ],
+        "zh": [
+          "隐私"
+        ],
+        "it": [
+          "privacy",
+          "riservatezza"
+        ],
+        "fr": [
+          "vie privée",
+          "confidentialité"
+        ],
+        "pt": [
+          "privacidade"
+        ],
+        "de": [
+          "privatsphäre",
+          "datenschutz"
+        ]
+      },
+      "glosses": {
+        "es": "Control legítimo sobre el acceso y uso de información personal.",
+        "en": "Legitimate control over access to and use of personal information.",
+        "ja": "個人情報へのアクセスと利用を正当に管理すること。",
+        "zh": "对个人信息访问和使用的合法控制。",
+        "it": "Controllo legittimo sull’accesso e uso delle informazioni personali.",
+        "fr": "Contrôle légitime de l’accès aux informations personnelles et de leur utilisation.",
+        "pt": "Controle legítimo sobre o acesso e uso de informações pessoais.",
+        "de": "Rechtmäßige Kontrolle über Zugriff auf und Nutzung persönlicher Informationen."
+      }
+    },
+    {
+      "id": "dog",
+      "pos": "noun",
+      "forms": {
+        "es": [
+          "perro",
+          "perra"
+        ],
+        "en": [
+          "dog"
+        ],
+        "ja": [
+          "犬"
+        ],
+        "zh": [
+          "狗"
+        ],
+        "it": [
+          "cane"
+        ],
+        "fr": [
+          "chien"
+        ],
+        "pt": [
+          "cão",
+          "cachorro"
+        ],
+        "de": [
+          "hund"
+        ]
+      },
+      "glosses": {
+        "es": "Mamífero doméstico de la familia de los cánidos.",
+        "en": "A domesticated mammal of the canine family.",
+        "ja": "イヌ科の家畜化された哺乳類。",
+        "zh": "犬科的家养哺乳动物。",
+        "it": "Mammifero domestico della famiglia dei canidi.",
+        "fr": "Mammifère domestique de la famille des canidés.",
+        "pt": "Mamífero doméstico da família dos canídeos.",
+        "de": "Ein domestiziertes Säugetier aus der Familie der Hunde."
+      }
+    },
+    {
+      "id": "prevention",
+      "pos": "noun",
+      "forms": {
+        "es": [
+          "prevención",
+          "prevencion"
+        ],
+        "en": [
+          "prevention"
+        ],
+        "ja": [
+          "予防"
+        ],
+        "zh": [
+          "预防"
+        ],
+        "it": [
+          "prevenzione"
+        ],
+        "fr": [
+          "prévention"
+        ],
+        "pt": [
+          "prevenção"
+        ],
+        "de": [
+          "prävention",
+          "vorbeugung"
+        ]
+      },
+      "glosses": {
+        "es": "Acción de evitar o reducir un riesgo antes de que ocurra.",
+        "en": "Action taken to avoid or reduce a risk before it occurs.",
+        "ja": "リスクが発生する前に回避または軽減する行為。",
+        "zh": "在风险发生前避免或降低风险的行动。",
+        "it": "Azione volta a evitare o ridurre un rischio prima che si verifichi.",
+        "fr": "Action visant à éviter ou réduire un risque avant qu’il ne survienne.",
+        "pt": "Ação para evitar ou reduzir um risco antes que ele ocorra.",
+        "de": "Maßnahme, die ein Risiko vor seinem Eintritt vermeidet oder verringert."
+      }
+    }
+  ]
+}

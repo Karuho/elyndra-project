@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "package_id": "programming.rust.modern-basic",
+  "name": "Rust moderno — Base práctica y verificable",
+  "version": "1.0.0",
+  "tier": "optional",
+  "domain": "programming/rust",
+  "language": "es",
+  "license_id": "CC0-1.0",
+  "publisher": "Proyecto Elyndra",
+  "tags": [
+    "rust",
+    "cargo",
+    "rustfmt",
+    "clippy",
+    "cargo-test",
+    "workspaces"
+  ],
+  "sources": [
+    {
+      "path": "rust-modern-basic.md",
+      "title": "Rust moderno — Base práctica y verificable",
+      "sha256": "5dfd01dd3816bbfdabbf7d8de83971ee624f73a16b24b7b3048b5904753302cd"
+    }
+  ]
+}

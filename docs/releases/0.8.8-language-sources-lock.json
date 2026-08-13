@@ -1,0 +1,130 @@
+{
+  "schema": 1,
+  "release": "0.8.8-alpha",
+  "retrieved_at": "2026-08-04",
+  "sources": [
+    {
+      "logical_source_id": "omw-mcr-spa-3.0",
+      "name": "Multilingual Central Repository Spanish WordNet 3.0",
+      "version_or_date": "omw-data v2.0 / MCR 3.0",
+      "official_url": "https://github.com/omwn/omw-data/tree/f75be19ec590da12a7a5665e361690b5badb7a25/wns/mcr",
+      "commit_or_tag": "v2.0 / f75be19ec590da12a7a5665e361690b5badb7a25",
+      "filename": "wn-data-spa.tab",
+      "size_bytes": 5995146,
+      "sha256_observed": "0ec37ce94ee2acc63ad6b120e1051f9841d172778cc24adc0023fb8dccf0a7cd",
+      "official_checksum": null,
+      "container_filename": "omw-data-v2.0.tar.gz",
+      "container_size_bytes": 43190293,
+      "container_sha256_observed": "fa364a240c4268e016775b68bc55458858a6ee30890906a9cb195cabd104e753",
+      "license": "CC-BY-3.0",
+      "notice_path": "wns/mcr/LICENSE",
+      "attribution": "Aitor Gonzalez-Agirre, Egoitz Laparra and German Rigau; Open Multilingual Wordnet.",
+      "retrieval_date": "2026-08-04",
+      "transformation": "Streaming adapter for spa:lemma and spa:def from the official OMW tab format.",
+      "extraction_tool_version_or_commit": "Elyndra 0.8.8-alpha",
+      "known_limitations": [
+        "The Spanish module has no synset-relation records; Princeton English relation data was not mixed into this pack.",
+        "1196 spa:exe records are omitted because the source identifies a synset, while Elyndra stores examples by sense."
+      ]
+    },
+    {
+      "logical_source_id": "eswiktionary-20260801",
+      "name": "Spanish Wiktionary pages-articles dump",
+      "version_or_date": "20260801",
+      "official_url": "https://dumps.wikimedia.org/eswiktionary/20260801/eswiktionary-20260801-pages-articles.xml.bz2",
+      "commit_or_tag": null,
+      "filename": "eswiktionary-20260801-pages-articles.xml.bz2",
+      "size_bytes": 88395194,
+      "sha256_observed": "6ba974e2ef5a5037803519dbe4462047d589d5d95a85bb0d933389a3674b4c63",
+      "official_checksum": "SHA-1 47ec6e1fa51a7a356e42bc8b1c7c768b47d284a7",
+      "license": "CC-BY-SA-4.0 and GFDL-1.3-or-later; page-specific additional terms may apply",
+      "notice_path": "https://foundation.wikimedia.org/wiki/Policy:Terms_of_Use",
+      "attribution": "Wikcionario contributors; Wikimedia Foundation does not endorse Elyndra.",
+      "retrieval_date": "2026-08-04",
+      "transformation": "Attempted one-process Spanish extraction to JSONL; no pack was built.",
+      "extraction_tool_version_or_commit": "wiktextract d9fa2335957c9089ce2c3fb110a075cf072903da; wikitextprocessor 9e92f4b53a98748f849ef6186617535abb0fca7b",
+      "status": "rejected",
+      "rejection_reason": "wiktextract_lua_ustring_module_failure",
+      "installable": false,
+      "output_accepted": false,
+      "known_limitations": [
+        "Extraction blocked: repeated lupa.lua51.LuaError for missing module ustring:ustring while expanding Template:lengua.",
+        "Partial JSONL output is invalid and must not be imported or redistributed."
+      ]
+    },
+    {
+      "logical_source_id": "kaikki-eswiktionary-20260801-raw",
+      "name": "Kaikki raw Wiktextract data for the Spanish Wiktionary edition",
+      "provider": "kaikki.org",
+      "upstream_provider": "Wikimedia",
+      "upstream_dump": "eswiktionary-20260703",
+      "version_or_date": "extraction 2026-08-01",
+      "extraction_date": "2026-08-01",
+      "wiktextract_commit": "d9fa233",
+      "wikitextprocessor_commit": "9e92f4b",
+      "official_url": "https://kaikki.org/eswiktionary/raw-wiktextract-data.jsonl.gz",
+      "filename": "kaikki-eswiktionary-20260801-raw-wiktextract-data.jsonl.gz",
+      "published_size": "95.8 MB compressed; 1.1 GB decompressed",
+      "size_bytes": 100451744,
+      "decompressed_size_bytes": 1192281449,
+      "sha256_observed": "ecd9e5080293b2f2214aab7c0e670db618479779ba4d0e56ed34caba3aaa4cc3",
+      "decompressed_sha256_observed": "8a3f36b3dc39efeefcddd20b7e0ee5e27e7e7a7f6cfeaace2c4ead46420d4c70",
+      "official_checksum": null,
+      "license": "CC-BY-SA-4.0 and GFDL-1.3-or-later; page-specific additional terms may apply",
+      "notice_path": "https://foundation.wikimedia.org/wiki/Policy:Terms_of_Use",
+      "attribution": "Wikcionario contributors; Wikimedia; Wiktextract; Kaikki.org. No endorsement implied.",
+      "retrieval_date": "2026-08-04",
+      "transformation": "pre-extracted raw Wiktextract JSONL; gzip-streamed into Elyndra's canonical pack schema",
+      "status": "accepted",
+      "installable": true,
+      "output_accepted": true,
+      "error_artifact": {
+        "official_url": "https://kaikki.org/eswiktionary/wiktextract-error-data.json.gz",
+        "filename": "kaikki-eswiktionary-20260801-wiktextract-error-data.json.gz",
+        "size_bytes": 135881,
+        "sha256_observed": "5bc0ac0d3d38ddb1c9ba4b77ab50fee17ab4a27590d288b033202c6fa6796742",
+        "counts": {
+          "debugs": 11434,
+          "errors": 1,
+          "notes": 7,
+          "warnings": 7,
+          "wiki_notices": 7
+        },
+        "main_categories": [
+          "Unprocessed section (11362)",
+          "Unmatched or unclosed HTML/ref tags",
+          "LUA error in pron-graf/mostrar (1)",
+          "Non-allowed mapframe tags omitted",
+          "Undefined Sound keys"
+        ],
+        "lexical_content": false
+      },
+      "known_limitations": [
+        "The edition contains multiple languages; only records with lang_code es and lang Español are imported.",
+        "The extraction error artifact is retained as evidence and never imported as lexical content.",
+        "Examples carrying an external ref are omitted because third-party licensing is ambiguous.",
+        "Named relation targets do not identify a stable target sense; Elyndra preserves only the source sense and target term."
+      ]
+    },
+    {
+      "logical_source_id": "unicode-cldr-es-48.2",
+      "name": "Unicode CLDR Spanish emoji annotations",
+      "version_or_date": "48.2 / 2026-03-17",
+      "official_url": "https://unicode.org/Public/cldr/48.2/cldr-common-48.2.zip",
+      "commit_or_tag": "48.2",
+      "filename": "cldr-common-48.2.zip",
+      "size_bytes": 36044097,
+      "sha256_observed": "d2844f9dbf6124d11a7b047f5381a467902d82a673be3d658f4c0791ffa0b83b",
+      "official_checksum": "SHA-512 de8660f5371e0fcfd03a42e3b4fc4c686ec6cd602b402f1e3d227844005a54eb7952873894443523837d5828c42874a1a267a19f91ded207a2d166144791fa62",
+      "license": "Unicode-3.0",
+      "notice_path": "LICENSE",
+      "attribution": "Copyright Unicode, Inc.; Unicode CLDR 48.2.",
+      "retrieval_date": "2026-08-04",
+      "transformation": "Streaming import of common/annotations/es.xml and common/annotationsDerived/es.xml only.",
+      "extraction_tool_version_or_commit": "Elyndra 0.8.8-alpha",
+      "known_limitations": [
+        "Annotations are lexical aids and never establish a user's emotional state."
+      ]
+    }
+  ]
+}

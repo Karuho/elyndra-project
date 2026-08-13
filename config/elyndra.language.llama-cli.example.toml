@@ -1,0 +1,20 @@
+[language]
+enabled = true
+backend = "llama-cli"
+binary = "/ruta/a/llama-cli"
+model = "/ruta/al/modelo.gguf"
+profile = "eco"
+
+[privacy]
+connectivity = "local-only"
+allow_remote = false
+
+[interaction]
+mode = "auto"
+preferred_language = "es"
+
+[provenance]
+license_id = "unverified"
+role = "runtime"
+teacher_allowed = false
+redistribution_allowed = false

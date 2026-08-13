@@ -1,0 +1,20 @@
+[language]
+enabled = true
+backend = "ollama-local"
+endpoint = "http://127.0.0.1:11434"
+model_name = "modelo-local:tag"
+profile = "eco"
+
+[privacy]
+connectivity = "local-only"
+allow_remote = false
+
+[interaction]
+mode = "auto"
+preferred_language = "es"
+
+[provenance]
+license_id = "unverified"
+role = "runtime"
+teacher_allowed = false
+redistribution_allowed = false

@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+build/
+dist/
+.venv/
+
+# Editors / OS
+.vscode/settings.json
+.idea/
+.DS_Store
+
+# Elyndra personal/runtime data
+.elyndra/
+data/
+/models/
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+config/elyndra.local.toml
+.env
+.env.*
+!.env.example
+
+# Logs and temporary files
+*.log
+*.tmp
+*.bak

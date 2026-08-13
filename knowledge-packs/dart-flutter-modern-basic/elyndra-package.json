@@ -1,0 +1,25 @@
+{
+  "schema_version": 1,
+  "package_id": "programming.dart-flutter.modern-basic",
+  "name": "Dart y Flutter modernos — Base práctica y verificable",
+  "version": "1.0.0",
+  "tier": "optional",
+  "domain": "programming/dart-flutter",
+  "language": "es",
+  "license_id": "CC0-1.0",
+  "publisher": "Proyecto Elyndra",
+  "tags": [
+    "dart",
+    "flutter",
+    "pubspec",
+    "analysis",
+    "testing"
+  ],
+  "sources": [
+    {
+      "path": "dart-flutter-modern-basic.md",
+      "title": "Dart y Flutter modernos — Base práctica y verificable",
+      "sha256": "80958082a0d35b09c78038f910c119ffc26bd8cc8f312ca72ee5e3aefc3fe8b0"
+    }
+  ]
+}

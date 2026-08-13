@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "package_id": "programming.ruby.modern-basic",
+  "name": "Ruby moderno — Base práctica y verificable",
+  "version": "1.0.0",
+  "tier": "optional",
+  "domain": "programming/ruby",
+  "language": "es",
+  "license_id": "CC0-1.0",
+  "publisher": "Proyecto Elyndra",
+  "tags": [
+    "ruby",
+    "bundler",
+    "rubocop",
+    "rspec",
+    "minitest",
+    "rails"
+  ],
+  "sources": [
+    {
+      "path": "ruby-modern-basic.md",
+      "title": "Ruby moderno — Base práctica y verificable",
+      "sha256": "af2df016c9f4960f5435e5e4dd6977a62d8d916f89c1ac62dfeba5fded220001"
+    }
+  ]
+}

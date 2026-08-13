@@ -1,0 +1,22 @@
+{
+  "id": "elyndra.translation.core-v1",
+  "version": "1.0.0",
+  "license": "CC0-1.0",
+  "description": "Frases exactas y plantillas mínimas para traducción local inmediata.",
+  "phrases": [
+    {
+      "id": "mother_spoils_me",
+      "source_forms": {
+        "es": ["mi mamá me mima", "mi mama me mima"]
+      },
+      "translations": {
+        "en": "My mom spoils me.",
+        "it": "Mia mamma mi vizia.",
+        "fr": "Ma mère me gâte.",
+        "pt": "Minha mãe me mima.",
+        "de": "Meine Mutter verwöhnt mich."
+      },
+      "pronunciation": {}
+    }
+  ]
+}

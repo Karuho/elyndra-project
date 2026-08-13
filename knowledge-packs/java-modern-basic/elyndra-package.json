@@ -1,0 +1,25 @@
+{
+  "schema_version": 1,
+  "package_id": "programming.java.modern-basic",
+  "name": "Java moderno — Base práctica y verificable",
+  "version": "1.0.0",
+  "tier": "optional",
+  "domain": "programming/java",
+  "language": "es",
+  "license_id": "CC0-1.0",
+  "publisher": "Proyecto Elyndra",
+  "tags": [
+    "java",
+    "jvm",
+    "maven",
+    "gradle",
+    "testing"
+  ],
+  "sources": [
+    {
+      "path": "java-modern-basic.md",
+      "title": "Java moderno — Base práctica y verificable",
+      "sha256": "eedccf633fc23e1b53aa45a650a294b1ff3ef0bcd711bb9e3f7ad55669ade2cc"
+    }
+  ]
+}

@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "package_id": "programming.go.modern-basic",
+  "name": "Go moderno — Base práctica y verificable",
+  "version": "1.0.0",
+  "tier": "optional",
+  "domain": "programming/go",
+  "language": "es",
+  "license_id": "CC0-1.0",
+  "publisher": "Proyecto Elyndra",
+  "tags": [
+    "go",
+    "golang",
+    "gofmt",
+    "go-vet",
+    "go-test",
+    "modules"
+  ],
+  "sources": [
+    {
+      "path": "go-modern-basic.md",
+      "title": "Go moderno — Base práctica y verificable",
+      "sha256": "b22f81c4346ba432abeac52b6d54271f0c34033f08da8e84dcf17f6ec7b02531"
+    }
+  ]
+}

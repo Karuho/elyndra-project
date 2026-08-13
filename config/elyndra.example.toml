@@ -1,0 +1,96 @@
+[agent]
+name = "Elyn"
+language = "es-CL"
+
+[owner]
+name = "TU_NOMBRE"
+system_user = "TU_USUARIO_LINUX"
+
+[privacy]
+offline = true
+telemetry = false
+network_allowed = false
+
+[ethics]
+# El núcleo ético no puede desactivarse. Esta opción solo controla sugerencias
+# proactivas de mejoras seguras, mantenibles o profesionales.
+proactive_advice = true
+# Los casos ambiguos pueden recibir una segunda revisión del modelo local.
+# El tutor nunca puede rebajar un bloqueo determinista de Elyndra.
+tutor_review = true
+
+[limits]
+max_search_results = 50
+command_timeout_seconds = 20
+
+[filesystem]
+allowed_roots = [
+  "/home/TU_USUARIO_LINUX/Proyectos",
+]
+
+[files]
+read_max_lines = 250
+
+[projects]
+scan_max_files = 5000
+
+[skills.php]
+timeout_seconds = 120
+max_output_chars = 12000
+
+[skills.python]
+timeout_seconds = 180
+max_output_chars = 12000
+
+[skills.java]
+timeout_seconds = 240
+max_output_chars = 12000
+
+[skills.kotlin]
+timeout_seconds = 240
+max_output_chars = 12000
+
+[skills.dotnet]
+timeout_seconds = 300
+max_output_chars = 12000
+
+[skills.native]
+timeout_seconds = 240
+max_output_chars = 12000
+
+[skills.ruby]
+timeout_seconds = 240
+max_output_chars = 12000
+
+[skills.go]
+timeout_seconds = 240
+max_output_chars = 12000
+
+[skills.rust]
+timeout_seconds = 300
+max_output_chars = 12000
+
+[skills.swift]
+timeout_seconds = 300
+max_output_chars = 12000
+
+[skills.dart]
+timeout_seconds = 300
+max_output_chars = 12000
+
+[skills.sql]
+timeout_seconds = 120
+max_output_chars = 12000
+
+[knowledge]
+max_file_size_mb = 5
+chunk_size_chars = 1800
+chunk_overlap_chars = 200
+allowed_extensions = [
+  ".txt", ".md", ".rst", ".py", ".php", ".js", ".mjs", ".cjs",
+  ".ts", ".tsx", ".jsx", ".java", ".cs", ".fs", ".vb", ".swift",
+  ".dart", ".csproj", ".fsproj", ".vbproj", ".sln", ".slnx", ".kt",
+  ".kts", ".css", ".scss", ".html", ".htm", ".json", ".toml",
+  ".yaml", ".yml", ".xml", ".sql", ".sh", ".ini", ".conf",
+  ".properties",
+]

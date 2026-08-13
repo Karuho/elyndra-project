@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "package_id": "programming.c-cpp.modern-basic",
+  "name": "C y C++ modernos — Base práctica y verificable",
+  "version": "1.0.0",
+  "tier": "optional",
+  "domain": "programming/c-cpp",
+  "language": "es",
+  "license_id": "CC0-1.0",
+  "publisher": "Proyecto Elyndra",
+  "tags": [
+    "c",
+    "cpp",
+    "gcc",
+    "clang",
+    "cmake",
+    "cppcheck"
+  ],
+  "sources": [
+    {
+      "path": "c-cpp-modern-basic.md",
+      "title": "C y C++ modernos — Base práctica y verificable",
+      "sha256": "f4a247412c7e00a4c4e64a34a30d2521e82cee4681e18d32ce55d25ce3243c7a"
+    }
+  ]
+}
