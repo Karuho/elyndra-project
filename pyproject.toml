@@ -14,7 +14,7 @@ license-files = [
   "NOTICE.md",
 ]
 authors = [
-  { name = "Carlos" }
+  { name = "DynaDev" }
 ]
 keywords = ["local-first", "personal-agent", "privacy", "offline", "assistant"]
 classifiers = [

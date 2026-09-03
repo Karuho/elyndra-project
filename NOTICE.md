@@ -1,8 +1,8 @@
 # Elyndra notices
 
-Required Notice: Copyright © 2026 Carlos. All rights reserved except those expressly granted under the applicable license.
+Required Notice: Copyright © 2026 DynaDev. All rights reserved except those expressly granted under the applicable license.
 
-Required Notice: Elyndra is an original software project created and maintained by Carlos.
+Required Notice: Elyndra is an original software project developed and maintained under the DynaDev name.
 
 Required Notice: Elyndra is made available for permitted noncommercial purposes under the PolyForm Noncommercial License 1.0.0.
 
