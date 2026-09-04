@@ -1,5 +1,9 @@
 """Bounded autonomy domain primitives for Elyndra."""
 
+from elyndra.autonomy.binding import (
+    AutonomyExecutionBinding,
+    ExecutionBindingError,
+)
 from elyndra.autonomy.capabilities import Capability, CapabilityGrant
 from elyndra.autonomy.execution import (
     CancellationToken,
@@ -27,12 +31,14 @@ from elyndra.autonomy.repository import AutonomyRepository
 from elyndra.autonomy.scope import WorkspaceScope
 
 __all__ = [
+    "AutonomyExecutionBinding",
     "AutonomyRepository",
     "AutonomyRun",
     "AutonomyRunStatus",
     "CancellationToken",
     "Capability",
     "CapabilityGrant",
+    "ExecutionBindingError",
     "ExecutionBudget",
     "ExecutionBudgetSnapshot",
     "ExecutionCancelled",
