@@ -2353,8 +2353,10 @@ class Database:
                     """
                 )
             self._migrate_gateway_phase3(connection, effective_role)
+            if effective_role == "vault":
+                self._migrate_autonomy_phase2(connection)
             connection.execute(
-                "INSERT OR REPLACE INTO schema_meta(key, value) VALUES('schema_version', '50')"
+                "INSERT OR REPLACE INTO schema_meta(key, value) VALUES('schema_version', '51')"
             )
         with suppress(PermissionError):
             self.path.chmod(0o600)
@@ -2416,6 +2418,198 @@ class Database:
             CREATE UNIQUE INDEX idx_gateway_one_active_download
             ON online_gateway_download_jobs((1))
             WHERE state IN ('approved','connecting','downloading','verifying');
+            """
+        )
+
+    @staticmethod
+    def _migrate_autonomy_phase2(connection: sqlite3.Connection) -> None:
+        connection.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS assistant_autonomy_runs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                public_id TEXT NOT NULL UNIQUE
+                    CHECK(length(public_id) BETWEEN 1 AND 128),
+                actor TEXT NOT NULL
+                    CHECK(length(actor) BETWEEN 1 AND 200),
+                workspace_root TEXT NOT NULL
+                    CHECK(length(workspace_root) BETWEEN 1 AND 4096),
+                objective TEXT NOT NULL
+                    CHECK(length(objective) BETWEEN 1 AND 4000),
+                status TEXT NOT NULL CHECK(status IN (
+                    'planned',
+                    'running',
+                    'waiting_human',
+                    'completed',
+                    'failed',
+                    'cancelled'
+                )),
+                grant_json TEXT NOT NULL
+                    CHECK(length(grant_json) BETWEEN 2 AND 65536),
+                plan_json TEXT NOT NULL
+                    CHECK(length(plan_json) BETWEEN 2 AND 262144),
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                started_at TEXT,
+                finished_at TEXT
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_autonomy_runs_status
+            ON assistant_autonomy_runs(status, id DESC);
+
+            CREATE INDEX IF NOT EXISTS idx_autonomy_runs_actor
+            ON assistant_autonomy_runs(actor, id DESC);
+
+            CREATE TABLE IF NOT EXISTS assistant_autonomy_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_id INTEGER NOT NULL,
+                sequence INTEGER NOT NULL CHECK(sequence >= 1),
+                event_type TEXT NOT NULL
+                    CHECK(length(event_type) BETWEEN 1 AND 64),
+                from_status TEXT CHECK(
+                    from_status IS NULL OR from_status IN (
+                        'planned',
+                        'running',
+                        'waiting_human',
+                        'completed',
+                        'failed',
+                        'cancelled'
+                    )
+                ),
+                to_status TEXT NOT NULL CHECK(to_status IN (
+                    'planned',
+                    'running',
+                    'waiting_human',
+                    'completed',
+                    'failed',
+                    'cancelled'
+                )),
+                step_id TEXT NOT NULL DEFAULT ''
+                    CHECK(length(step_id) <= 64),
+                summary TEXT NOT NULL
+                    CHECK(length(summary) BETWEEN 1 AND 2000),
+                payload_json TEXT NOT NULL DEFAULT '{}'
+                    CHECK(length(payload_json) <= 16384),
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(run_id)
+                    REFERENCES assistant_autonomy_runs(id)
+                    ON DELETE RESTRICT,
+                UNIQUE(run_id, sequence)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_autonomy_events_run
+            ON assistant_autonomy_events(run_id, sequence);
+
+            CREATE TABLE IF NOT EXISTS assistant_autonomy_human_gates (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                public_id TEXT NOT NULL UNIQUE
+                    CHECK(length(public_id) BETWEEN 1 AND 128),
+                run_id INTEGER NOT NULL,
+                kind TEXT NOT NULL CHECK(kind IN (
+                    'approval',
+                    'review',
+                    'external_side_effect'
+                )),
+                status TEXT NOT NULL CHECK(status IN (
+                    'pending',
+                    'approved',
+                    'rejected',
+                    'cancelled'
+                )),
+                reason TEXT NOT NULL
+                    CHECK(length(reason) BETWEEN 1 AND 2000),
+                created_at TEXT NOT NULL,
+                resolved_at TEXT,
+                resolved_by TEXT CHECK(
+                    resolved_by IS NULL OR length(resolved_by) BETWEEN 1 AND 200
+                ),
+                FOREIGN KEY(run_id)
+                    REFERENCES assistant_autonomy_runs(id)
+                    ON DELETE RESTRICT,
+                CHECK(
+                    (
+                        status = 'pending'
+                        AND resolved_at IS NULL
+                        AND resolved_by IS NULL
+                    )
+                    OR
+                    (
+                        status IN ('approved', 'rejected', 'cancelled')
+                        AND resolved_at IS NOT NULL
+                        AND resolved_by IS NOT NULL
+                    )
+                )
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_autonomy_gates_run
+            ON assistant_autonomy_human_gates(run_id, id DESC);
+
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_autonomy_one_pending_gate
+            ON assistant_autonomy_human_gates(run_id)
+            WHERE status = 'pending';
+
+            CREATE TRIGGER IF NOT EXISTS trg_autonomy_runs_authority_immutable
+            BEFORE UPDATE OF
+                actor,
+                workspace_root,
+                objective,
+                grant_json,
+                plan_json,
+                created_at
+            ON assistant_autonomy_runs
+            WHEN
+                NEW.actor != OLD.actor
+                OR NEW.workspace_root != OLD.workspace_root
+                OR NEW.objective != OLD.objective
+                OR NEW.grant_json != OLD.grant_json
+                OR NEW.plan_json != OLD.plan_json
+                OR NEW.created_at != OLD.created_at
+            BEGIN
+                SELECT RAISE(ABORT, 'autonomy_run_authority_immutable');
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS trg_autonomy_events_no_update
+            BEFORE UPDATE ON assistant_autonomy_events
+            BEGIN
+                SELECT RAISE(ABORT, 'autonomy_events_append_only');
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS trg_autonomy_events_no_delete
+            BEFORE DELETE ON assistant_autonomy_events
+            BEGIN
+                SELECT RAISE(ABORT, 'autonomy_events_append_only');
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS trg_autonomy_gate_identity_immutable
+            BEFORE UPDATE OF
+                public_id,
+                run_id,
+                kind,
+                reason,
+                created_at
+            ON assistant_autonomy_human_gates
+            WHEN
+                NEW.public_id != OLD.public_id
+                OR NEW.run_id != OLD.run_id
+                OR NEW.kind != OLD.kind
+                OR NEW.reason != OLD.reason
+                OR NEW.created_at != OLD.created_at
+            BEGIN
+                SELECT RAISE(ABORT, 'autonomy_gate_identity_immutable');
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS trg_autonomy_gate_resolved_immutable
+            BEFORE UPDATE ON assistant_autonomy_human_gates
+            WHEN OLD.status != 'pending'
+            BEGIN
+                SELECT RAISE(ABORT, 'autonomy_gate_already_resolved');
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS trg_autonomy_gate_resolution_status
+            BEFORE UPDATE OF status ON assistant_autonomy_human_gates
+            WHEN NEW.status NOT IN ('approved', 'rejected', 'cancelled')
+            BEGIN
+                SELECT RAISE(ABORT, 'autonomy_gate_invalid_resolution');
+            END;
             """
         )
 

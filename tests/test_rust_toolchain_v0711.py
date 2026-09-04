@@ -291,7 +291,7 @@ def test_rust_profile_and_control_center(isolated_home: ElyndraPaths) -> None:
         version = connection.execute(
             "SELECT value FROM schema_meta WHERE key = 'schema_version'"
         ).fetchone()[0]
-    assert version == "50"
+    assert version == "51"
 
 
 def test_rust_knowledge_package_is_valid(isolated_home: ElyndraPaths) -> None:

@@ -39,7 +39,7 @@ def _service(
     )
 
 
-def test_schema_50_is_role_scoped_and_idempotent(tmp_path: Path) -> None:
+def test_schema_51_preserves_gateway_role_scope_and_is_idempotent(tmp_path: Path) -> None:
     root = _database(tmp_path / "root.sqlite3", "root")
     vault = _database(tmp_path / "vault.sqlite3", "vault")
     root.migrate()
@@ -49,7 +49,7 @@ def test_schema_50_is_role_scoped_and_idempotent(tmp_path: Path) -> None:
             connection.execute(
                 "SELECT value FROM schema_meta WHERE key='schema_version'"
             ).fetchone()[0]
-            == "50"
+            == "51"
         )
         assert connection.execute(
             "SELECT 1 FROM sqlite_master WHERE name='online_gateway_sources'"
@@ -65,7 +65,7 @@ def test_schema_50_is_role_scoped_and_idempotent(tmp_path: Path) -> None:
             connection.execute(
                 "SELECT value FROM schema_meta WHERE key='schema_version'"
             ).fetchone()[0]
-            == "50"
+            == "51"
         )
         assert connection.execute(
             "SELECT 1 FROM sqlite_master WHERE name='account_gateway_operations'"
@@ -110,7 +110,7 @@ def test_exact_previous_schema_data_is_preserved(tmp_path: Path, role: str) -> N
             connection.execute(
                 "SELECT value FROM schema_meta WHERE key='schema_version'"
             ).fetchone()[0]
-            == "50"
+            == "51"
         )
 
 

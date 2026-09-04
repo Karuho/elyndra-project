@@ -476,7 +476,7 @@ def test_schema_advances_to_26_for_change_proposals(
             "SELECT name FROM sqlite_master "
             "WHERE type='table' AND name='assistant_change_proposals'"
         ).fetchone()
-    assert schema == "50"
+    assert schema == "51"
     assert table is not None
 
 

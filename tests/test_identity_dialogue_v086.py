@@ -496,7 +496,7 @@ def test_release_v086_schema_and_version(isolated_home: ElyndraPaths) -> None:
                 "SELECT name FROM sqlite_master WHERE type = 'table'"
             ).fetchall()
         }
-    assert schema == "50"
+    assert schema == "51"
     assert __version__ == "0.8.10-alpha"
     assert {
         "local_accounts",

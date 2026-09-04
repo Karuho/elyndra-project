@@ -306,6 +306,6 @@ def test_schema_advances_to_30_with_ethics_review_table(
             ).fetchall()
         }
 
-    assert schema == "50"
+    assert schema == "51"
     assert "assistant_ethics_reviews" in tables
     assert len(app.skills.list_all()) == 102

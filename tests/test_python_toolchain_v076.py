@@ -359,7 +359,7 @@ def test_python_control_center_and_schema(isolated_home: ElyndraPaths) -> None:
             "SELECT value FROM schema_meta WHERE key = 'schema_version'"
         ).fetchone()[0]
     assert {"ruff_enabled", "mypy_config", "pytest_path"} <= columns
-    assert version == "50"
+    assert version == "51"
 
 
 def test_shipped_python_package_is_valid(isolated_home: ElyndraPaths) -> None:

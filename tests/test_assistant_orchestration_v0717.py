@@ -248,7 +248,7 @@ def test_schema_advances_to_25_for_action_run_history(
         table = connection.execute(
             "SELECT name FROM sqlite_master WHERE type='table' AND name='assistant_action_runs'"
         ).fetchone()
-    assert schema == "50"
+    assert schema == "51"
     assert table is not None
 
 

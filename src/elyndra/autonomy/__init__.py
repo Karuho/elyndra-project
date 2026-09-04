@@ -10,9 +10,11 @@ from elyndra.autonomy.models import (
     RunPlan,
     RunStep,
 )
+from elyndra.autonomy.repository import AutonomyRepository
 from elyndra.autonomy.scope import WorkspaceScope
 
 __all__ = [
+    "AutonomyRepository",
     "AutonomyRun",
     "AutonomyRunStatus",
     "Capability",

@@ -199,7 +199,7 @@ def test_release_v087_version_and_schema(isolated_home: ElyndraPaths) -> None:
             "SELECT value FROM schema_meta WHERE key = 'schema_version'"
         ).fetchone()[0]
     assert __version__ == "0.8.10-alpha"
-    assert schema == "50"
+    assert schema == "51"
 
 class _NoRedirect(HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: ANN001
