@@ -303,7 +303,7 @@ def test_schema_36_and_control_surface_do_not_store_raw_tutor_text(
     assert "prompt" not in comparison_columns
     assert "output_text" not in comparison_columns
     assert schema == "50"
-    assert __version__ == "0.8.9-alpha"
+    assert __version__ == "0.8.10-alpha"
 
 
 def test_duplicate_comparison_rolls_back_without_orphan_record(

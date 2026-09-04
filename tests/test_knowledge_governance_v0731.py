@@ -253,7 +253,7 @@ def test_schema_39_adds_non_destructive_knowledge_governance(
             )
         }
     assert schema == "50"
-    assert __version__ == "0.8.9-alpha"
+    assert __version__ == "0.8.10-alpha"
     assert conflict_table is not None
     assert {"revalidate_after", "validation_status", "last_revalidated_at"} <= columns
     assert "deleted_at" not in columns

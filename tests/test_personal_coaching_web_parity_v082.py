@@ -137,7 +137,7 @@ def test_http_stream_returns_local_organizer_and_runtime_version(
         done = next(event["response"] for event in events if event["type"] == "done")
 
         assert done["meta"]["engine"] == "local-personal-organizer"
-        assert done["meta"]["runtime_version"] == "0.8.9-alpha"
+        assert done["meta"]["runtime_version"] == "0.8.10-alpha"
         assert done["elapsed_ms"] < 5_000
         assert "Control médico web" in done["message"]
     finally:
@@ -164,8 +164,8 @@ def test_personal_web_page_identifies_runtime_and_requires_approval(
         with urlopen(f"{base}/personal", timeout=3) as response:
             page = response.read().decode("utf-8")
             runtime_header = response.headers["X-Elyndra-Version"]
-        assert "Elyndra 0.8.9-alpha" in page
-        assert runtime_header == "0.8.9-alpha"
+        assert "Elyndra 0.8.10-alpha" in page
+        assert runtime_header == "0.8.10-alpha"
 
         payload = {
             "title": "Compromiso web",
@@ -187,7 +187,7 @@ def test_personal_web_page_identifies_runtime_and_requires_approval(
 
         with urlopen(f"{base}/api/personal/overview", timeout=3) as response:
             overview = json.load(response)
-        assert overview["runtime_version"] == "0.8.9-alpha"
+        assert overview["runtime_version"] == "0.8.10-alpha"
         assert overview["interface_parity"]["deterministic_routes_shared"] is True
     finally:
         server.shutdown()

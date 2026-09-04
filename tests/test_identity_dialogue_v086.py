@@ -319,7 +319,7 @@ def test_web_registration_login_user_mode_profile_and_encrypted_export(
         assert status == 200
         assert bootstrap["auth"]["authenticated"] is True
         assert bootstrap["developer_mode"] is False
-        assert bootstrap["version"] == "0.8.9-alpha"
+        assert bootstrap["version"] == "0.8.10-alpha"
 
         status, _, _ = _request_json(
             base, local_token, "/api/control/overview", cookie=cookie
@@ -497,7 +497,7 @@ def test_release_v086_schema_and_version(isolated_home: ElyndraPaths) -> None:
             ).fetchall()
         }
     assert schema == "50"
-    assert __version__ == "0.8.9-alpha"
+    assert __version__ == "0.8.10-alpha"
     assert {
         "local_accounts",
         "account_sessions",
