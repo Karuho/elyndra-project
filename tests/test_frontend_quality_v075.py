@@ -293,7 +293,7 @@ def test_web_profile_migration_adds_quality_columns(isolated_home: ElyndraPaths)
         ).fetchone()[0]
 
     assert {"eslint_enabled", "stylelint_enabled", "framework_preset"} <= columns
-    assert version == "50"
+    assert version == "51"
 
 
 def test_existing_v074_database_is_migrated_without_recreating_profiles(
@@ -342,4 +342,4 @@ def test_existing_v074_database_is_migrated_without_recreating_profiles(
         version = connection.execute(
             "SELECT value FROM schema_meta WHERE key = 'schema_version'"
         ).fetchone()[0]
-    assert version == "50"
+    assert version == "51"

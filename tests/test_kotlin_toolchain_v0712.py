@@ -336,7 +336,7 @@ def test_kotlin_control_center_schema_and_registry(
         version = connection.execute(
             "SELECT value FROM schema_meta WHERE key = 'schema_version'"
         ).fetchone()[0]
-    assert version == "50"
+    assert version == "51"
 
 
 def test_kotlin_knowledge_package_and_security_contract(

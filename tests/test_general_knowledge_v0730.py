@@ -154,7 +154,7 @@ def test_schema_38_and_general_knowledge_are_non_destructive(
 
     status = app.general_knowledge.status()
     control = service.control_tutors()
-    assert schema == "50"
+    assert schema == "51"
     assert __version__ == "0.8.10-alpha"
     assert status["knowledge_deletion_allowed"] is False
     assert status["silent_learning"] is False
@@ -400,7 +400,7 @@ def test_migration_37_to_38_preserves_existing_tutor_knowledge(
             "SELECT name FROM sqlite_master WHERE type = 'table' "
             "AND name = 'assistant_general_knowledge'"
         ).fetchone()
-    assert schema == "50"
+    assert schema == "51"
     assert preserved is not None
     assert new_table is not None
 

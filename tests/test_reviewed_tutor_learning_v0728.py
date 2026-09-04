@@ -302,7 +302,7 @@ def test_schema_36_and_control_surface_do_not_store_raw_tutor_text(
     assert "evidence_comparisons" in control
     assert "prompt" not in comparison_columns
     assert "output_text" not in comparison_columns
-    assert schema == "50"
+    assert schema == "51"
     assert __version__ == "0.8.10-alpha"
 
 

@@ -295,7 +295,7 @@ def test_schema_40_adds_multisource_and_scope_columns(
                 "PRAGMA table_info(assistant_general_knowledge)"
             )
         }
-    assert schema == "50"
+    assert schema == "51"
     assert {
         "evidence_sources_json",
         "domain",

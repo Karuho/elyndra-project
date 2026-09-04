@@ -151,7 +151,7 @@ def test_schema_37_and_evolution_status_are_non_destructive(
 
     control = service.control_tutors()
     status = app.tutor_evolution.status()
-    assert schema == "50"
+    assert schema == "51"
     assert __version__ == "0.8.10-alpha"
     assert status["knowledge_deletion_allowed"] is False
     assert status["automatic_promotion"] is False
@@ -497,6 +497,6 @@ def test_migration_36_to_37_preserves_existing_tutor_data(
             "SELECT name FROM sqlite_master WHERE type = 'table' "
             "AND name = 'assistant_tutor_knowledge'"
         ).fetchone()
-    assert schema == "50"
+    assert schema == "51"
     assert preserved is not None
     assert new_table is not None

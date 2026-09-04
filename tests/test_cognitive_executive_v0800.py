@@ -64,7 +64,7 @@ def test_schema_41_and_executive_status(isolated_home: ElyndraPaths) -> None:
             )
         }
 
-    assert schema == "50"
+    assert schema == "51"
     assert __version__ == "0.8.10-alpha"
     assert {
         "assistant_executive_decisions",

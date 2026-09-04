@@ -318,5 +318,5 @@ def test_web_control_exposes_tutors_and_schema_35(
 
     assert control["status"]["authority_transferred"] is False
     assert "tutors" in overview
-    assert schema == "50"
+    assert schema == "51"
     assert __version__ == "0.8.10-alpha"

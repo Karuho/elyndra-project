@@ -175,5 +175,5 @@ def test_web_control_exposes_translation_preferences_and_schema_35(
     assert preferences["status"]["silent_learning"] is False
     assert overview["translation"]["complete_translation_engine"] is False
     assert overview["preferences"]["approval_required"] is True
-    assert version == "50"
+    assert version == "51"
     assert "reviewed_preferences" in tables

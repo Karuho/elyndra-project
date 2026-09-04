@@ -82,7 +82,7 @@ def test_schema_42_version_and_organizer_status(
             )
         }
 
-    assert schema == "50"
+    assert schema == "51"
     assert __version__ == "0.8.10-alpha"
     assert {
         "assistant_organizer_items",

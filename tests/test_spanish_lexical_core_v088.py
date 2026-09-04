@@ -114,7 +114,7 @@ def test_schema_49_roles_are_explicit_and_fail_closed(tmp_path: Path) -> None:
         role = connection.execute(
             "SELECT value FROM schema_meta WHERE key='database_role'"
         ).fetchone()[0]
-        assert schema == "50"
+        assert schema == "51"
         assert role == "root"
     with pytest.raises(RuntimeError, match="Rol de base incompatible"):
         Database(tmp_path / "root.db", role="vault").migrate()
@@ -223,7 +223,7 @@ def test_schema_48_root_and_vault_migrate_idempotently(tmp_path: Path) -> None:
             assert migrated.execute("SELECT value FROM preserved").fetchone()[0] == "intacto"
             assert migrated.execute(
                 "SELECT value FROM schema_meta WHERE key='schema_version'"
-            ).fetchone()[0] == "50"
+            ).fetchone()[0] == "51"
             assert migrated.execute(
                 "SELECT value FROM schema_meta WHERE key='database_role'"
             ).fetchone()[0] == role

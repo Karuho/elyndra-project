@@ -218,7 +218,7 @@ def test_schema_advances_to_28_for_development_sessions(
                 "SELECT name FROM sqlite_master WHERE type = 'table'"
             ).fetchall()
         }
-    assert schema == "50"
+    assert schema == "51"
     assert "assistant_development_sessions" in tables
     assert "assistant_development_session_events" in tables
     assert len(app.skills.list_all()) == 102
