@@ -155,7 +155,7 @@ def test_schema_38_and_general_knowledge_are_non_destructive(
     status = app.general_knowledge.status()
     control = service.control_tutors()
     assert schema == "50"
-    assert __version__ == "0.8.9-alpha"
+    assert __version__ == "0.8.10-alpha"
     assert status["knowledge_deletion_allowed"] is False
     assert status["silent_learning"] is False
     assert status["automatic_promotion"] is False

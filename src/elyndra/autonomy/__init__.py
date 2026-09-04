@@ -1,0 +1,26 @@
+"""Bounded autonomy domain primitives for Elyndra."""
+
+from elyndra.autonomy.capabilities import Capability, CapabilityGrant
+from elyndra.autonomy.models import (
+    AutonomyRun,
+    AutonomyRunStatus,
+    HumanGate,
+    HumanGateKind,
+    HumanGateStatus,
+    RunPlan,
+    RunStep,
+)
+from elyndra.autonomy.scope import WorkspaceScope
+
+__all__ = [
+    "AutonomyRun",
+    "AutonomyRunStatus",
+    "Capability",
+    "CapabilityGrant",
+    "HumanGate",
+    "HumanGateKind",
+    "HumanGateStatus",
+    "RunPlan",
+    "RunStep",
+    "WorkspaceScope",
+]

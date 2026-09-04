@@ -9,9 +9,9 @@ def test_release_version_and_public_docs_are_synchronized() -> None:
     root = Path(__file__).resolve().parents[1]
     pyproject = (root / "pyproject.toml").read_text(encoding="utf-8")
     readme = (root / "README.md").read_text(encoding="utf-8")
-    assert elyndra.__version__ == "0.8.9-alpha"
-    assert 'version = "0.8.9-alpha"' in pyproject
-    assert "Status: `0.8.9-alpha`" in readme
+    assert elyndra.__version__ == "0.8.10-alpha"
+    assert 'version = "0.8.10-alpha"' in pyproject
+    assert "Status: `0.8.10-alpha`" in readme
     assert (root / "docs" / "RELEASE_0.7.25.md").is_file()
     assert (root / "docs" / "RELEASE_0.7.28.md").is_file()
     assert (root / "docs" / "RELEASE_0.7.31.md").is_file()

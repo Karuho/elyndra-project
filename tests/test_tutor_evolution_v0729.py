@@ -152,7 +152,7 @@ def test_schema_37_and_evolution_status_are_non_destructive(
     control = service.control_tutors()
     status = app.tutor_evolution.status()
     assert schema == "50"
-    assert __version__ == "0.8.9-alpha"
+    assert __version__ == "0.8.10-alpha"
     assert status["knowledge_deletion_allowed"] is False
     assert status["automatic_promotion"] is False
     assert "lesson_evaluations" in control

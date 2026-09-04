@@ -9,7 +9,7 @@ and ETags are never recorded. Empty initial partials without strong ETags are re
 **Elyndra** is a source-available, local-first framework for building a private personal agent.
 Its memory, permissions, tools and identity belong to the person running it.
 
-> Status: `0.8.9-alpha` — local assistant with a deny-by-default controlled HTTPS gateway validated
+> Status: `0.8.10-alpha` — local assistant with a deny-by-default controlled HTTPS gateway validated
 > only against deterministic loopback dependencies in Phases 3 and 4.
 
 ## Controlled Online Gateway — Phase 4

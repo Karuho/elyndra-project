@@ -156,7 +156,7 @@ def test_web_scheduler_requires_approval_and_shares_notifications(
 
         with urlopen(f"{base}/personal", timeout=3) as response:
             page = response.read().decode("utf-8")
-        assert "Elyndra 0.8.9-alpha" in page
+        assert "Elyndra 0.8.10-alpha" in page
         assert 'id="personal-scheduler-start"' in page
         assert 'id="personal-local-notifications"' in page
 
