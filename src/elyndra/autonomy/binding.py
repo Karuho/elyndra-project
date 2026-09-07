@@ -4,7 +4,12 @@ from datetime import UTC, datetime
 from typing import Any
 
 from elyndra.autonomy.capabilities import Capability, CapabilityGrant
-from elyndra.autonomy.execution import CancellationToken, ExecutionContract
+from elyndra.autonomy.execution import (
+    CancellationToken,
+    ExecutionBudgetSnapshot,
+    ExecutionContract,
+    ExecutionRequest,
+)
 from elyndra.autonomy.models import (
     AutonomyRun,
     AutonomyRunStatus,
@@ -44,6 +49,31 @@ _STEP_KEYS = frozenset(
 
 class ExecutionBindingError(PermissionError):
     """Persisted autonomy state cannot safely become an execution contract."""
+
+
+class _RepositoryExecutionReservationBackend:
+    def __init__(
+        self,
+        repository: AutonomyRepository,
+        *,
+        actor: str,
+    ) -> None:
+        self.repository = repository
+        self.actor = actor
+
+    def reserve(
+        self,
+        request: ExecutionRequest,
+        *,
+        runtime_seconds: int = 0,
+        retry: bool = False,
+    ) -> ExecutionBudgetSnapshot:
+        return self.repository.reserve_execution(
+            request,
+            actor=self.actor,
+            runtime_seconds=runtime_seconds,
+            retry=retry,
+        )
 
 
 class AutonomyExecutionBinding:
@@ -158,13 +188,25 @@ class AutonomyExecutionBinding:
                 "started_at no puede ser anterior a created_at."
             )
 
+        budget = self.repository.execution_budget(
+            trusted_run_id,
+            actor=trusted_actor,
+        )
+
+        reservation_backend = _RepositoryExecutionReservationBackend(
+            self.repository,
+            actor=trusted_actor,
+        )
+
         return ExecutionContract(
             run_id=trusted_run_id,
             plan=plan,
             workspace=workspace,
             grant=grant,
             approved_step_ids=approved_step_ids,
+            budget=budget,
             cancellation=cancellation,
+            reservation_backend=reservation_backend,
         )
 
 
