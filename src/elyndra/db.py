@@ -2355,8 +2355,9 @@ class Database:
             self._migrate_gateway_phase3(connection, effective_role)
             if effective_role == "vault":
                 self._migrate_autonomy_phase2(connection)
+                self._migrate_autonomy_phase5(connection)
             connection.execute(
-                "INSERT OR REPLACE INTO schema_meta(key, value) VALUES('schema_version', '51')"
+                "INSERT OR REPLACE INTO schema_meta(key, value) VALUES('schema_version', '52')"
             )
         with suppress(PermissionError):
             self.path.chmod(0o600)
@@ -2609,6 +2610,59 @@ class Database:
             WHEN NEW.status NOT IN ('approved', 'rejected', 'cancelled')
             BEGIN
                 SELECT RAISE(ABORT, 'autonomy_gate_invalid_resolution');
+            END;
+            """
+        )
+
+    @staticmethod
+    def _migrate_autonomy_phase5(connection: sqlite3.Connection) -> None:
+        connection.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS assistant_autonomy_execution_reservations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                request_id TEXT NOT NULL UNIQUE
+                    CHECK(length(request_id) BETWEEN 1 AND 128),
+                request_sha256 TEXT NOT NULL
+                    CHECK(length(request_sha256) = 64),
+                run_id INTEGER NOT NULL,
+                sequence INTEGER NOT NULL CHECK(sequence >= 1),
+                step_id TEXT NOT NULL
+                    CHECK(length(step_id) BETWEEN 1 AND 64),
+                capability TEXT NOT NULL
+                    CHECK(length(capability) BETWEEN 1 AND 128),
+                runtime_seconds INTEGER NOT NULL
+                    CHECK(runtime_seconds >= 0),
+                is_retry INTEGER NOT NULL
+                    CHECK(is_retry IN (0, 1)),
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(run_id)
+                    REFERENCES assistant_autonomy_runs(id)
+                    ON DELETE RESTRICT,
+                UNIQUE(run_id, sequence)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_autonomy_execution_reservations_run
+            ON assistant_autonomy_execution_reservations(
+                run_id,
+                sequence
+            );
+
+            CREATE TRIGGER IF NOT EXISTS trg_autonomy_execution_reservations_no_update
+            BEFORE UPDATE ON assistant_autonomy_execution_reservations
+            BEGIN
+                SELECT RAISE(
+                    ABORT,
+                    'autonomy_execution_reservations_append_only'
+                );
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS trg_autonomy_execution_reservations_no_delete
+            BEFORE DELETE ON assistant_autonomy_execution_reservations
+            BEGIN
+                SELECT RAISE(
+                    ABORT,
+                    'autonomy_execution_reservations_append_only'
+                );
             END;
             """
         )

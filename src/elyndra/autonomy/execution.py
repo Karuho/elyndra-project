@@ -139,6 +139,20 @@ class ExecutionBudget:
             max_runtime_seconds=grant.max_runtime_seconds,
         )
 
+    @classmethod
+    def from_snapshot(
+        cls,
+        snapshot: ExecutionBudgetSnapshot,
+    ) -> ExecutionBudget:
+        return cls(
+            max_commands=snapshot.max_commands,
+            max_retries=snapshot.max_retries,
+            max_runtime_seconds=snapshot.max_runtime_seconds,
+            commands_reserved=snapshot.commands_reserved,
+            retries_reserved=snapshot.retries_reserved,
+            runtime_seconds_reserved=snapshot.runtime_seconds_reserved,
+        )
+
     def snapshot(self) -> ExecutionBudgetSnapshot:
         return ExecutionBudgetSnapshot(
             max_commands=self.max_commands,
@@ -261,6 +275,19 @@ class ExecutionRequest:
         object.__setattr__(self, "target", target)
 
 
+class ExecutionReservationBackend(Protocol):
+    """Durable budget reservation interface used by a trusted control plane."""
+
+    def reserve(
+        self,
+        request: ExecutionRequest,
+        *,
+        runtime_seconds: int = 0,
+        retry: bool = False,
+    ) -> ExecutionBudgetSnapshot:
+        ...
+
+
 @dataclass(frozen=True, slots=True)
 class PreparedExecution:
     request: ExecutionRequest
@@ -331,6 +358,7 @@ class ExecutionContract:
         approved_step_ids: frozenset[str] = frozenset(),
         budget: ExecutionBudget | None = None,
         cancellation: CancellationToken | None = None,
+        reservation_backend: ExecutionReservationBackend | None = None,
     ) -> None:
         self.run_id = _required(run_id, "run_id", 128)
         self.plan = plan
@@ -338,6 +366,7 @@ class ExecutionContract:
         self.grant = grant
         self.budget = budget or ExecutionBudget.from_grant(grant)
         self.cancellation = cancellation or CancellationToken()
+        self.reservation_backend = reservation_backend
 
         self.budget.require_within(grant)
 
@@ -382,11 +411,6 @@ class ExecutionContract:
 
         resolved_target = self._resolve_target(step)
 
-        budget = self.budget.reserve(
-            runtime_seconds=runtime_seconds,
-            retry=retry,
-        )
-
         request = ExecutionRequest(
             run_id=self.run_id,
             step_id=step.step_id,
@@ -396,12 +420,63 @@ class ExecutionContract:
             requires_human_gate=step.requires_human_gate,
         )
 
+        if self.reservation_backend is None:
+            budget = self.budget.reserve(
+                runtime_seconds=runtime_seconds,
+                retry=retry,
+            )
+        else:
+            reserved = self.reservation_backend.reserve(
+                request,
+                runtime_seconds=runtime_seconds,
+                retry=retry,
+            )
+            budget = self._accept_reserved_snapshot(reserved)
+
         return PreparedExecution(
             request=request,
             resolved_target=resolved_target,
             budget=budget,
             prepared_at=_utcnow(),
         )
+
+    def _accept_reserved_snapshot(
+        self,
+        snapshot: ExecutionBudgetSnapshot,
+    ) -> ExecutionBudgetSnapshot:
+        durable = ExecutionBudget.from_snapshot(snapshot)
+        durable.require_within(self.grant)
+
+        expected_limits = (
+            self.grant.max_commands,
+            self.grant.max_retries,
+            self.grant.max_runtime_seconds,
+        )
+        actual_limits = (
+            durable.max_commands,
+            durable.max_retries,
+            durable.max_runtime_seconds,
+        )
+
+        if actual_limits != expected_limits:
+            raise ExecutionDenied(
+                "El backend durable devolvió límites distintos "
+                "del CapabilityGrant congelado."
+            )
+
+        current = self.budget.snapshot()
+        if (
+            durable.commands_reserved < current.commands_reserved
+            or durable.retries_reserved < current.retries_reserved
+            or durable.runtime_seconds_reserved
+            < current.runtime_seconds_reserved
+        ):
+            raise ExecutionDenied(
+                "El backend durable intentó reducir presupuesto ya consumido."
+            )
+
+        self.budget = durable
+        return durable.snapshot()
 
     def _resolve_target(self, step: RunStep) -> str | None:
         if step.capability in _PATH_CAPABILITIES:

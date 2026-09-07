@@ -1,22 +1,54 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import uuid
 from datetime import UTC, datetime
 from typing import Any
 
-from elyndra.autonomy.capabilities import CapabilityGrant
+from elyndra.autonomy.capabilities import Capability, CapabilityGrant
+from elyndra.autonomy.execution import (
+    ExecutionBudget,
+    ExecutionBudgetSnapshot,
+    ExecutionRequest,
+)
 from elyndra.autonomy.models import (
     AutonomyRun,
     AutonomyRunStatus,
     HumanGateKind,
     HumanGateStatus,
     RunPlan,
+    RunStep,
 )
 from elyndra.db import Database
 
 _STEP_ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
+
+_GRANT_KEYS = frozenset(
+    {
+        "capabilities",
+        "issued_at",
+        "expires_at",
+        "max_steps",
+        "max_retries",
+        "max_commands",
+        "max_runtime_seconds",
+        "allowed_hosts",
+    }
+)
+
+_PLAN_KEYS = frozenset({"objective", "steps"})
+
+_PLAN_STEP_KEYS = frozenset(
+    {
+        "step_id",
+        "capability",
+        "action",
+        "target",
+        "requires_human_gate",
+    }
+)
 
 _TERMINAL_STATUSES = frozenset(
     {
@@ -481,6 +513,377 @@ class AutonomyRepository:
             raise RuntimeError("No se pudo recuperar el run después de resolver el gate.")
         return item
 
+    def execution_budget(
+        self,
+        run_id: str,
+        *,
+        actor: str,
+    ) -> ExecutionBudget:
+        with self.database.connect() as connection:
+            row = self._owned_run(
+                connection,
+                run_id,
+                actor=actor,
+            )
+            grant = _grant_from_json(str(row["grant_json"]))
+            return self._execution_budget_from_connection(
+                connection,
+                run_db_id=int(row["id"]),
+                grant=grant,
+            )
+
+    def reserve_execution(
+        self,
+        request: ExecutionRequest,
+        *,
+        actor: str,
+        runtime_seconds: int = 0,
+        retry: bool = False,
+    ) -> ExecutionBudgetSnapshot:
+        if not isinstance(request, ExecutionRequest):
+            raise TypeError("request debe ser un ExecutionRequest.")
+
+        if isinstance(runtime_seconds, bool) or not isinstance(
+            runtime_seconds,
+            int,
+        ):
+            raise TypeError("runtime_seconds debe ser un entero.")
+
+        if runtime_seconds < 0:
+            raise ValueError("runtime_seconds no puede ser negativo.")
+
+        if not isinstance(retry, bool):
+            raise TypeError("retry debe ser booleano.")
+
+        request_sha256 = _reservation_sha256(
+            request,
+            runtime_seconds=runtime_seconds,
+            retry=retry,
+        )
+
+        with self.database.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+
+            row = self._owned_run(
+                connection,
+                request.run_id,
+                actor=actor,
+            )
+
+            if str(row["status"]) != AutonomyRunStatus.RUNNING.value:
+                raise PermissionError(
+                    "Solo un AutonomyRun running puede reservar ejecución."
+                )
+
+            grant = _grant_from_json(str(row["grant_json"]))
+            if grant.is_expired(at=_utcnow()):
+                raise PermissionError(
+                    "CapabilityGrant expirado; no puede reservar ejecución."
+                )
+
+            plan = _plan_from_json(str(row["plan_json"]))
+            step = next(
+                (
+                    item
+                    for item in plan.steps
+                    if item.step_id == request.step_id
+                ),
+                None,
+            )
+
+            if step is None:
+                raise PermissionError(
+                    "ExecutionRequest apunta a un step ajeno "
+                    "al plan congelado."
+                )
+
+            if (
+                step.capability is not request.capability
+                or step.action != request.action
+                or step.target != request.target
+                or step.requires_human_gate
+                is not request.requires_human_gate
+            ):
+                raise PermissionError(
+                    "ExecutionRequest no coincide con el step congelado."
+                )
+
+            if step.requires_human_gate:
+                self._require_step_human_gate_approved(
+                    connection,
+                    run_db_id=int(row["id"]),
+                    step_id=step.step_id,
+                )
+
+            existing = connection.execute(
+                """
+                SELECT
+                    run_id,
+                    request_sha256
+                FROM assistant_autonomy_execution_reservations
+                WHERE request_id = ?
+                """,
+                (request.request_id,),
+            ).fetchone()
+
+            if existing is not None:
+                if (
+                    int(existing["run_id"]) != int(row["id"])
+                    or str(existing["request_sha256"])
+                    != request_sha256
+                ):
+                    raise PermissionError(
+                        "request_id reutilizado con una reserva diferente."
+                    )
+
+                return self._execution_budget_from_connection(
+                    connection,
+                    run_db_id=int(row["id"]),
+                    grant=grant,
+                ).snapshot()
+
+            budget = self._execution_budget_from_connection(
+                connection,
+                run_db_id=int(row["id"]),
+                grant=grant,
+            )
+
+            snapshot = budget.reserve(
+                runtime_seconds=runtime_seconds,
+                retry=retry,
+            )
+
+            sequence = int(
+                connection.execute(
+                    """
+                    SELECT COALESCE(MAX(sequence), 0) + 1
+                    FROM assistant_autonomy_execution_reservations
+                    WHERE run_id = ?
+                    """,
+                    (int(row["id"]),),
+                ).fetchone()[0]
+            )
+
+            connection.execute(
+                """
+                INSERT INTO assistant_autonomy_execution_reservations(
+                    request_id,
+                    request_sha256,
+                    run_id,
+                    sequence,
+                    step_id,
+                    capability,
+                    runtime_seconds,
+                    is_retry,
+                    created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    request.request_id,
+                    request_sha256,
+                    int(row["id"]),
+                    sequence,
+                    request.step_id,
+                    request.capability.value,
+                    runtime_seconds,
+                    1 if retry else 0,
+                    _now(),
+                ),
+            )
+
+            return snapshot
+
+    @staticmethod
+    def _require_step_human_gate_approved(
+        connection: Any,
+        *,
+        run_db_id: int,
+        step_id: str,
+    ) -> None:
+        request_events = connection.execute(
+            """
+            SELECT
+                sequence,
+                payload_json
+            FROM assistant_autonomy_events
+            WHERE
+                run_id = ?
+                AND event_type = 'human_gate_requested'
+                AND step_id = ?
+            ORDER BY sequence ASC
+            """,
+            (
+                run_db_id,
+                step_id,
+            ),
+        ).fetchall()
+
+        if not request_events:
+            raise PermissionError(
+                f"El step {step_id} requiere HumanGate aprobado."
+            )
+
+        approval_events = connection.execute(
+            """
+            SELECT
+                sequence,
+                payload_json
+            FROM assistant_autonomy_events
+            WHERE
+                run_id = ?
+                AND event_type = 'human_gate_approved'
+            ORDER BY sequence ASC
+            """,
+            (run_db_id,),
+        ).fetchall()
+
+        parsed_approvals: dict[str, int] = {}
+
+        for event in approval_events:
+            try:
+                payload = json.loads(str(event["payload_json"]))
+            except json.JSONDecodeError as exc:
+                raise PermissionError(
+                    "Audit de aprobación de HumanGate inválido."
+                ) from exc
+
+            if not isinstance(payload, dict):
+                raise PermissionError(
+                    "Audit de aprobación de HumanGate inválido."
+                )
+
+            gate_id = payload.get("gate_id")
+            decision = payload.get("decision")
+
+            if not isinstance(gate_id, str) or not gate_id.strip():
+                raise PermissionError(
+                    "Audit de aprobación de HumanGate sin gate_id válido."
+                )
+
+            if decision != HumanGateStatus.APPROVED.value:
+                raise PermissionError(
+                    "Evento human_gate_approved con decision inconsistente."
+                )
+
+            if gate_id in parsed_approvals:
+                raise PermissionError(
+                    "HumanGate con múltiples eventos de aprobación."
+                )
+
+            parsed_approvals[gate_id] = int(event["sequence"])
+
+        for event in request_events:
+            try:
+                payload = json.loads(str(event["payload_json"]))
+            except json.JSONDecodeError as exc:
+                raise PermissionError(
+                    "Audit de solicitud de HumanGate inválido."
+                ) from exc
+
+            if not isinstance(payload, dict):
+                raise PermissionError(
+                    "Audit de solicitud de HumanGate inválido."
+                )
+
+            gate_id = payload.get("gate_id")
+            kind = payload.get("kind")
+
+            if not isinstance(gate_id, str) or not gate_id.strip():
+                raise PermissionError(
+                    "Audit de solicitud de HumanGate sin gate_id válido."
+                )
+
+            try:
+                audited_kind = HumanGateKind(kind)
+            except (TypeError, ValueError) as exc:
+                raise PermissionError(
+                    "Audit de solicitud de HumanGate con kind inválido."
+                ) from exc
+
+            gate = connection.execute(
+                """
+                SELECT
+                    kind,
+                    status
+                FROM assistant_autonomy_human_gates
+                WHERE
+                    run_id = ?
+                    AND public_id = ?
+                """,
+                (
+                    run_db_id,
+                    gate_id,
+                ),
+            ).fetchone()
+
+            if gate is None:
+                continue
+
+            if str(gate["status"]) != HumanGateStatus.APPROVED.value:
+                continue
+
+            if str(gate["kind"]) != audited_kind.value:
+                raise PermissionError(
+                    "El kind del HumanGate no coincide con su audit."
+                )
+
+            approval_sequence = parsed_approvals.get(gate_id)
+            if approval_sequence is None:
+                continue
+
+            if approval_sequence <= int(event["sequence"]):
+                raise PermissionError(
+                    "La aprobación de HumanGate precede o coincide "
+                    "con su solicitud."
+                )
+
+            return
+
+        raise PermissionError(
+            f"El step {step_id} requiere HumanGate aprobado."
+        )
+
+    @staticmethod
+    def _execution_budget_from_connection(
+        connection: Any,
+        *,
+        run_db_id: int,
+        grant: CapabilityGrant,
+    ) -> ExecutionBudget:
+        usage = connection.execute(
+            """
+            SELECT
+                COUNT(*) AS commands_reserved,
+                COALESCE(SUM(is_retry), 0) AS retries_reserved,
+                COALESCE(SUM(runtime_seconds), 0)
+                    AS runtime_seconds_reserved
+            FROM assistant_autonomy_execution_reservations
+            WHERE run_id = ?
+            """,
+            (run_db_id,),
+        ).fetchone()
+
+        if usage is None:
+            raise RuntimeError(
+                "No se pudo calcular el execution budget persistido."
+            )
+
+        try:
+            return ExecutionBudget(
+                max_commands=grant.max_commands,
+                max_retries=grant.max_retries,
+                max_runtime_seconds=grant.max_runtime_seconds,
+                commands_reserved=int(usage["commands_reserved"]),
+                retries_reserved=int(usage["retries_reserved"]),
+                runtime_seconds_reserved=int(
+                    usage["runtime_seconds_reserved"]
+                ),
+            )
+        except (TypeError, ValueError) as exc:
+            raise PermissionError(
+                "El ledger persistido excede o viola el CapabilityGrant."
+            ) from exc
+
     def _owned_run(
         self,
         connection: Any,
@@ -689,26 +1092,198 @@ def _required(value: str, label: str, maximum: int) -> str:
 
 
 def _require_grant_active_json(encoded: str) -> None:
+    grant = _grant_from_json(encoded)
+
+    if grant.is_expired(at=_utcnow()):
+        raise PermissionError(
+            "CapabilityGrant expirado; se requiere un nuevo grant explícito."
+        )
+
+
+def _grant_from_json(encoded: str) -> CapabilityGrant:
     try:
         payload = json.loads(encoded)
-        expires_raw = payload["expires_at"]
-        if not isinstance(expires_raw, str):
-            raise TypeError("expires_at must be a string")
-        expires_at = datetime.fromisoformat(expires_raw)
-    except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+
+        if not isinstance(payload, dict):
+            raise TypeError("grant must be an object")
+
+        if frozenset(payload) != _GRANT_KEYS:
+            raise ValueError("grant fields mismatch")
+
+        capabilities_raw = payload["capabilities"]
+        allowed_hosts_raw = payload["allowed_hosts"]
+
+        if not isinstance(capabilities_raw, list):
+            raise TypeError("capabilities must be a list")
+
+        if not isinstance(allowed_hosts_raw, list):
+            raise TypeError("allowed_hosts must be a list")
+
+        grant = CapabilityGrant(
+            capabilities=frozenset(
+                Capability(_required(item, "capability", 128))
+                for item in capabilities_raw
+            ),
+            issued_at=_parse_iso_datetime(
+                payload["issued_at"],
+                "issued_at",
+            ),
+            expires_at=_parse_iso_datetime(
+                payload["expires_at"],
+                "expires_at",
+            ),
+            max_steps=_json_int(
+                payload["max_steps"],
+                "max_steps",
+            ),
+            max_retries=_json_int(
+                payload["max_retries"],
+                "max_retries",
+            ),
+            max_commands=_json_int(
+                payload["max_commands"],
+                "max_commands",
+            ),
+            max_runtime_seconds=_json_int(
+                payload["max_runtime_seconds"],
+                "max_runtime_seconds",
+            ),
+            allowed_hosts=tuple(
+                _required(item, "allowed_host", 255)
+                for item in allowed_hosts_raw
+            ),
+        )
+    except (
+        KeyError,
+        TypeError,
+        ValueError,
+        json.JSONDecodeError,
+    ) as exc:
         raise PermissionError(
             "CapabilityGrant persistido inválido; autoridad denegada."
         ) from exc
 
-    if expires_at.tzinfo is None or expires_at.utcoffset() is None:
-        raise PermissionError(
-            "CapabilityGrant persistido sin zona horaria; autoridad denegada."
-        )
+    return grant
 
-    if _utcnow() >= expires_at:
-        raise PermissionError(
-            "CapabilityGrant expirado; se requiere un nuevo grant explícito."
+
+def _plan_from_json(encoded: str) -> RunPlan:
+    try:
+        payload = json.loads(encoded)
+
+        if not isinstance(payload, dict):
+            raise TypeError("plan must be an object")
+
+        if frozenset(payload) != _PLAN_KEYS:
+            raise ValueError("plan fields mismatch")
+
+        steps_raw = payload["steps"]
+        if not isinstance(steps_raw, list):
+            raise TypeError("steps must be a list")
+
+        steps: list[RunStep] = []
+
+        for raw_step in steps_raw:
+            if not isinstance(raw_step, dict):
+                raise TypeError("step must be an object")
+
+            if frozenset(raw_step) != _PLAN_STEP_KEYS:
+                raise ValueError("step fields mismatch")
+
+            requires_gate = raw_step["requires_human_gate"]
+            if not isinstance(requires_gate, bool):
+                raise TypeError(
+                    "requires_human_gate must be boolean"
+                )
+
+            target = raw_step["target"]
+            if not isinstance(target, str):
+                raise TypeError("target must be text")
+
+            steps.append(
+                RunStep(
+                    step_id=_required(
+                        raw_step["step_id"],
+                        "step_id",
+                        64,
+                    ),
+                    capability=Capability(
+                        _required(
+                            raw_step["capability"],
+                            "capability",
+                            128,
+                        )
+                    ),
+                    action=_required(
+                        raw_step["action"],
+                        "action",
+                        160,
+                    ),
+                    target=target,
+                    requires_human_gate=requires_gate,
+                )
+            )
+
+        return RunPlan(
+            objective=_required(
+                payload["objective"],
+                "objective",
+                4_000,
+            ),
+            steps=tuple(steps),
         )
+    except (
+        KeyError,
+        TypeError,
+        ValueError,
+        json.JSONDecodeError,
+    ) as exc:
+        raise PermissionError(
+            "RunPlan persistido inválido; autoridad denegada."
+        ) from exc
+
+
+def _reservation_sha256(
+    request: ExecutionRequest,
+    *,
+    runtime_seconds: int,
+    retry: bool,
+) -> str:
+    encoded = json.dumps(
+        {
+            "request_id": request.request_id,
+            "run_id": request.run_id,
+            "step_id": request.step_id,
+            "capability": request.capability.value,
+            "action": request.action,
+            "target": request.target,
+            "requires_human_gate": request.requires_human_gate,
+            "runtime_seconds": runtime_seconds,
+            "retry": retry,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _parse_iso_datetime(value: object, label: str) -> datetime:
+    if not isinstance(value, str):
+        raise TypeError(f"{label} must be text")
+
+    parsed = datetime.fromisoformat(value)
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise ValueError(f"{label} must include timezone")
+
+    return parsed
+
+
+def _json_int(value: object, label: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError(f"{label} must be an integer")
+    return value
 
 
 def _transition_event(status: AutonomyRunStatus) -> str:
