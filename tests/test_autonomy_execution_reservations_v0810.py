@@ -1111,12 +1111,13 @@ def test_schema_55_upgrade_creates_execution_results_ledger(
         second_request,
         actor="owner",
         runtime_seconds=command.timeout_seconds,
+        retry=True,
     )
     repository._claim_execution_launch(
         second_request,
         actor="owner",
         runtime_seconds=command.timeout_seconds,
-        retry=False,
+        retry=True,
     )
 
     with database.connect() as connection:
