@@ -312,11 +312,29 @@ class PreparedExecution:
     resolved_target: str | None
     budget: ExecutionBudgetSnapshot
     command_snapshot: CommandSnapshot | None = None
+    reserved_runtime_seconds: int = 0
+    retry: bool = False
     prepared_at: datetime = field(default_factory=lambda: datetime.now(UTC))
 
     def __post_init__(self) -> None:
         if self.prepared_at.tzinfo is None or self.prepared_at.utcoffset() is None:
             raise ValueError("prepared_at debe incluir zona horaria.")
+
+        if (
+            isinstance(self.reserved_runtime_seconds, bool)
+            or not isinstance(self.reserved_runtime_seconds, int)
+        ):
+            raise TypeError(
+                "reserved_runtime_seconds debe ser un entero."
+            )
+
+        if self.reserved_runtime_seconds < 0:
+            raise ValueError(
+                "reserved_runtime_seconds no puede ser negativo."
+            )
+
+        if not isinstance(self.retry, bool):
+            raise TypeError("retry debe ser booleano.")
 
         if self.request.capability is Capability.PROCESS_EXEC:
             if not isinstance(self.command_snapshot, CommandSnapshot):
@@ -330,6 +348,24 @@ class PreparedExecution:
             ):
                 raise ValueError(
                     "CommandSnapshot no coincide con ExecutionRequest."
+                )
+
+            if (
+                self.reserved_runtime_seconds
+                != self.command_snapshot.spec.timeout_seconds
+            ):
+                raise ValueError(
+                    "process.exec debe reservar exactamente "
+                    "CommandSpec.timeout_seconds."
+                )
+
+            if (
+                self.resolved_target
+                != self.command_snapshot.resolved_cwd
+            ):
+                raise ValueError(
+                    "resolved_target no coincide con "
+                    "CommandSnapshot.resolved_cwd."
                 )
         elif self.command_snapshot is not None:
             raise ValueError(
@@ -345,6 +381,11 @@ class ExecutionResult:
     exit_code: int | None = None
     duration_ms: int = 0
     error_code: str = ""
+    stdout: str = ""
+    stderr: str = ""
+    timed_out: bool = False
+    stdout_truncated: bool = False
+    stderr_truncated: bool = False
 
     def __post_init__(self) -> None:
         request_id = _required(self.request_id, "request_id", 128)
@@ -362,6 +403,19 @@ class ExecutionResult:
         error_code = self.error_code.strip()
         if len(error_code) > 80:
             raise ValueError("error_code supera 80 caracteres.")
+
+        if not isinstance(self.stdout, str):
+            raise TypeError("stdout debe ser texto.")
+        if not isinstance(self.stderr, str):
+            raise TypeError("stderr debe ser texto.")
+
+        for label, value in (
+            ("timed_out", self.timed_out),
+            ("stdout_truncated", self.stdout_truncated),
+            ("stderr_truncated", self.stderr_truncated),
+        ):
+            if not isinstance(value, bool):
+                raise TypeError(f"{label} debe ser booleano.")
 
         object.__setattr__(self, "request_id", request_id)
         object.__setattr__(self, "summary", summary)
@@ -525,6 +579,8 @@ class ExecutionContract:
             resolved_target=resolved_target,
             budget=budget,
             command_snapshot=command_snapshot,
+            reserved_runtime_seconds=reservation_runtime,
+            retry=retry,
             prepared_at=_utcnow(),
         )
 

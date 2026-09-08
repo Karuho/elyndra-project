@@ -760,6 +760,250 @@ class AutonomyRepository:
 
             return snapshot
 
+    def verify_execution_reservation(
+        self,
+        request: ExecutionRequest,
+        *,
+        actor: str,
+        runtime_seconds: int,
+        retry: bool,
+    ) -> ExecutionBudgetSnapshot:
+        if not isinstance(request, ExecutionRequest):
+            raise TypeError(
+                "request debe ser un ExecutionRequest."
+            )
+
+        if (
+            isinstance(runtime_seconds, bool)
+            or not isinstance(runtime_seconds, int)
+        ):
+            raise TypeError(
+                "runtime_seconds debe ser un entero."
+            )
+
+        if runtime_seconds < 0:
+            raise ValueError(
+                "runtime_seconds no puede ser negativo."
+            )
+
+        if not isinstance(retry, bool):
+            raise TypeError("retry debe ser booleano.")
+
+        request_sha256 = _reservation_sha256(
+            request,
+            runtime_seconds=runtime_seconds,
+            retry=retry,
+        )
+
+        with self.database.connect() as connection:
+            run_row = self._owned_run(
+                connection,
+                request.run_id,
+                actor=actor,
+            )
+
+            row = connection.execute(
+                """
+                SELECT
+                    request_sha256,
+                    run_id,
+                    step_id,
+                    capability,
+                    command_sha256,
+                    runtime_seconds,
+                    is_retry
+                FROM assistant_autonomy_execution_reservations
+                WHERE request_id = ?
+                """,
+                (request.request_id,),
+            ).fetchone()
+
+            if row is None:
+                raise PermissionError(
+                    "No existe una reserva durable para "
+                    "ExecutionRequest."
+                )
+
+            stored_command_sha256 = (
+                ""
+                if row["command_sha256"] is None
+                else str(row["command_sha256"])
+            )
+
+            if (
+                int(row["run_id"]) != int(run_row["id"])
+                or str(row["request_sha256"])
+                != request_sha256
+                or str(row["step_id"]) != request.step_id
+                or str(row["capability"])
+                != request.capability.value
+                or stored_command_sha256
+                != request.command_sha256
+                or int(row["runtime_seconds"])
+                != runtime_seconds
+                or bool(int(row["is_retry"])) is not retry
+            ):
+                raise PermissionError(
+                    "La reserva durable no coincide exactamente "
+                    "con ExecutionRequest."
+                )
+
+        # assistant_autonomy_execution_reservations es append-only:
+        # una vez verificada la existencia, reserve_execution()
+        # puede reutilizarse como revalidación idempotente completa
+        # de run/grant/plan/gate/CommandSnapshot sin crear otra fila.
+        return self.reserve_execution(
+            request,
+            actor=actor,
+            runtime_seconds=runtime_seconds,
+            retry=retry,
+        )
+
+    def claim_execution_launch(
+        self,
+        request: ExecutionRequest,
+        *,
+        actor: str,
+        runtime_seconds: int,
+        retry: bool,
+    ) -> None:
+        if not isinstance(request, ExecutionRequest):
+            raise TypeError(
+                "request debe ser un ExecutionRequest."
+            )
+
+        if request.capability is not Capability.PROCESS_EXEC:
+            raise PermissionError(
+                "Solo process.exec puede consumir un launch claim."
+            )
+
+        if (
+            isinstance(runtime_seconds, bool)
+            or not isinstance(runtime_seconds, int)
+        ):
+            raise TypeError(
+                "runtime_seconds debe ser un entero."
+            )
+
+        if runtime_seconds < 0:
+            raise ValueError(
+                "runtime_seconds no puede ser negativo."
+            )
+
+        if not isinstance(retry, bool):
+            raise TypeError("retry debe ser booleano.")
+
+        request_sha256 = _reservation_sha256(
+            request,
+            runtime_seconds=runtime_seconds,
+            retry=retry,
+        )
+
+        with self.database.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+
+            run_row = self._owned_run(
+                connection,
+                request.run_id,
+                actor=actor,
+            )
+
+            if (
+                str(run_row["status"])
+                != AutonomyRunStatus.RUNNING.value
+            ):
+                raise PermissionError(
+                    "Solo un AutonomyRun running puede iniciar launch."
+                )
+
+            grant = _grant_from_json(
+                str(run_row["grant_json"])
+            )
+
+            if grant.is_expired(at=_utcnow()):
+                raise PermissionError(
+                    "CapabilityGrant expirado antes del launch."
+                )
+
+            reservation = connection.execute(
+                """
+                SELECT
+                    request_sha256,
+                    run_id,
+                    step_id,
+                    capability,
+                    command_sha256,
+                    runtime_seconds,
+                    is_retry
+                FROM assistant_autonomy_execution_reservations
+                WHERE request_id = ?
+                """,
+                (request.request_id,),
+            ).fetchone()
+
+            if reservation is None:
+                raise PermissionError(
+                    "No existe una reserva durable para launch."
+                )
+
+            stored_command_sha256 = (
+                ""
+                if reservation["command_sha256"] is None
+                else str(reservation["command_sha256"])
+            )
+
+            if (
+                int(reservation["run_id"])
+                != int(run_row["id"])
+                or str(reservation["request_sha256"])
+                != request_sha256
+                or str(reservation["step_id"])
+                != request.step_id
+                or str(reservation["capability"])
+                != request.capability.value
+                or stored_command_sha256
+                != request.command_sha256
+                or int(reservation["runtime_seconds"])
+                != runtime_seconds
+                or bool(int(reservation["is_retry"])) is not retry
+            ):
+                raise PermissionError(
+                    "La reserva durable no coincide con el launch."
+                )
+
+            existing = connection.execute(
+                """
+                SELECT 1
+                FROM assistant_autonomy_execution_launches
+                WHERE request_id = ?
+                """,
+                (request.request_id,),
+            ).fetchone()
+
+            if existing is not None:
+                raise PermissionError(
+                    "ExecutionRequest ya fue consumido para launch."
+                )
+
+            connection.execute(
+                """
+                INSERT INTO assistant_autonomy_execution_launches(
+                    request_id,
+                    request_sha256,
+                    run_id,
+                    command_sha256,
+                    created_at
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    request.request_id,
+                    request_sha256,
+                    int(run_row["id"]),
+                    request.command_sha256,
+                    _now(),
+                ),
+            )
+
     @staticmethod
     def _require_step_human_gate_approved(
         connection: Any,

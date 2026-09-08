@@ -329,7 +329,7 @@ def test_sql_profile_and_control_center(isolated_home: ElyndraPaths) -> None:
         version = connection.execute(
             "SELECT value FROM schema_meta WHERE key = 'schema_version'"
         ).fetchone()[0]
-    assert version == "54"
+    assert version == "55"
 
 
 def test_sql_profile_rejects_unsafe_exclusion(isolated_home: ElyndraPaths) -> None:
