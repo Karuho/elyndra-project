@@ -105,10 +105,7 @@ class _TailCollector:
     def text(self) -> str:
         clean = _ANSI_ESCAPE.sub(b"", bytes(self.data))
         clean = clean.replace(b"\x00", b"")
-        return clean.decode(
-            "utf-8",
-            errors="replace",
-        ).strip()
+        return _sanitized_utf8_tail(clean, self.limit)
 
 
 class BubblewrapExecutor:
@@ -297,21 +294,41 @@ class BubblewrapExecutor:
 
             # Última frontera durable antes de producir efectos:
             # un request_id puede iniciar como máximo un proceso.
-            self.repository.claim_execution_launch(
+            receipt = self.repository._claim_execution_launch(
                 request,
                 actor=self.actor,
                 runtime_seconds=prepared.reserved_runtime_seconds,
                 retry=prepared.retry,
             )
 
-            cancellation.require_active()
+            if cancellation.cancelled:
+                result = ExecutionResult(
+                    request_id=request.request_id,
+                    outcome=ExecutionOutcome.CANCELLED,
+                    summary=(
+                        "Proceso sandboxed cancelado "
+                        "antes del launch."
+                    ),
+                    exit_code=None,
+                    duration_ms=0,
+                    error_code="cancelled",
+                )
+            else:
+                result = self._run(
+                    argv,
+                    prepared=prepared,
+                    cancellation=cancellation,
+                    pass_fd=executable_fd,
+                )
 
-            return self._run(
-                argv,
-                prepared=prepared,
-                cancellation=cancellation,
-                pass_fd=executable_fd,
+            self.repository._record_execution_result(
+                request,
+                result,
+                actor=self.actor,
+                receipt=receipt,
             )
+
+            return result
 
     def _build_bwrap_argv(
         self,
@@ -438,7 +455,13 @@ class BubblewrapExecutor:
                     * 1000
                 ),
                 error_code="sandbox_launch_failed",
-                stderr=str(exc),
+                stderr=_sanitized_utf8_tail(
+                    str(exc).encode(
+                        "utf-8",
+                        errors="replace",
+                    ),
+                    command.stderr_limit_bytes,
+                ),
             )
 
         assert process.stdout is not None
@@ -577,6 +600,25 @@ class BubblewrapExecutor:
                 stderr_collector.truncated
             ),
         )
+
+
+def _sanitized_utf8_tail(
+    value: bytes,
+    limit: int,
+) -> str:
+    sanitized = value.decode(
+        "utf-8",
+        errors="replace",
+    ).strip()
+    encoded = sanitized.encode("utf-8")
+
+    if len(encoded) <= limit:
+        return sanitized
+
+    clipped = encoded[-limit:]
+    while clipped and clipped[0] & 0xC0 == 0x80:
+        clipped = clipped[1:]
+    return clipped.decode("utf-8")
 
 
 def _trusted_bwrap_path() -> str:
