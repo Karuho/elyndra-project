@@ -4,6 +4,7 @@ from elyndra.autonomy.binding import (
     AutonomyExecutionBinding,
     ExecutionBindingError,
 )
+from elyndra.autonomy.bubblewrap_executor import BubblewrapExecutor
 from elyndra.autonomy.capabilities import Capability, CapabilityGrant
 from elyndra.autonomy.commands import (
     CommandEnvironmentProfile,
@@ -44,6 +45,7 @@ __all__ = [
     "AutonomyRepository",
     "AutonomyRun",
     "AutonomyRunStatus",
+    "BubblewrapExecutor",
     "CancellationToken",
     "Capability",
     "CapabilityGrant",

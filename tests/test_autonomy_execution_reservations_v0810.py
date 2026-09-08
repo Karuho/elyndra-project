@@ -118,7 +118,7 @@ def _request(
     )
 
 
-def test_schema_54_reservation_ledger_is_vault_scoped_and_idempotent(
+def test_schema_55_reservation_ledger_is_vault_scoped_and_idempotent(
     tmp_path: Path,
 ) -> None:
     root = Database(tmp_path / "root.sqlite3", role="root")
@@ -135,7 +135,7 @@ def test_schema_54_reservation_ledger_is_vault_scoped_and_idempotent(
             SELECT value FROM schema_meta
             WHERE key='schema_version'
             """
-        ).fetchone()[0] == "54"
+        ).fetchone()[0] == "55"
 
         assert connection.execute(
             """
@@ -152,7 +152,7 @@ def test_schema_54_reservation_ledger_is_vault_scoped_and_idempotent(
             SELECT value FROM schema_meta
             WHERE key='schema_version'
             """
-        ).fetchone()[0] == "54"
+        ).fetchone()[0] == "55"
 
         assert connection.execute(
             """
@@ -206,7 +206,7 @@ def test_schema_51_upgrade_preserves_run_and_creates_ledger(
             SELECT value FROM schema_meta
             WHERE key='schema_version'
             """
-        ).fetchone()[0] == "54"
+        ).fetchone()[0] == "55"
 
         assert connection.execute(
             """
@@ -714,7 +714,7 @@ def test_schema_53_upgrade_adds_command_sha256_without_losing_reservation(
             SELECT value FROM schema_meta
             WHERE key='schema_version'
             """
-        ).fetchone()[0] == "54"
+        ).fetchone()[0] == "55"
 
         columns = {
             str(row[1])
@@ -896,3 +896,70 @@ def test_process_reservation_detects_executable_change_after_snapshot(
         run.run_id,
         actor="owner",
     ).snapshot().commands_reserved == 0
+
+
+def test_schema_54_upgrade_creates_one_shot_launch_ledger(
+    tmp_path: Path,
+) -> None:
+    database, repository, run = _state(tmp_path)
+    _start(repository, run)
+
+    request = _request(
+        run,
+        request_id="schema-54-launch-ledger",
+    )
+
+    repository.reserve_execution(
+        request,
+        actor="owner",
+        runtime_seconds=3,
+    )
+
+    with database.connect() as connection:
+        connection.execute(
+            "DROP TABLE assistant_autonomy_execution_launches"
+        )
+        connection.execute(
+            """
+            UPDATE schema_meta
+            SET value='54'
+            WHERE key='schema_version'
+            """
+        )
+
+    database.migrate()
+
+    with database.connect() as connection:
+        assert connection.execute(
+            """
+            SELECT value
+            FROM schema_meta
+            WHERE key='schema_version'
+            """
+        ).fetchone()[0] == "55"
+
+        assert connection.execute(
+            """
+            SELECT 1
+            FROM sqlite_master
+            WHERE
+                type='table'
+                AND name='assistant_autonomy_execution_launches'
+            """
+        ).fetchone()
+
+        assert connection.execute(
+            """
+            SELECT COUNT(*)
+            FROM assistant_autonomy_execution_reservations
+            WHERE request_id = ?
+            """,
+            (request.request_id,),
+        ).fetchone()[0] == 1
+
+        assert connection.execute(
+            """
+            SELECT COUNT(*)
+            FROM assistant_autonomy_execution_launches
+            """
+        ).fetchone()[0] == 0

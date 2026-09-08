@@ -2357,8 +2357,9 @@ class Database:
                 self._migrate_autonomy_phase2(connection)
                 self._migrate_autonomy_phase5(connection)
                 self._migrate_autonomy_phase6a3(connection)
+                self._migrate_autonomy_phase7a(connection)
             connection.execute(
-                "INSERT OR REPLACE INTO schema_meta(key, value) VALUES('schema_version', '54')"
+                "INSERT OR REPLACE INTO schema_meta(key, value) VALUES('schema_version', '55')"
             )
         with suppress(PermissionError):
             self.path.chmod(0o600)
@@ -2690,6 +2691,58 @@ class Database:
                     )
                 """
             )
+
+    @staticmethod
+    def _migrate_autonomy_phase7a(
+        connection: sqlite3.Connection,
+    ) -> None:
+        connection.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS assistant_autonomy_execution_launches (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                request_id TEXT NOT NULL UNIQUE
+                    CHECK(length(request_id) BETWEEN 1 AND 128),
+                request_sha256 TEXT NOT NULL
+                    CHECK(length(request_sha256) = 64),
+                run_id INTEGER NOT NULL,
+                command_sha256 TEXT NOT NULL
+                    CHECK(length(command_sha256) = 64),
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(run_id)
+                    REFERENCES assistant_autonomy_runs(id)
+                    ON DELETE RESTRICT,
+                FOREIGN KEY(request_id)
+                    REFERENCES assistant_autonomy_execution_reservations(
+                        request_id
+                    )
+                    ON DELETE RESTRICT
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_autonomy_execution_launches_run
+            ON assistant_autonomy_execution_launches(
+                run_id,
+                id
+            );
+
+            CREATE TRIGGER IF NOT EXISTS trg_autonomy_execution_launches_no_update
+            BEFORE UPDATE ON assistant_autonomy_execution_launches
+            BEGIN
+                SELECT RAISE(
+                    ABORT,
+                    'autonomy_execution_launches_append_only'
+                );
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS trg_autonomy_execution_launches_no_delete
+            BEFORE DELETE ON assistant_autonomy_execution_launches
+            BEGIN
+                SELECT RAISE(
+                    ABORT,
+                    'autonomy_execution_launches_append_only'
+                );
+            END;
+            """
+        )
 
     @staticmethod
     def _create_memory_fts(connection: sqlite3.Connection) -> bool:
