@@ -459,7 +459,21 @@
 - [ ] Keep private proxies, authentication, telemetry, update checks and community marketplace out of
   `0.8.9-alpha`.
 
-## 0.8.10-alpha — Privacy and Telemetry
+## 0.8.10-alpha — Autonomous Development Runtime
+
+- [x] Establish bounded autonomy runs, workspace scopes, capability grants, frozen plans and HumanGates.
+- [x] Persist append-only autonomy state, audit events and durable execution reservations.
+- [x] Bind persisted authority to frozen command identity and exact execution snapshots.
+- [x] Add Bubblewrap as the sole sandboxed autonomous process-execution boundary.
+- [x] Persist provenance-bound durable execution observations and explicit unresolved launch gaps.
+- [ ] Add a synchronous supervised one-tick runner with at most one process launch per tick.
+- [ ] Add explicit reviewed retry/failure handling with fresh bounded authority per retry.
+- [ ] Add bounded multi-step orchestration without hidden background continuation.
+- [ ] Add separately authorized transactional self-modification.
+- [ ] Add bounded validation and supervised repair without unbounded repair loops.
+- [ ] Keep external networking and automatic Git/GitHub publication outside the autonomous runtime unless separately specified.
+
+### Later — Privacy and Telemetry
 
 - [ ] Add versioned consent, payload preview, revocation and non-sensitive opt-in telemetry.
 - [ ] Publish concise privacy and service terms without collecting prompts, searches or personal content.
