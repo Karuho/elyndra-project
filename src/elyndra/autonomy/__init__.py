@@ -39,6 +39,11 @@ from elyndra.autonomy.models import (
 )
 from elyndra.autonomy.repository import AutonomyRepository
 from elyndra.autonomy.scope import WorkspaceScope
+from elyndra.autonomy.supervised_runner import (
+    SupervisedAutonomyRunner,
+    SupervisedTickOutcome,
+    SupervisedTickResult,
+)
 
 __all__ = [
     "AutonomyExecutionBinding",
@@ -67,6 +72,9 @@ __all__ = [
     "RunPlan",
     "RunStep",
     "WorkspaceScope",
+    "SupervisedAutonomyRunner",
+    "SupervisedTickOutcome",
+    "SupervisedTickResult",
     "CommandEnvironmentProfile",
     "CommandSandboxProfile",
     "CommandSnapshot",

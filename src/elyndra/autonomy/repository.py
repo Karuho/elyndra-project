@@ -732,6 +732,44 @@ class AutonomyRepository:
                 grant=grant,
             )
 
+            # Preserve the established budget-denial semantics without
+            # mutating the real in-memory budget before the duplicate-initial
+            # guard. This temporary copy uses the same ExecutionBudget domain
+            # validation as the eventual durable reservation.
+            budget_state = budget.snapshot()
+            preflight_budget = ExecutionBudget(
+                max_commands=budget_state.max_commands,
+                max_retries=budget_state.max_retries,
+                max_runtime_seconds=budget_state.max_runtime_seconds,
+                commands_reserved=budget_state.commands_reserved,
+                retries_reserved=budget_state.retries_reserved,
+                runtime_seconds_reserved=(
+                    budget_state.runtime_seconds_reserved
+                ),
+            )
+            preflight_budget.reserve(
+                runtime_seconds=runtime_seconds,
+                retry=retry,
+            )
+
+            if not retry:
+                duplicate_initial = connection.execute(
+                    """
+                    SELECT 1
+                    FROM assistant_autonomy_execution_reservations
+                    WHERE
+                        run_id = ?
+                        AND step_id = ?
+                        AND is_retry = 0
+                    LIMIT 1
+                    """,
+                    (int(row["id"]), request.step_id),
+                ).fetchone()
+                if duplicate_initial is not None:
+                    raise PermissionError(
+                        "El step ya tiene una reserva inicial durable."
+                    )
+
             snapshot = budget.reserve(
                 runtime_seconds=runtime_seconds,
                 retry=retry,
@@ -1147,6 +1185,175 @@ class AutonomyRepository:
             }
             for row in rows
         ]
+
+    def finalize_execution_run_if_ready(
+        self,
+        run_id: str,
+        *,
+        actor: str,
+    ) -> bool:
+        """
+        Atomically complete a run from durable execution observations.
+
+        Completion grants no new execution authority. It therefore validates
+        the persisted grant shape but does not require the grant to remain
+        active after every frozen step already has a durable successful
+        observation.
+        """
+
+        with self.database.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+
+            run_row = self._owned_run(
+                connection,
+                run_id,
+                actor=actor,
+            )
+            status = AutonomyRunStatus(
+                str(run_row["status"])
+            )
+
+            if status is AutonomyRunStatus.COMPLETED:
+                return True
+
+            if status is not AutonomyRunStatus.RUNNING:
+                return False
+
+            # Validate frozen persisted authority/plan structure without
+            # requiring authority to remain active for an already-completed
+            # execution history.
+            _grant_from_json(str(run_row["grant_json"]))
+            plan = _plan_from_json(str(run_row["plan_json"]))
+
+            unresolved = connection.execute(
+                """
+                SELECT 1
+                FROM assistant_autonomy_execution_reservations
+                    AS reservation
+                LEFT JOIN assistant_autonomy_execution_results
+                    AS result
+                  ON result.request_id = reservation.request_id
+                WHERE
+                    reservation.run_id = ?
+                    AND result.request_id IS NULL
+                LIMIT 1
+                """,
+                (int(run_row["id"]),),
+            ).fetchone()
+
+            if unresolved is not None:
+                return False
+
+            successful_rows = connection.execute(
+                """
+                SELECT DISTINCT step_id
+                FROM assistant_autonomy_execution_results
+                WHERE
+                    run_id = ?
+                    AND outcome = ?
+                """,
+                (
+                    int(run_row["id"]),
+                    ExecutionOutcome.SUCCEEDED.value,
+                ),
+            ).fetchall()
+
+            succeeded = {
+                str(row["step_id"])
+                for row in successful_rows
+            }
+
+            if not all(
+                step.step_id in succeeded
+                for step in plan.steps
+            ):
+                return False
+
+            now = _now()
+
+            self._set_status(
+                connection,
+                run_row,
+                AutonomyRunStatus.COMPLETED,
+                now=now,
+            )
+            self._insert_event(
+                connection,
+                run_db_id=int(run_row["id"]),
+                event_type=_transition_event(
+                    AutonomyRunStatus.COMPLETED
+                ),
+                from_status=AutonomyRunStatus.RUNNING,
+                to_status=AutonomyRunStatus.COMPLETED,
+                summary=(
+                    "Plan congelado completado con "
+                    "observaciones durables exitosas."
+                ),
+                payload={
+                    "completion_basis": (
+                        "durable_execution_results"
+                    )
+                },
+                created_at=now,
+            )
+
+        return True
+
+    def execution_attempt_gaps(
+        self,
+        run_id: str,
+        *,
+        actor: str,
+    ) -> list[dict[str, Any]]:
+        """Return durable reservations missing a launch or a result."""
+
+        with self.database.connect() as connection:
+            run_row = self._owned_run(connection, run_id, actor=actor)
+            rows = connection.execute(
+                """
+                SELECT
+                    reservation.request_id,
+                    reservation.step_id,
+                    reservation.command_sha256,
+                    reservation.created_at AS reserved_at,
+                    launch.created_at AS launched_at,
+                    CASE
+                        WHEN launch.request_id IS NULL
+                            THEN 'reservation_unlaunched'
+                        ELSE 'observation_unresolved'
+                    END AS state
+                FROM assistant_autonomy_execution_reservations AS reservation
+                LEFT JOIN assistant_autonomy_execution_launches AS launch
+                  ON launch.request_id = reservation.request_id
+                LEFT JOIN assistant_autonomy_execution_results AS result
+                  ON result.request_id = reservation.request_id
+                WHERE
+                    reservation.run_id = ?
+                    AND result.request_id IS NULL
+                ORDER BY reservation.id ASC
+                """,
+                (int(run_row["id"]),),
+            ).fetchall()
+            public_run_id = str(run_row["public_id"])
+
+        gaps: list[dict[str, Any]] = []
+        for row in rows:
+            item = {
+                "run_id": public_run_id,
+                "request_id": str(row["request_id"]),
+                "step_id": str(row["step_id"]),
+                "command_sha256": (
+                    ""
+                    if row["command_sha256"] is None
+                    else str(row["command_sha256"])
+                ),
+                "state": str(row["state"]),
+                "reserved_at": str(row["reserved_at"]),
+            }
+            if row["launched_at"] is not None:
+                item["launched_at"] = str(row["launched_at"])
+            gaps.append(item)
+        return gaps
 
     def _record_execution_result(
         self,
