@@ -2357,7 +2357,7 @@ class Database:
                 self._migrate_autonomy_phase2(connection)
                 self._migrate_autonomy_phase5(connection)
             connection.execute(
-                "INSERT OR REPLACE INTO schema_meta(key, value) VALUES('schema_version', '52')"
+                "INSERT OR REPLACE INTO schema_meta(key, value) VALUES('schema_version', '53')"
             )
         with suppress(PermissionError):
             self.path.chmod(0o600)

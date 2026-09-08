@@ -8,6 +8,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from elyndra.autonomy.capabilities import Capability, CapabilityGrant
+from elyndra.autonomy.commands import CommandSpec
 from elyndra.autonomy.execution import (
     ExecutionBudget,
     ExecutionBudgetSnapshot,
@@ -25,7 +26,7 @@ from elyndra.db import Database
 
 _STEP_ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
 
-_GRANT_KEYS = frozenset(
+_GRANT_KEYS_V1 = frozenset(
     {
         "capabilities",
         "issued_at",
@@ -38,9 +39,11 @@ _GRANT_KEYS = frozenset(
     }
 )
 
+_GRANT_KEYS_V2 = _GRANT_KEYS_V1 | {"allowed_executables"}
+
 _PLAN_KEYS = frozenset({"objective", "steps"})
 
-_PLAN_STEP_KEYS = frozenset(
+_PLAN_STEP_KEYS_V1 = frozenset(
     {
         "step_id",
         "capability",
@@ -49,6 +52,8 @@ _PLAN_STEP_KEYS = frozenset(
         "requires_human_gate",
     }
 )
+
+_PLAN_STEP_KEYS_V2 = _PLAN_STEP_KEYS_V1 | {"command"}
 
 _TERMINAL_STATUSES = frozenset(
     {
@@ -615,6 +620,12 @@ class AutonomyRepository:
                     step_id=step.step_id,
                 )
 
+            if step.capability is Capability.PROCESS_EXEC:
+                raise PermissionError(
+                    "process.exec permanece deshabilitado hasta que "
+                    "la reserva durable esté ligada al CommandSnapshot."
+                )
+
             existing = connection.execute(
                 """
                 SELECT
@@ -1027,6 +1038,7 @@ def _grant_data(grant: CapabilityGrant) -> dict[str, Any]:
         "max_commands": grant.max_commands,
         "max_runtime_seconds": grant.max_runtime_seconds,
         "allowed_hosts": list(grant.allowed_hosts),
+        "allowed_executables": list(grant.allowed_executables),
     }
 
 
@@ -1040,6 +1052,11 @@ def _plan_data(plan: RunPlan) -> dict[str, Any]:
                 "action": step.action,
                 "target": step.target,
                 "requires_human_gate": step.requires_human_gate,
+                "command": (
+                    step.command.to_data()
+                    if step.command is not None
+                    else None
+                ),
             }
             for step in plan.steps
         ],
@@ -1107,11 +1124,19 @@ def _grant_from_json(encoded: str) -> CapabilityGrant:
         if not isinstance(payload, dict):
             raise TypeError("grant must be an object")
 
-        if frozenset(payload) != _GRANT_KEYS:
+        keys = frozenset(payload)
+        if keys not in {_GRANT_KEYS_V1, _GRANT_KEYS_V2}:
             raise ValueError("grant fields mismatch")
 
         capabilities_raw = payload["capabilities"]
         allowed_hosts_raw = payload["allowed_hosts"]
+        allowed_executables_raw = payload.get(
+            "allowed_executables",
+            [],
+        )
+
+        if not isinstance(allowed_executables_raw, list):
+            raise TypeError("allowed_executables must be a list")
 
         if not isinstance(capabilities_raw, list):
             raise TypeError("capabilities must be a list")
@@ -1152,6 +1177,10 @@ def _grant_from_json(encoded: str) -> CapabilityGrant:
                 _required(item, "allowed_host", 255)
                 for item in allowed_hosts_raw
             ),
+            allowed_executables=tuple(
+                _required(item, "allowed_executable", 4096)
+                for item in allowed_executables_raw
+            ),
         )
     except (
         KeyError,
@@ -1186,7 +1215,11 @@ def _plan_from_json(encoded: str) -> RunPlan:
             if not isinstance(raw_step, dict):
                 raise TypeError("step must be an object")
 
-            if frozenset(raw_step) != _PLAN_STEP_KEYS:
+            step_keys = frozenset(raw_step)
+            if step_keys not in {
+                _PLAN_STEP_KEYS_V1,
+                _PLAN_STEP_KEYS_V2,
+            }:
                 raise ValueError("step fields mismatch")
 
             requires_gate = raw_step["requires_human_gate"]
@@ -1198,6 +1231,14 @@ def _plan_from_json(encoded: str) -> RunPlan:
             target = raw_step["target"]
             if not isinstance(target, str):
                 raise TypeError("target must be text")
+
+            raw_command = raw_step.get("command")
+
+            command = (
+                None
+                if raw_command is None
+                else CommandSpec.from_data(raw_command)
+            )
 
             steps.append(
                 RunStep(
@@ -1220,6 +1261,7 @@ def _plan_from_json(encoded: str) -> RunPlan:
                     ),
                     target=target,
                     requires_human_gate=requires_gate,
+                    command=command,
                 )
             )
 

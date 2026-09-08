@@ -9,6 +9,7 @@ import pytest
 
 import elyndra.autonomy.repository as autonomy_repository
 from elyndra.autonomy import (
+    AutonomyExecutionBinding,
     AutonomyRepository,
     AutonomyRun,
     AutonomyRunStatus,
@@ -73,7 +74,7 @@ def _run(tmp_path: Path) -> AutonomyRun:
     )
 
 
-def test_schema_52_is_vault_scoped_and_idempotent(tmp_path: Path) -> None:
+def test_schema_53_is_vault_scoped_and_idempotent(tmp_path: Path) -> None:
     root = _database(tmp_path / "root.sqlite3", role="root")
     vault = _database(tmp_path / "vault.sqlite3", role="vault")
 
@@ -83,7 +84,7 @@ def test_schema_52_is_vault_scoped_and_idempotent(tmp_path: Path) -> None:
     with root.connect() as connection:
         assert connection.execute(
             "SELECT value FROM schema_meta WHERE key='schema_version'"
-        ).fetchone()[0] == "52"
+        ).fetchone()[0] == "53"
 
         assert connection.execute(
             """
@@ -95,7 +96,7 @@ def test_schema_52_is_vault_scoped_and_idempotent(tmp_path: Path) -> None:
     with vault.connect() as connection:
         assert connection.execute(
             "SELECT value FROM schema_meta WHERE key='schema_version'"
-        ).fetchone()[0] == "52"
+        ).fetchone()[0] == "53"
 
         for table in (
             "assistant_autonomy_runs",
@@ -152,7 +153,7 @@ def test_schema_50_vault_upgrade_preserves_existing_data(tmp_path: Path) -> None
 
         assert connection.execute(
             "SELECT value FROM schema_meta WHERE key='schema_version'"
-        ).fetchone()[0] == "52"
+        ).fetchone()[0] == "53"
 
         assert connection.execute(
             """
@@ -519,3 +520,193 @@ def test_transition_and_event_are_one_sqlite_transaction(
         "run_created",
         "run_started",
     ]
+
+def test_schema_52_upgrade_preserves_legacy_authority_json_without_rewrite(
+    tmp_path: Path,
+) -> None:
+    database = _database(tmp_path / "vault.sqlite3")
+    run = _run(tmp_path)
+
+    legacy_grant = json.dumps(
+        {
+            "capabilities": sorted(
+                capability.value
+                for capability in run.grant.capabilities
+            ),
+            "issued_at": run.grant.issued_at.isoformat(),
+            "expires_at": run.grant.expires_at.isoformat(),
+            "max_steps": run.grant.max_steps,
+            "max_retries": run.grant.max_retries,
+            "max_commands": run.grant.max_commands,
+            "max_runtime_seconds": run.grant.max_runtime_seconds,
+            "allowed_hosts": list(run.grant.allowed_hosts),
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+    legacy_plan = json.dumps(
+        {
+            "objective": run.plan.objective,
+            "steps": [
+                {
+                    "step_id": step.step_id,
+                    "capability": step.capability.value,
+                    "action": step.action,
+                    "target": step.target,
+                    "requires_human_gate": step.requires_human_gate,
+                }
+                for step in run.plan.steps
+            ],
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+    created_at = run.created_at.isoformat()
+
+    with database.connect() as connection:
+        connection.execute(
+            """
+            INSERT INTO assistant_autonomy_runs(
+                public_id,
+                actor,
+                workspace_root,
+                objective,
+                status,
+                grant_json,
+                plan_json,
+                created_at,
+                updated_at,
+                started_at,
+                finished_at
+            ) VALUES (?, ?, ?, ?, 'planned', ?, ?, ?, ?, NULL, NULL)
+            """,
+            (
+                run.run_id,
+                run.actor,
+                str(run.workspace.root),
+                run.plan.objective,
+                legacy_grant,
+                legacy_plan,
+                created_at,
+                created_at,
+            ),
+        )
+
+        run_row = connection.execute(
+            """
+            SELECT id
+            FROM assistant_autonomy_runs
+            WHERE public_id = ?
+            """,
+            (run.run_id,),
+        ).fetchone()
+
+        assert run_row is not None
+
+        connection.execute(
+            """
+            INSERT INTO assistant_autonomy_events(
+                run_id,
+                sequence,
+                event_type,
+                from_status,
+                to_status,
+                step_id,
+                summary,
+                payload_json,
+                created_at
+            ) VALUES(
+                ?,
+                1,
+                'run_created',
+                NULL,
+                'planned',
+                '',
+                'Run autónomo creado con autoridad congelada.',
+                '{}',
+                ?
+            )
+            """,
+            (
+                int(run_row["id"]),
+                created_at,
+            ),
+        )
+
+        connection.execute(
+            """
+            UPDATE schema_meta
+            SET value='52'
+            WHERE key='schema_version'
+            """
+        )
+
+    # Migrar 52 -> 53. La migración NO debe reescribir la autoridad
+    # congelada ni necesitar desactivar sus triggers de inmutabilidad.
+    database.migrate()
+
+    with database.connect() as connection:
+        schema = connection.execute(
+            """
+            SELECT value
+            FROM schema_meta
+            WHERE key='schema_version'
+            """
+        ).fetchone()
+
+        assert schema is not None
+        assert schema[0] == "53"
+
+        row = connection.execute(
+            """
+            SELECT grant_json, plan_json
+            FROM assistant_autonomy_runs
+            WHERE public_id = ?
+            """,
+            (run.run_id,),
+        ).fetchone()
+
+        assert row is not None
+        assert row["grant_json"] == legacy_grant
+        assert row["plan_json"] == legacy_plan
+
+    repository = AutonomyRepository(database)
+
+    # Esto obliga al parser V1 del repository a reconstruir un grant
+    # histórico sin allowed_executables.
+    repository.transition(
+        run.run_id,
+        AutonomyRunStatus.RUNNING,
+        actor=run.actor,
+        summary="Validar compatibilidad schema 52.",
+    )
+
+    # Esto obliga también al trusted binding a reconstruir grant + plan V1.
+    contract = AutonomyExecutionBinding(repository).bind(
+        run.run_id,
+        actor=run.actor,
+    )
+
+    assert contract.grant.allowed_executables == ()
+    assert all(
+        step.command is None
+        for step in contract.plan.steps
+    )
+
+    with database.connect() as connection:
+        row = connection.execute(
+            """
+            SELECT grant_json, plan_json
+            FROM assistant_autonomy_runs
+            WHERE public_id = ?
+            """,
+            (run.run_id,),
+        ).fetchone()
+
+        assert row is not None
+        assert row["grant_json"] == legacy_grant
+        assert row["plan_json"] == legacy_plan

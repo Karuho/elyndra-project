@@ -114,7 +114,7 @@ def _request(
     )
 
 
-def test_schema_52_reservation_ledger_is_vault_scoped_and_idempotent(
+def test_schema_53_reservation_ledger_is_vault_scoped_and_idempotent(
     tmp_path: Path,
 ) -> None:
     root = Database(tmp_path / "root.sqlite3", role="root")
@@ -131,7 +131,7 @@ def test_schema_52_reservation_ledger_is_vault_scoped_and_idempotent(
             SELECT value FROM schema_meta
             WHERE key='schema_version'
             """
-        ).fetchone()[0] == "52"
+        ).fetchone()[0] == "53"
 
         assert connection.execute(
             """
@@ -148,7 +148,7 @@ def test_schema_52_reservation_ledger_is_vault_scoped_and_idempotent(
             SELECT value FROM schema_meta
             WHERE key='schema_version'
             """
-        ).fetchone()[0] == "52"
+        ).fetchone()[0] == "53"
 
         assert connection.execute(
             """
@@ -202,7 +202,7 @@ def test_schema_51_upgrade_preserves_run_and_creates_ledger(
             SELECT value FROM schema_meta
             WHERE key='schema_version'
             """
-        ).fetchone()[0] == "52"
+        ).fetchone()[0] == "53"
 
         assert connection.execute(
             """

@@ -7,6 +7,7 @@ from datetime import UTC, datetime
 from enum import StrEnum
 
 from elyndra.autonomy.capabilities import Capability, CapabilityGrant
+from elyndra.autonomy.commands import CommandSpec
 from elyndra.autonomy.scope import WorkspaceScope
 
 _STEP_ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
@@ -46,6 +47,7 @@ class RunStep:
     action: str
     target: str = ""
     requires_human_gate: bool = False
+    command: CommandSpec | None = None
 
     def __post_init__(self) -> None:
         clean_id = self.step_id.strip().casefold()
@@ -69,11 +71,29 @@ class RunStep:
                 f"target supera {_MAX_TARGET_CHARS} caracteres."
             )
 
+        command = self.command
+
+        if capability is Capability.PROCESS_EXEC:
+            if not isinstance(command, CommandSpec):
+                raise ValueError(
+                    "Un step process.exec requiere CommandSpec."
+                )
+
+            if target != command.cwd:
+                raise ValueError(
+                    "En process.exec, target debe coincidir "
+                    "exactamente con command.cwd."
+                )
+        elif command is not None:
+            raise ValueError(
+                "Solo un step process.exec puede contener CommandSpec."
+            )
+
         object.__setattr__(self, "step_id", clean_id)
         object.__setattr__(self, "capability", capability)
         object.__setattr__(self, "action", action)
         object.__setattr__(self, "target", target)
-
+        object.__setattr__(self, "command", command)
 
 @dataclass(frozen=True, slots=True)
 class RunPlan:
@@ -177,6 +197,28 @@ class AutonomyRun:
             raise PermissionError(
                 f"El plan requiere capabilities no concedidas: {rendered}"
             )
+
+        for step in self.plan.steps:
+            if step.capability is not Capability.PROCESS_EXEC:
+                continue
+
+            command = step.command
+            if command is None:
+                raise PermissionError(
+                    f"El step {step.step_id} no tiene CommandSpec."
+                )
+
+            if not self.grant.allows_executable(command.executable):
+                raise PermissionError(
+                    "Ejecutable fuera del allowlist del CapabilityGrant: "
+                    f"{command.executable}"
+                )
+
+            if command.timeout_seconds > self.grant.max_runtime_seconds:
+                raise PermissionError(
+                    "El timeout del comando excede "
+                    "max_runtime_seconds del CapabilityGrant."
+                )
 
         object.__setattr__(self, "actor", actor)
         object.__setattr__(self, "run_id", run_id)

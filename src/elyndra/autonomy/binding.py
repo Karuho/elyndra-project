@@ -4,6 +4,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from elyndra.autonomy.capabilities import Capability, CapabilityGrant
+from elyndra.autonomy.commands import CommandSpec
 from elyndra.autonomy.execution import (
     CancellationToken,
     ExecutionBudgetSnapshot,
@@ -21,7 +22,7 @@ from elyndra.autonomy.models import (
 from elyndra.autonomy.repository import AutonomyRepository
 from elyndra.autonomy.scope import WorkspaceScope
 
-_GRANT_KEYS = frozenset(
+_GRANT_KEYS_V1 = frozenset(
     {
         "capabilities",
         "issued_at",
@@ -34,9 +35,11 @@ _GRANT_KEYS = frozenset(
     }
 )
 
+_GRANT_KEYS_V2 = _GRANT_KEYS_V1 | {"allowed_executables"}
+
 _PLAN_KEYS = frozenset({"objective", "steps"})
 
-_STEP_KEYS = frozenset(
+_STEP_KEYS_V1 = frozenset(
     {
         "step_id",
         "capability",
@@ -45,6 +48,8 @@ _STEP_KEYS = frozenset(
         "requires_human_gate",
     }
 )
+
+_STEP_KEYS_V2 = _STEP_KEYS_V1 | {"command"}
 
 
 class ExecutionBindingError(PermissionError):
@@ -380,7 +385,17 @@ def _approved_step_ids(
 
 
 def _rebuild_grant(raw: object) -> CapabilityGrant:
-    payload = _exact_dict(raw, "grant", _GRANT_KEYS)
+    if not isinstance(raw, dict):
+        raise ExecutionBindingError(
+            "grant debe ser un objeto JSON."
+        )
+
+    payload = raw
+    keys = frozenset(payload)
+    if keys not in {_GRANT_KEYS_V1, _GRANT_KEYS_V2}:
+        raise ExecutionBindingError(
+            "grant tiene campos inesperados o faltantes."
+        )
 
     capabilities_raw = _exact_list(
         payload["capabilities"],
@@ -389,6 +404,11 @@ def _rebuild_grant(raw: object) -> CapabilityGrant:
     allowed_hosts_raw = _exact_list(
         payload["allowed_hosts"],
         "grant.allowed_hosts",
+    )
+
+    allowed_executables_raw = _exact_list(
+        payload.get("allowed_executables", []),
+        "grant.allowed_executables",
     )
 
     try:
@@ -436,6 +456,14 @@ def _rebuild_grant(raw: object) -> CapabilityGrant:
                 "grant.max_runtime_seconds",
             ),
             allowed_hosts=allowed_hosts,
+            allowed_executables=tuple(
+                _required_str(
+                    value,
+                    "grant.allowed_executable",
+                    4096,
+                )
+                for value in allowed_executables_raw
+            ),
         )
     except (PermissionError, TypeError, ValueError) as exc:
         raise ExecutionBindingError(
@@ -453,13 +481,34 @@ def _rebuild_plan(raw: object) -> RunPlan:
 
     try:
         for raw_step in steps_raw:
-            step = _exact_dict(raw_step, "plan.step", _STEP_KEYS)
+            if not isinstance(raw_step, dict):
+                raise ExecutionBindingError(
+                    "plan.step debe ser un objeto JSON."
+                )
+
+            step = raw_step
+            step_keys = frozenset(step)
+
+            if step_keys not in {
+                _STEP_KEYS_V1,
+                _STEP_KEYS_V2,
+            }:
+                raise ExecutionBindingError(
+                    "plan.step tiene campos inesperados o faltantes."
+                )
 
             requires_gate = step["requires_human_gate"]
             if not isinstance(requires_gate, bool):
                 raise TypeError(
                     "plan.step.requires_human_gate debe ser booleano."
                 )
+
+            raw_command = step.get("command")
+            command = (
+                None
+                if raw_command is None
+                else CommandSpec.from_data(raw_command)
+            )
 
             steps.append(
                 RunStep(
@@ -486,6 +535,7 @@ def _rebuild_plan(raw: object) -> RunPlan:
                         2000,
                     ),
                     requires_human_gate=requires_gate,
+                    command=command,
                 )
             )
 

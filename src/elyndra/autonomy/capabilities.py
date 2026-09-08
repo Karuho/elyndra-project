@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import StrEnum
+from pathlib import Path
 
 
 class Capability(StrEnum):
@@ -45,6 +47,7 @@ class CapabilityGrant:
     max_commands: int = 80
     max_runtime_seconds: int = 3_600
     allowed_hosts: tuple[str, ...] = ()
+    allowed_executables: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         normalized: set[Capability] = set()
@@ -88,6 +91,45 @@ class CapabilityGrant:
 
         object.__setattr__(self, "allowed_hosts", tuple(normalized_hosts))
 
+        normalized_executables: list[str] = []
+
+        for executable in self.allowed_executables:
+            if not isinstance(executable, str):
+                raise TypeError(
+                    "Cada allowed_executable debe ser texto."
+                )
+
+            clean = executable.strip()
+            if not clean:
+                raise ValueError(
+                    "Un allowed_executable no puede estar vacío."
+                )
+            if "\x00" in clean:
+                raise ValueError(
+                    "Un allowed_executable no puede contener NUL."
+                )
+
+            path = Path(clean)
+            if not path.is_absolute():
+                raise ValueError(
+                    "allowed_executables requiere rutas absolutas exactas."
+                )
+
+            if clean.startswith("//") or os.path.normpath(clean) != clean:
+                raise ValueError(
+                    "allowed_executables requiere rutas normalizadas "
+                    "lexicalmente."
+                )
+
+            if clean not in normalized_executables:
+                normalized_executables.append(clean)
+
+        object.__setattr__(
+            self,
+            "allowed_executables",
+            tuple(normalized_executables),
+        )
+
     def is_expired(self, *, at: datetime | None = None) -> bool:
         current = at or datetime.now(UTC)
         _require_aware(current, "at")
@@ -129,6 +171,10 @@ class CapabilityGrant:
     def allows_host(self, host: str) -> bool:
         clean = host.strip().casefold()
         return bool(clean) and clean in self.allowed_hosts
+
+    def allows_executable(self, executable: str) -> bool:
+        clean = executable.strip()
+        return bool(clean) and clean in self.allowed_executables
 
 
 def _require_aware(value: datetime, label: str) -> None:

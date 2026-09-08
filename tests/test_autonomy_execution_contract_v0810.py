@@ -10,6 +10,7 @@ from elyndra.autonomy import (
     CancellationToken,
     Capability,
     CapabilityGrant,
+    CommandSpec,
     ExecutionBudget,
     ExecutionCancelled,
     ExecutionContract,
@@ -521,3 +522,59 @@ def test_execution_result_is_bounded_and_normalized() -> None:
             summary="Invalid duration.",
             duration_ms=-1,
         )
+
+def test_process_exec_remains_fail_closed_before_command_binding(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "project"
+    root.mkdir()
+
+    executable = "/usr/bin/python3.13"
+    now = datetime.now(UTC)
+
+    grant = CapabilityGrant(
+        capabilities=frozenset({Capability.PROCESS_EXEC}),
+        issued_at=now,
+        expires_at=now + timedelta(hours=1),
+        max_commands=2,
+        max_runtime_seconds=60,
+        allowed_executables=(executable,),
+    )
+
+    command = CommandSpec(
+        executable=executable,
+        argv=(executable, "--version"),
+        cwd=".",
+        timeout_seconds=10,
+    )
+
+    plan = RunPlan(
+        objective="Prepare one process command",
+        steps=(
+            RunStep(
+                step_id="run",
+                capability=Capability.PROCESS_EXEC,
+                action="run version check",
+                target=".",
+                command=command,
+            ),
+        ),
+    )
+
+    contract = ExecutionContract(
+        run_id="process-run",
+        plan=plan,
+        workspace=WorkspaceScope.from_root(root),
+        grant=grant,
+    )
+
+    with pytest.raises(
+        ExecutionDenied,
+        match="process.exec permanece deshabilitado",
+    ):
+        contract.prepare(
+            "run",
+            runtime_seconds=10,
+        )
+
+    assert contract.budget.snapshot().commands_reserved == 0
