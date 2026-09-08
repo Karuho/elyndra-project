@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import re
+import secrets
 import uuid
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
@@ -12,7 +15,9 @@ from elyndra.autonomy.commands import CommandSnapshot, CommandSpec
 from elyndra.autonomy.execution import (
     ExecutionBudget,
     ExecutionBudgetSnapshot,
+    ExecutionOutcome,
     ExecutionRequest,
+    ExecutionResult,
 )
 from elyndra.autonomy.models import (
     AutonomyRun,
@@ -89,6 +94,20 @@ _TRANSITIONS = {
     AutonomyRunStatus.FAILED: frozenset(),
     AutonomyRunStatus.CANCELLED: frozenset(),
 }
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class _ExecutionObservationReceipt:
+    """Executor-held proof for one durable launch inside the trusted runtime."""
+
+    request_id: str
+    secret: bytes
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.request_id, str) or not self.request_id:
+            raise ValueError("receipt request_id inválido.")
+        if not isinstance(self.secret, bytes) or len(self.secret) != 32:
+            raise ValueError("receipt secret inválido.")
 
 
 class AutonomyRepository:
@@ -859,14 +878,14 @@ class AutonomyRepository:
             retry=retry,
         )
 
-    def claim_execution_launch(
+    def _claim_execution_launch(
         self,
         request: ExecutionRequest,
         *,
         actor: str,
         runtime_seconds: int,
         retry: bool,
-    ) -> None:
+    ) -> _ExecutionObservationReceipt:
         if not isinstance(request, ExecutionRequest):
             raise TypeError(
                 "request debe ser un ExecutionRequest."
@@ -897,6 +916,13 @@ class AutonomyRepository:
             request,
             runtime_seconds=runtime_seconds,
             retry=retry,
+        )
+        receipt = _ExecutionObservationReceipt(
+            request_id=request.request_id,
+            secret=secrets.token_bytes(32),
+        )
+        receipt_sha256 = _observation_receipt_sha256(
+            receipt,
         )
 
         with self.database.connect() as connection:
@@ -992,16 +1018,520 @@ class AutonomyRepository:
                     request_sha256,
                     run_id,
                     command_sha256,
+                    observation_receipt_sha256,
                     created_at
-                ) VALUES (?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?)
                 """,
                 (
                     request.request_id,
                     request_sha256,
                     int(run_row["id"]),
                     request.command_sha256,
+                    receipt_sha256,
                     _now(),
                 ),
+            )
+
+        return receipt
+
+    def execution_results(
+        self,
+        run_id: str,
+        *,
+        actor: str,
+    ) -> list[dict[str, Any]]:
+        with self.database.connect() as connection:
+            run_row = self._owned_run(
+                connection,
+                run_id,
+                actor=actor,
+            )
+
+            rows = connection.execute(
+                """
+                SELECT
+                    sequence,
+                    request_id,
+                    step_id,
+                    command_sha256,
+                    runtime_seconds,
+                    is_retry,
+                    outcome,
+                    exit_code,
+                    duration_ms,
+                    summary,
+                    error_code,
+                    stdout,
+                    stderr,
+                    stdout_sha256,
+                    stderr_sha256,
+                    timed_out,
+                    stdout_truncated,
+                    stderr_truncated,
+                    created_at
+                FROM assistant_autonomy_execution_results
+                WHERE run_id = ?
+                ORDER BY sequence ASC
+                """,
+                (int(run_row["id"]),),
+            ).fetchall()
+
+            public_run_id = str(
+                run_row["public_id"]
+            )
+
+        results: list[dict[str, Any]] = []
+
+        for raw in rows:
+            item = dict(raw)
+            item["run_id"] = public_run_id
+            item["is_retry"] = bool(
+                int(item["is_retry"])
+            )
+            item["timed_out"] = bool(
+                int(item["timed_out"])
+            )
+            item["stdout_truncated"] = bool(
+                int(item["stdout_truncated"])
+            )
+            item["stderr_truncated"] = bool(
+                int(item["stderr_truncated"])
+            )
+            results.append(item)
+
+        return results
+
+    def execution_observation_gaps(
+        self,
+        run_id: str,
+        *,
+        actor: str,
+    ) -> list[dict[str, Any]]:
+        """Return launches whose process observation was never persisted."""
+
+        with self.database.connect() as connection:
+            run_row = self._owned_run(
+                connection,
+                run_id,
+                actor=actor,
+            )
+            rows = connection.execute(
+                """
+                SELECT
+                    l.request_id,
+                    r.step_id,
+                    l.command_sha256,
+                    l.created_at AS launched_at
+                FROM assistant_autonomy_execution_launches AS l
+                JOIN assistant_autonomy_execution_reservations AS r
+                  ON r.request_id = l.request_id
+                LEFT JOIN assistant_autonomy_execution_results AS observed
+                  ON observed.request_id = l.request_id
+                WHERE
+                    l.run_id = ?
+                    AND observed.request_id IS NULL
+                ORDER BY l.id ASC
+                """,
+                (int(run_row["id"]),),
+            ).fetchall()
+            public_run_id = str(run_row["public_id"])
+
+        return [
+            {
+                "run_id": public_run_id,
+                "request_id": str(row["request_id"]),
+                "step_id": str(row["step_id"]),
+                "command_sha256": str(row["command_sha256"]),
+                "state": "observation_unresolved",
+                "launched_at": str(row["launched_at"]),
+            }
+            for row in rows
+        ]
+
+    def _record_execution_result(
+        self,
+        request: ExecutionRequest,
+        result: ExecutionResult,
+        *,
+        actor: str,
+        receipt: _ExecutionObservationReceipt,
+    ) -> None:
+        if not isinstance(
+            request,
+            ExecutionRequest,
+        ):
+            raise TypeError(
+                "request debe ser un ExecutionRequest."
+            )
+
+        if not isinstance(
+            result,
+            ExecutionResult,
+        ):
+            raise TypeError(
+                "result debe ser un ExecutionResult."
+            )
+
+        if not isinstance(
+            receipt,
+            _ExecutionObservationReceipt,
+        ):
+            raise TypeError(
+                "receipt debe ser un comprobante de observación."
+            )
+
+        if (
+            request.capability
+            is not Capability.PROCESS_EXEC
+        ):
+            raise PermissionError(
+                "Phase 7B.1 solo registra "
+                "observaciones process.exec."
+            )
+
+        if result.request_id != request.request_id:
+            raise PermissionError(
+                "ExecutionResult no pertenece "
+                "al ExecutionRequest."
+            )
+
+        with self.database.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+
+            run_row = self._owned_run(
+                connection,
+                request.run_id,
+                actor=actor,
+            )
+
+            durable = connection.execute(
+                """
+                SELECT
+                    l.request_sha256
+                        AS launch_request_sha256,
+                    l.run_id
+                        AS launch_run_id,
+                    l.command_sha256
+                        AS launch_command_sha256,
+                    l.observation_receipt_sha256,
+
+                    r.request_sha256
+                        AS reservation_request_sha256,
+                    r.run_id
+                        AS reservation_run_id,
+                    r.step_id,
+                    r.capability,
+                    r.command_sha256
+                        AS reservation_command_sha256,
+                    r.runtime_seconds,
+                    r.is_retry
+
+                FROM assistant_autonomy_execution_launches AS l
+
+                JOIN assistant_autonomy_execution_reservations AS r
+                  ON r.request_id = l.request_id
+
+                WHERE l.request_id = ?
+                """,
+                (request.request_id,),
+            ).fetchone()
+
+            if durable is None:
+                raise PermissionError(
+                    "No existe un launch durable "
+                    "para ExecutionResult."
+                )
+
+            receipt_commitment = durable[
+                "observation_receipt_sha256"
+            ]
+            if receipt_commitment is None:
+                raise PermissionError(
+                    "El launch histórico no tiene comprobante "
+                    "de observación."
+                )
+
+            if receipt.request_id != request.request_id:
+                raise PermissionError(
+                    "El comprobante no pertenece al ExecutionRequest."
+                )
+
+            observed_commitment = _observation_receipt_sha256(
+                receipt,
+            )
+            if not hmac.compare_digest(
+                str(receipt_commitment),
+                observed_commitment,
+            ):
+                raise PermissionError(
+                    "Comprobante de observación inválido."
+                )
+
+            runtime_seconds = int(
+                durable["runtime_seconds"]
+            )
+            retry = bool(
+                int(durable["is_retry"])
+            )
+
+            expected_request_sha256 = (
+                _reservation_sha256(
+                    request,
+                    runtime_seconds=runtime_seconds,
+                    retry=retry,
+                )
+            )
+
+            reservation_command_sha256 = (
+                ""
+                if durable[
+                    "reservation_command_sha256"
+                ]
+                is None
+                else str(
+                    durable[
+                        "reservation_command_sha256"
+                    ]
+                )
+            )
+
+            if (
+                int(durable["launch_run_id"])
+                != int(run_row["id"])
+                or int(
+                    durable["reservation_run_id"]
+                )
+                != int(run_row["id"])
+                or str(
+                    durable[
+                        "launch_request_sha256"
+                    ]
+                )
+                != expected_request_sha256
+                or str(
+                    durable[
+                        "reservation_request_sha256"
+                    ]
+                )
+                != expected_request_sha256
+                or str(durable["step_id"])
+                != request.step_id
+                or str(durable["capability"])
+                != request.capability.value
+                or str(
+                    durable[
+                        "launch_command_sha256"
+                    ]
+                )
+                != request.command_sha256
+                or reservation_command_sha256
+                != request.command_sha256
+            ):
+                raise PermissionError(
+                    "Launch/reserva durable no coincide "
+                    "con ExecutionRequest."
+                )
+
+            plan = _plan_from_json(
+                str(run_row["plan_json"])
+            )
+
+            step = next(
+                (
+                    item
+                    for item in plan.steps
+                    if item.step_id
+                    == request.step_id
+                ),
+                None,
+            )
+
+            if (
+                step is None
+                or step.capability
+                is not Capability.PROCESS_EXEC
+                or step.action
+                != request.action
+                or step.target
+                != request.target
+                or step.command is None
+            ):
+                raise PermissionError(
+                    "ExecutionRequest ya no coincide "
+                    "con el plan congelado."
+                )
+
+            command = step.command
+
+            if (
+                command.timeout_seconds
+                != runtime_seconds
+            ):
+                raise PermissionError(
+                    "La reserva durable no coincide "
+                    "con CommandSpec.timeout_seconds."
+                )
+
+            _validate_execution_result_for_command(
+                result,
+                command,
+            )
+
+            existing = connection.execute(
+                """
+                SELECT 1
+                FROM assistant_autonomy_execution_results
+                WHERE request_id = ?
+                """,
+                (request.request_id,),
+            ).fetchone()
+
+            if existing is not None:
+                raise PermissionError(
+                    "ExecutionRequest ya tiene "
+                    "una observación durable."
+                )
+
+            stdout_bytes = result.stdout.encode(
+                "utf-8"
+            )
+            stderr_bytes = result.stderr.encode(
+                "utf-8"
+            )
+
+            stdout_sha256 = hashlib.sha256(
+                stdout_bytes
+            ).hexdigest()
+
+            stderr_sha256 = hashlib.sha256(
+                stderr_bytes
+            ).hexdigest()
+
+            sequence = int(
+                connection.execute(
+                    """
+                    SELECT
+                        COALESCE(MAX(sequence), 0) + 1
+                    FROM assistant_autonomy_execution_results
+                    WHERE run_id = ?
+                    """,
+                    (int(run_row["id"]),),
+                ).fetchone()[0]
+            )
+
+            now = _now()
+
+            connection.execute(
+                """
+                INSERT INTO assistant_autonomy_execution_results(
+                    request_id,
+                    request_sha256,
+                    run_id,
+                    sequence,
+                    step_id,
+                    command_sha256,
+                    runtime_seconds,
+                    is_retry,
+                    outcome,
+                    exit_code,
+                    duration_ms,
+                    summary,
+                    error_code,
+                    stdout,
+                    stderr,
+                    stdout_sha256,
+                    stderr_sha256,
+                    timed_out,
+                    stdout_truncated,
+                    stderr_truncated,
+                    created_at
+                ) VALUES (
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                )
+                """,
+                (
+                    request.request_id,
+                    expected_request_sha256,
+                    int(run_row["id"]),
+                    sequence,
+                    request.step_id,
+                    request.command_sha256,
+                    runtime_seconds,
+                    1 if retry else 0,
+                    result.outcome.value,
+                    result.exit_code,
+                    result.duration_ms,
+                    result.summary,
+                    result.error_code,
+                    result.stdout,
+                    result.stderr,
+                    stdout_sha256,
+                    stderr_sha256,
+                    1 if result.timed_out else 0,
+                    (
+                        1
+                        if result.stdout_truncated
+                        else 0
+                    ),
+                    (
+                        1
+                        if result.stderr_truncated
+                        else 0
+                    ),
+                    now,
+                ),
+            )
+
+            current_status = AutonomyRunStatus(
+                str(run_row["status"])
+            )
+
+            self._insert_event(
+                connection,
+                run_db_id=int(run_row["id"]),
+                event_type="execution_observed",
+                from_status=current_status,
+                to_status=current_status,
+                summary=_execution_observed_summary(result),
+                payload={
+                    "request_id": (
+                        request.request_id
+                    ),
+                    "outcome": (
+                        result.outcome.value
+                    ),
+                    "exit_code": (
+                        result.exit_code
+                    ),
+                    "duration_ms": (
+                        result.duration_ms
+                    ),
+                    "error_code": (
+                        result.error_code
+                    ),
+                    "command_sha256": (
+                        request.command_sha256
+                    ),
+                    "stdout_sha256": (
+                        stdout_sha256
+                    ),
+                    "stderr_sha256": (
+                        stderr_sha256
+                    ),
+                    "timed_out": (
+                        result.timed_out
+                    ),
+                    "stdout_truncated": (
+                        result.stdout_truncated
+                    ),
+                    "stderr_truncated": (
+                        result.stderr_truncated
+                    ),
+                    "retry": retry,
+                },
+                created_at=now,
+                step_id=request.step_id,
             )
 
     @staticmethod
@@ -1582,6 +2112,178 @@ def _plan_from_json(encoded: str) -> RunPlan:
         raise PermissionError(
             "RunPlan persistido inválido; autoridad denegada."
         ) from exc
+
+
+def _validate_execution_result_for_command(
+    result: ExecutionResult,
+    command: CommandSpec,
+) -> None:
+    if (
+        result.exit_code is not None
+        and (
+            isinstance(result.exit_code, bool)
+            or not isinstance(
+                result.exit_code,
+                int,
+            )
+        )
+    ):
+        raise PermissionError(
+            "ExecutionResult.exit_code inválido."
+        )
+
+    stdout_size = len(
+        result.stdout.encode("utf-8")
+    )
+    stderr_size = len(
+        result.stderr.encode("utf-8")
+    )
+
+    if (
+        stdout_size
+        > command.stdout_limit_bytes
+    ):
+        raise PermissionError(
+            "ExecutionResult.stdout excede "
+            "CommandSpec.stdout_limit_bytes."
+        )
+
+    if (
+        stderr_size
+        > command.stderr_limit_bytes
+    ):
+        raise PermissionError(
+            "ExecutionResult.stderr excede "
+            "CommandSpec.stderr_limit_bytes."
+        )
+
+    if (
+        result.outcome
+        is ExecutionOutcome.DENIED
+    ):
+        raise PermissionError(
+            "Un launch consumido no puede "
+            "persistirse como denied."
+        )
+
+    if (
+        result.outcome
+        is ExecutionOutcome.SUCCEEDED
+    ):
+        if (
+            result.exit_code != 0
+            or result.timed_out
+            or result.error_code
+        ):
+            raise PermissionError(
+                "ExecutionResult succeeded "
+                "es semánticamente inconsistente."
+            )
+        return
+
+    if (
+        result.outcome
+        is ExecutionOutcome.CANCELLED
+    ):
+        if (
+            result.timed_out
+            or result.error_code
+            != "cancelled"
+            or result.exit_code == 0
+        ):
+            raise PermissionError(
+                "ExecutionResult cancelled "
+                "es semánticamente inconsistente."
+            )
+        return
+
+    if (
+        result.outcome
+        is not ExecutionOutcome.FAILED
+    ):
+        raise PermissionError(
+            "ExecutionResult outcome no soportado."
+        )
+
+    if result.error_code not in {
+        "sandbox_launch_failed",
+        "process_timeout",
+        "process_exit_nonzero",
+    }:
+        raise PermissionError(
+            "ExecutionResult failed usa "
+            "error_code no reconocido."
+        )
+
+    if result.error_code == "process_timeout":
+        if (
+            not result.timed_out
+            or result.exit_code == 0
+        ):
+            raise PermissionError(
+                "process_timeout requiere "
+                "timed_out=true."
+            )
+        return
+
+    if result.timed_out:
+        raise PermissionError(
+            "Solo process_timeout puede "
+            "marcar timed_out=true."
+        )
+
+    if (
+        result.error_code
+        == "sandbox_launch_failed"
+    ):
+        if result.exit_code is not None:
+            raise PermissionError(
+                "sandbox_launch_failed requiere "
+                "exit_code=None."
+            )
+        return
+
+    if (
+        result.exit_code is None
+        or result.exit_code == 0
+    ):
+        raise PermissionError(
+            "process_exit_nonzero requiere "
+            "exit_code no cero."
+        )
+
+
+def _execution_observed_summary(
+    result: ExecutionResult,
+) -> str:
+    if result.outcome is ExecutionOutcome.SUCCEEDED:
+        return "Ejecución observada: proceso completado."
+    if result.outcome is ExecutionOutcome.CANCELLED:
+        return "Ejecución observada: proceso cancelado."
+    return {
+        "sandbox_launch_failed": (
+            "Ejecución observada: Bubblewrap no pudo iniciarse."
+        ),
+        "process_timeout": (
+            "Ejecución observada: tiempo de ejecución agotado."
+        ),
+        "process_exit_nonzero": (
+            "Ejecución observada: código de salida no cero."
+        ),
+    }[result.error_code]
+
+
+def _observation_receipt_sha256(
+    receipt: _ExecutionObservationReceipt,
+) -> str:
+    request_id = receipt.request_id.encode("utf-8")
+    payload = (
+        b"elyndra.execution-observation.v1\x00"
+        + len(request_id).to_bytes(2, "big")
+        + request_id
+        + receipt.secret
+    )
+    return hashlib.sha256(payload).hexdigest()
 
 
 def _reservation_sha256(

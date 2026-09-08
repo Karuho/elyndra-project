@@ -2358,8 +2358,9 @@ class Database:
                 self._migrate_autonomy_phase5(connection)
                 self._migrate_autonomy_phase6a3(connection)
                 self._migrate_autonomy_phase7a(connection)
+                self._migrate_autonomy_phase7b1(connection)
             connection.execute(
-                "INSERT OR REPLACE INTO schema_meta(key, value) VALUES('schema_version', '55')"
+                "INSERT OR REPLACE INTO schema_meta(key, value) VALUES('schema_version', '56')"
             )
         with suppress(PermissionError):
             self.path.chmod(0o600)
@@ -2739,6 +2740,134 @@ class Database:
                 SELECT RAISE(
                     ABORT,
                     'autonomy_execution_launches_append_only'
+                );
+            END;
+            """
+        )
+
+    @staticmethod
+    def _migrate_autonomy_phase7b1(
+        connection: sqlite3.Connection,
+    ) -> None:
+        launch_columns = {
+            str(row[1])
+            for row in connection.execute(
+                "PRAGMA table_info(assistant_autonomy_execution_launches)"
+            )
+        }
+
+        if "observation_receipt_sha256" not in launch_columns:
+            connection.execute(
+                """
+                ALTER TABLE assistant_autonomy_execution_launches
+                ADD COLUMN observation_receipt_sha256 TEXT
+                    CHECK(
+                        observation_receipt_sha256 IS NULL
+                        OR length(observation_receipt_sha256) = 64
+                    )
+                """
+            )
+
+        connection.executescript(
+            """
+            CREATE TRIGGER IF NOT EXISTS
+            trg_autonomy_execution_launches_receipt_required
+            BEFORE INSERT ON assistant_autonomy_execution_launches
+            WHEN NEW.observation_receipt_sha256 IS NULL
+            BEGIN
+                SELECT RAISE(
+                    ABORT,
+                    'autonomy_execution_launch_receipt_required'
+                );
+            END;
+
+            CREATE TABLE IF NOT EXISTS assistant_autonomy_execution_results (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                request_id TEXT NOT NULL UNIQUE
+                    CHECK(length(request_id) BETWEEN 1 AND 128),
+                request_sha256 TEXT NOT NULL
+                    CHECK(length(request_sha256) = 64),
+                run_id INTEGER NOT NULL,
+                sequence INTEGER NOT NULL
+                    CHECK(sequence >= 1),
+                step_id TEXT NOT NULL
+                    CHECK(length(step_id) BETWEEN 1 AND 64),
+                command_sha256 TEXT NOT NULL
+                    CHECK(length(command_sha256) = 64),
+                runtime_seconds INTEGER NOT NULL
+                    CHECK(runtime_seconds >= 0),
+                is_retry INTEGER NOT NULL
+                    CHECK(is_retry IN (0, 1)),
+                outcome TEXT NOT NULL CHECK(outcome IN (
+                    'succeeded',
+                    'failed',
+                    'cancelled',
+                    'denied'
+                )),
+                exit_code INTEGER,
+                duration_ms INTEGER NOT NULL
+                    CHECK(duration_ms >= 0),
+                summary TEXT NOT NULL
+                    CHECK(length(summary) BETWEEN 1 AND 2000),
+                error_code TEXT NOT NULL
+                    CHECK(length(error_code) <= 80),
+                stdout TEXT NOT NULL
+                    CHECK(length(stdout) <= 1048576),
+                stderr TEXT NOT NULL
+                    CHECK(length(stderr) <= 1048576),
+                stdout_sha256 TEXT NOT NULL
+                    CHECK(length(stdout_sha256) = 64),
+                stderr_sha256 TEXT NOT NULL
+                    CHECK(length(stderr_sha256) = 64),
+                timed_out INTEGER NOT NULL
+                    CHECK(timed_out IN (0, 1)),
+                stdout_truncated INTEGER NOT NULL
+                    CHECK(stdout_truncated IN (0, 1)),
+                stderr_truncated INTEGER NOT NULL
+                    CHECK(stderr_truncated IN (0, 1)),
+                created_at TEXT NOT NULL,
+
+                FOREIGN KEY(run_id)
+                    REFERENCES assistant_autonomy_runs(id)
+                    ON DELETE RESTRICT,
+
+                FOREIGN KEY(request_id)
+                    REFERENCES assistant_autonomy_execution_launches(
+                        request_id
+                    )
+                    ON DELETE RESTRICT,
+
+                UNIQUE(run_id, sequence)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_autonomy_execution_results_run
+            ON assistant_autonomy_execution_results(
+                run_id,
+                sequence
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_autonomy_execution_results_step
+            ON assistant_autonomy_execution_results(
+                run_id,
+                step_id,
+                sequence
+            );
+
+            CREATE TRIGGER IF NOT EXISTS trg_autonomy_execution_results_no_update
+            BEFORE UPDATE ON assistant_autonomy_execution_results
+            BEGIN
+                SELECT RAISE(
+                    ABORT,
+                    'autonomy_execution_results_append_only'
+                );
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS trg_autonomy_execution_results_no_delete
+            BEFORE DELETE ON assistant_autonomy_execution_results
+            BEGIN
+                SELECT RAISE(
+                    ABORT,
+                    'autonomy_execution_results_append_only'
                 );
             END;
             """

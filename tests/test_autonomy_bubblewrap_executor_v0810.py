@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import io
+import json
 import shutil
+import sqlite3
 import subprocess
 import sys
 from datetime import UTC, datetime, timedelta
@@ -22,11 +25,14 @@ from elyndra.autonomy import (
     ExecutionBudget,
     ExecutionOutcome,
     ExecutionRequest,
+    ExecutionResult,
     PreparedExecution,
     RunPlan,
     RunStep,
     WorkspaceScope,
 )
+from elyndra.autonomy.bubblewrap_executor import _TailCollector
+from elyndra.autonomy.repository import _ExecutionObservationReceipt
 from elyndra.db import Database
 
 
@@ -408,6 +414,51 @@ def test_bubblewrap_executor_truncates_output(
     ) <= 64
 
 
+def test_bubblewrap_executor_invalid_utf8_respects_exact_byte_limits(
+    tmp_path: Path,
+) -> None:
+    _require_runtime()
+
+    code = """
+import os
+
+os.write(1, b"A" + (b"\\xff" * 64))
+os.write(2, b"B" + (b"\\xfe" * 64))
+"""
+
+    _database, repository, run = _state(
+        tmp_path,
+        code=code,
+        stdout_limit_bytes=17,
+        stderr_limit_bytes=19,
+    )
+
+    result = _execute(
+        repository,
+        _prepare(repository, run),
+    )
+
+    assert result.outcome is ExecutionOutcome.SUCCEEDED
+    assert result.stdout_truncated
+    assert result.stderr_truncated
+    assert len(result.stdout.encode("utf-8")) <= 17
+    assert len(result.stderr.encode("utf-8")) <= 19
+
+
+@pytest.mark.parametrize("limit", (1, 2, 3, 7, 17))
+def test_tail_collector_invalid_utf8_is_byte_safe(limit: int) -> None:
+    collector = _TailCollector.create(
+        io.BytesIO(b"prefix-" + (b"\xff" * 64)),
+        limit,
+    )
+    collector.collect()
+
+    text = collector.text()
+
+    assert collector.truncated
+    assert len(text.encode("utf-8")) <= limit
+
+
 def test_bubblewrap_executor_enforces_timeout(
     tmp_path: Path,
 ) -> None:
@@ -606,3 +657,465 @@ def test_bubblewrap_executor_has_no_launcher_override() -> None:
             actor="owner",
             bwrap_path="/usr/bin/python3.13",  # type: ignore[call-arg]
         )
+
+
+def test_bubblewrap_executor_persists_durable_observation(
+    tmp_path: Path,
+) -> None:
+    _require_runtime()
+
+    database, repository, run = _state(
+        tmp_path,
+        code="print('OBSERVED_OK')",
+    )
+
+    prepared = _prepare(
+        repository,
+        run,
+    )
+
+    result = _execute(
+        repository,
+        prepared,
+    )
+
+    assert result.outcome is ExecutionOutcome.SUCCEEDED
+
+    observations = repository.execution_results(
+        run.run_id,
+        actor="owner",
+    )
+
+    assert len(observations) == 1
+
+    observation = observations[0]
+
+    assert observation["sequence"] == 1
+    assert (
+        observation["request_id"]
+        == prepared.request.request_id
+    )
+    assert observation["step_id"] == "run"
+    assert observation["outcome"] == "succeeded"
+    assert observation["exit_code"] == 0
+    assert observation["stdout"] == "OBSERVED_OK"
+    assert observation["stderr"] == ""
+    assert not observation["timed_out"]
+    assert not observation["is_retry"]
+    assert len(observation["stdout_sha256"]) == 64
+    assert len(observation["stderr_sha256"]) == 64
+
+    with database.connect() as connection:
+        event = connection.execute(
+            """
+            SELECT
+                event_type,
+                step_id,
+                payload_json
+            FROM assistant_autonomy_events
+            WHERE
+                event_type='execution_observed'
+                AND step_id='run'
+            """
+        ).fetchone()
+
+    assert event is not None
+    assert event["event_type"] == "execution_observed"
+
+
+def test_execution_observation_rejects_duplicate_record(
+    tmp_path: Path,
+) -> None:
+    _database, repository, run = _state(
+        tmp_path,
+        code="print('unused')",
+    )
+
+    prepared = _prepare(
+        repository,
+        run,
+    )
+
+    receipt = repository._claim_execution_launch(
+        prepared.request,
+        actor="owner",
+        runtime_seconds=prepared.reserved_runtime_seconds,
+        retry=prepared.retry,
+    )
+    result = ExecutionResult(
+        request_id=prepared.request.request_id,
+        outcome=ExecutionOutcome.SUCCEEDED,
+        summary="Observación única.",
+        exit_code=0,
+    )
+    repository._record_execution_result(
+        prepared.request,
+        result,
+        actor="owner",
+        receipt=receipt,
+    )
+
+    with pytest.raises(
+        PermissionError,
+        match="ya tiene una observación durable",
+    ):
+        repository._record_execution_result(
+            prepared.request,
+            result,
+            actor="owner",
+            receipt=receipt,
+        )
+
+    assert len(
+        repository.execution_results(
+            run.run_id,
+            actor="owner",
+        )
+    ) == 1
+
+
+def test_execution_observation_rows_are_append_only(
+    tmp_path: Path,
+) -> None:
+    _require_runtime()
+
+    database, repository, run = _state(
+        tmp_path,
+        code="print('IMMUTABLE_RESULT')",
+    )
+
+    _execute(
+        repository,
+        _prepare(repository, run),
+    )
+
+    with pytest.raises(
+        sqlite3.IntegrityError,
+        match="autonomy_execution_results_append_only",
+    ), database.connect() as connection:
+        connection.execute(
+            """
+            UPDATE assistant_autonomy_execution_results
+            SET stdout = 'tampered'
+            """
+        )
+
+    with pytest.raises(
+        sqlite3.IntegrityError,
+        match="autonomy_execution_results_append_only",
+    ), database.connect() as connection:
+        connection.execute(
+            """
+            DELETE FROM assistant_autonomy_execution_results
+            """
+        )
+
+
+def test_execution_observation_requires_executor_receipt(
+    tmp_path: Path,
+) -> None:
+    _database, repository, run = _state(
+        tmp_path,
+        code="print('MUST_NOT_BE_OBSERVED')",
+    )
+
+    prepared = _prepare(
+        repository,
+        run,
+    )
+    real_receipt = repository._claim_execution_launch(
+        prepared.request,
+        actor="owner",
+        runtime_seconds=prepared.reserved_runtime_seconds,
+        retry=prepared.retry,
+    )
+
+    forged = ExecutionResult(
+        request_id=prepared.request.request_id,
+        outcome=ExecutionOutcome.SUCCEEDED,
+        summary="Resultado fabricado.",
+        exit_code=0,
+    )
+
+    with pytest.raises(
+        PermissionError,
+        match="Comprobante de observación inválido",
+    ):
+        repository._record_execution_result(
+            prepared.request,
+            forged,
+            actor="owner",
+            receipt=_ExecutionObservationReceipt(
+                request_id=prepared.request.request_id,
+                secret=b"x" * 32,
+            ),
+        )
+
+    with pytest.raises(
+        PermissionError,
+        match="no pertenece al ExecutionRequest",
+    ):
+        repository._record_execution_result(
+            prepared.request,
+            forged,
+            actor="owner",
+            receipt=_ExecutionObservationReceipt(
+                request_id="different-request-id",
+                secret=real_receipt.secret,
+            ),
+        )
+
+    assert not hasattr(repository, "record_execution_result")
+    assert repository.execution_results(
+        run.run_id,
+        actor="owner",
+    ) == []
+
+
+def test_execution_observation_enforces_command_output_bound(
+    tmp_path: Path,
+) -> None:
+    _database, repository, run = _state(
+        tmp_path,
+        code="print('unused')",
+        stdout_limit_bytes=64,
+    )
+
+    prepared = _prepare(
+        repository,
+        run,
+    )
+
+    receipt = repository._claim_execution_launch(
+        prepared.request,
+        actor="owner",
+        runtime_seconds=(
+            prepared.reserved_runtime_seconds
+        ),
+        retry=prepared.retry,
+    )
+
+    forged = ExecutionResult(
+        request_id=prepared.request.request_id,
+        outcome=ExecutionOutcome.SUCCEEDED,
+        summary="Output fuera de límite.",
+        exit_code=0,
+        stdout="X" * 65,
+    )
+
+    with pytest.raises(
+        PermissionError,
+        match="stdout excede",
+    ):
+        repository._record_execution_result(
+            prepared.request,
+            forged,
+            actor="owner",
+            receipt=receipt,
+        )
+
+    assert repository.execution_results(
+        run.run_id,
+        actor="owner",
+    ) == []
+
+
+def test_execution_observation_gap_is_explicit_until_result(
+    tmp_path: Path,
+) -> None:
+    _database, repository, run = _state(
+        tmp_path,
+        code="print('unused')",
+    )
+    prepared = _prepare(repository, run)
+    receipt = repository._claim_execution_launch(
+        prepared.request,
+        actor="owner",
+        runtime_seconds=prepared.reserved_runtime_seconds,
+        retry=prepared.retry,
+    )
+
+    gaps = repository.execution_observation_gaps(
+        run.run_id,
+        actor="owner",
+    )
+    assert gaps == [
+        {
+            "run_id": run.run_id,
+            "request_id": prepared.request.request_id,
+            "step_id": "run",
+            "command_sha256": prepared.request.command_sha256,
+            "state": "observation_unresolved",
+            "launched_at": gaps[0]["launched_at"],
+        }
+    ]
+    assert repository.execution_results(
+        run.run_id,
+        actor="owner",
+    ) == []
+
+    result = ExecutionResult(
+        request_id=prepared.request.request_id,
+        outcome=ExecutionOutcome.SUCCEEDED,
+        summary="Observación válida.",
+        exit_code=0,
+    )
+    repository._record_execution_result(
+        prepared.request,
+        result,
+        actor="owner",
+        receipt=receipt,
+    )
+
+    assert repository.execution_observation_gaps(
+        run.run_id,
+        actor="owner",
+    ) == []
+    assert len(repository.execution_results(run.run_id, actor="owner")) == 1
+
+
+@pytest.mark.parametrize(
+    ("outcome", "exit_code", "timed_out", "error_code"),
+    (
+        (ExecutionOutcome.SUCCEEDED, None, False, ""),
+        (ExecutionOutcome.SUCCEEDED, 1, False, ""),
+        (ExecutionOutcome.SUCCEEDED, 0, True, ""),
+        (ExecutionOutcome.SUCCEEDED, 0, False, "unexpected"),
+        (ExecutionOutcome.FAILED, None, False, "process_exit_nonzero"),
+        (ExecutionOutcome.FAILED, 0, False, "process_exit_nonzero"),
+        (ExecutionOutcome.FAILED, 1, True, "process_exit_nonzero"),
+        (ExecutionOutcome.FAILED, 1, False, "process_timeout"),
+        (ExecutionOutcome.FAILED, 0, True, "process_timeout"),
+        (ExecutionOutcome.FAILED, 1, False, "sandbox_launch_failed"),
+        (ExecutionOutcome.FAILED, None, True, "sandbox_launch_failed"),
+        (ExecutionOutcome.CANCELLED, 0, False, "cancelled"),
+        (ExecutionOutcome.CANCELLED, None, True, "cancelled"),
+        (ExecutionOutcome.CANCELLED, None, False, "wrong"),
+    ),
+)
+def test_execution_observation_rejects_impossible_result_semantics(
+    tmp_path: Path,
+    outcome: ExecutionOutcome,
+    exit_code: int | None,
+    timed_out: bool,
+    error_code: str,
+) -> None:
+    _database, repository, run = _state(
+        tmp_path,
+        code="print('unused')",
+    )
+    prepared = _prepare(repository, run)
+    receipt = repository._claim_execution_launch(
+        prepared.request,
+        actor="owner",
+        runtime_seconds=prepared.reserved_runtime_seconds,
+        retry=prepared.retry,
+    )
+    result = ExecutionResult(
+        request_id=prepared.request.request_id,
+        outcome=outcome,
+        summary="Combinación imposible.",
+        exit_code=exit_code,
+        timed_out=timed_out,
+        error_code=error_code,
+    )
+
+    with pytest.raises(PermissionError, match="inconsistente|requiere|Solo"):
+        repository._record_execution_result(
+            prepared.request,
+            result,
+            actor="owner",
+            receipt=receipt,
+        )
+
+    assert repository.execution_results(run.run_id, actor="owner") == []
+    assert len(repository.execution_observation_gaps(run.run_id, actor="owner")) == 1
+
+
+@pytest.mark.parametrize("exit_code", (None, -15))
+def test_execution_observation_accepts_cancellation_before_or_after_popen(
+    tmp_path: Path,
+    exit_code: int | None,
+) -> None:
+    _database, repository, run = _state(
+        tmp_path,
+        code="print('unused')",
+    )
+    prepared = _prepare(repository, run)
+    receipt = repository._claim_execution_launch(
+        prepared.request,
+        actor="owner",
+        runtime_seconds=prepared.reserved_runtime_seconds,
+        retry=prepared.retry,
+    )
+    result = ExecutionResult(
+        request_id=prepared.request.request_id,
+        outcome=ExecutionOutcome.CANCELLED,
+        summary="Cancelado.",
+        exit_code=exit_code,
+        error_code="cancelled",
+    )
+
+    repository._record_execution_result(
+        prepared.request,
+        result,
+        actor="owner",
+        receipt=receipt,
+    )
+
+    assert repository.execution_results(run.run_id, actor="owner")[0][
+        "outcome"
+    ] == "cancelled"
+
+
+def test_execution_observed_audit_excludes_caller_controlled_secrets(
+    tmp_path: Path,
+) -> None:
+    database, repository, run = _state(
+        tmp_path,
+        code="print('unused')",
+    )
+    prepared = _prepare(repository, run)
+    receipt = repository._claim_execution_launch(
+        prepared.request,
+        actor="owner",
+        runtime_seconds=prepared.reserved_runtime_seconds,
+        retry=prepared.retry,
+    )
+    distinctive = "AUDIT_SECRET_DO_NOT_COPY_7B1"
+    result = ExecutionResult(
+        request_id=prepared.request.request_id,
+        outcome=ExecutionOutcome.SUCCEEDED,
+        summary=distinctive,
+        exit_code=0,
+        stdout=distinctive,
+    )
+    repository._record_execution_result(
+        prepared.request,
+        result,
+        actor="owner",
+        receipt=receipt,
+    )
+
+    with database.connect() as connection:
+        event = connection.execute(
+            """
+            SELECT summary, payload_json
+            FROM assistant_autonomy_events
+            WHERE event_type = 'execution_observed'
+            """
+        ).fetchone()
+
+    assert event is not None
+    assert event["summary"] == "Ejecución observada: proceso completado."
+    assert distinctive not in event["summary"]
+    assert distinctive not in event["payload_json"]
+    payload = json.loads(event["payload_json"])
+    assert "stdout" not in payload
+    assert "stderr" not in payload
+    raw_receipt = receipt.secret.hex()
+    assert raw_receipt not in event["summary"]
+    assert raw_receipt not in event["payload_json"]
+    assert raw_receipt not in str(
+        repository.execution_results(run.run_id, actor="owner")
+    )

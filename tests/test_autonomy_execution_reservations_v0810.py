@@ -118,7 +118,7 @@ def _request(
     )
 
 
-def test_schema_55_reservation_ledger_is_vault_scoped_and_idempotent(
+def test_schema_56_reservation_ledger_is_vault_scoped_and_idempotent(
     tmp_path: Path,
 ) -> None:
     root = Database(tmp_path / "root.sqlite3", role="root")
@@ -135,7 +135,7 @@ def test_schema_55_reservation_ledger_is_vault_scoped_and_idempotent(
             SELECT value FROM schema_meta
             WHERE key='schema_version'
             """
-        ).fetchone()[0] == "55"
+        ).fetchone()[0] == "56"
 
         assert connection.execute(
             """
@@ -152,7 +152,7 @@ def test_schema_55_reservation_ledger_is_vault_scoped_and_idempotent(
             SELECT value FROM schema_meta
             WHERE key='schema_version'
             """
-        ).fetchone()[0] == "55"
+        ).fetchone()[0] == "56"
 
         assert connection.execute(
             """
@@ -206,7 +206,7 @@ def test_schema_51_upgrade_preserves_run_and_creates_ledger(
             SELECT value FROM schema_meta
             WHERE key='schema_version'
             """
-        ).fetchone()[0] == "55"
+        ).fetchone()[0] == "56"
 
         assert connection.execute(
             """
@@ -714,7 +714,7 @@ def test_schema_53_upgrade_adds_command_sha256_without_losing_reservation(
             SELECT value FROM schema_meta
             WHERE key='schema_version'
             """
-        ).fetchone()[0] == "55"
+        ).fetchone()[0] == "56"
 
         columns = {
             str(row[1])
@@ -936,7 +936,7 @@ def test_schema_54_upgrade_creates_one_shot_launch_ledger(
             FROM schema_meta
             WHERE key='schema_version'
             """
-        ).fetchone()[0] == "55"
+        ).fetchone()[0] == "56"
 
         assert connection.execute(
             """
@@ -963,3 +963,196 @@ def test_schema_54_upgrade_creates_one_shot_launch_ledger(
             FROM assistant_autonomy_execution_launches
             """
         ).fetchone()[0] == 0
+
+
+def test_schema_55_upgrade_creates_execution_results_ledger(
+    tmp_path: Path,
+) -> None:
+    database, repository, run = _process_state(
+        tmp_path
+    )
+    _start(repository, run)
+
+    command = run.plan.steps[0].command
+    assert command is not None
+
+    snapshot = CommandSnapshot.capture(
+        command,
+        resolved_cwd=run.workspace.root,
+    )
+
+    request = _process_request(
+        run,
+        command_sha256=snapshot.command_sha256,
+        request_id="schema-55-result-ledger",
+    )
+
+    repository.reserve_execution(
+        request,
+        actor="owner",
+        runtime_seconds=command.timeout_seconds,
+    )
+
+    repository._claim_execution_launch(
+        request,
+        actor="owner",
+        runtime_seconds=command.timeout_seconds,
+        retry=False,
+    )
+
+    with database.connect() as connection:
+        connection.execute(
+            """
+            DROP TABLE assistant_autonomy_execution_results
+            """
+        )
+        connection.execute(
+            """
+            DROP TRIGGER trg_autonomy_execution_launches_receipt_required
+            """
+        )
+        connection.execute(
+            """
+            ALTER TABLE assistant_autonomy_execution_launches
+            DROP COLUMN observation_receipt_sha256
+            """
+        )
+        connection.execute(
+            """
+            UPDATE schema_meta
+            SET value='55'
+            WHERE key='schema_version'
+            """
+        )
+
+        historical_launch = tuple(
+            connection.execute(
+                """
+                SELECT
+                    request_id,
+                    request_sha256,
+                    run_id,
+                    command_sha256,
+                    created_at
+                FROM assistant_autonomy_execution_launches
+                WHERE request_id = ?
+                """,
+                (request.request_id,),
+            ).fetchone()
+        )
+
+    database.migrate()
+
+    with database.connect() as connection:
+        assert connection.execute(
+            """
+            SELECT value
+            FROM schema_meta
+            WHERE key='schema_version'
+            """
+        ).fetchone()[0] == "56"
+
+        assert connection.execute(
+            """
+            SELECT 1
+            FROM sqlite_master
+            WHERE
+                type='table'
+                AND name='assistant_autonomy_execution_results'
+            """
+        ).fetchone()
+
+        assert connection.execute(
+            """
+            SELECT COUNT(*)
+            FROM assistant_autonomy_execution_launches
+            WHERE request_id = ?
+            """,
+            (request.request_id,),
+        ).fetchone()[0] == 1
+
+        migrated_launch = connection.execute(
+            """
+            SELECT
+                request_id,
+                request_sha256,
+                run_id,
+                command_sha256,
+                created_at,
+                observation_receipt_sha256
+            FROM assistant_autonomy_execution_launches
+            WHERE request_id = ?
+            """,
+            (request.request_id,),
+        ).fetchone()
+
+        assert migrated_launch is not None
+        assert tuple(migrated_launch[:5]) == historical_launch
+        assert migrated_launch["observation_receipt_sha256"] is None
+
+        assert connection.execute(
+            """
+            SELECT COUNT(*)
+            FROM assistant_autonomy_execution_results
+            """
+        ).fetchone()[0] == 0
+
+    assert repository.execution_observation_gaps(
+        run.run_id,
+        actor="owner",
+    )[0]["state"] == "observation_unresolved"
+
+    second_request = _process_request(
+        run,
+        command_sha256=snapshot.command_sha256,
+        request_id="schema-56-provenance-launch",
+    )
+    repository.reserve_execution(
+        second_request,
+        actor="owner",
+        runtime_seconds=command.timeout_seconds,
+    )
+    repository._claim_execution_launch(
+        second_request,
+        actor="owner",
+        runtime_seconds=command.timeout_seconds,
+        retry=False,
+    )
+
+    with database.connect() as connection:
+        commitment = connection.execute(
+            """
+            SELECT observation_receipt_sha256
+            FROM assistant_autonomy_execution_launches
+            WHERE request_id = ?
+            """,
+            (second_request.request_id,),
+        ).fetchone()[0]
+
+    assert isinstance(commitment, str)
+    assert len(commitment) == 64
+
+    with pytest.raises(
+        sqlite3.IntegrityError,
+        match="autonomy_execution_launches_append_only",
+    ), database.connect() as connection:
+        connection.execute(
+            """
+            UPDATE assistant_autonomy_execution_launches
+            SET observation_receipt_sha256 = ?
+            WHERE request_id = ?
+            """,
+            ("0" * 64, second_request.request_id),
+        )
+
+    with pytest.raises(
+        sqlite3.IntegrityError,
+        match="autonomy_execution_launches_append_only",
+    ), database.connect() as connection:
+        connection.execute(
+            """
+            DELETE FROM assistant_autonomy_execution_launches
+            WHERE request_id = ?
+            """,
+            (second_request.request_id,),
+        )
