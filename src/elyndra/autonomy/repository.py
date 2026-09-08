@@ -8,7 +8,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from elyndra.autonomy.capabilities import Capability, CapabilityGrant
-from elyndra.autonomy.commands import CommandSpec
+from elyndra.autonomy.commands import CommandSnapshot, CommandSpec
 from elyndra.autonomy.execution import (
     ExecutionBudget,
     ExecutionBudgetSnapshot,
@@ -22,6 +22,7 @@ from elyndra.autonomy.models import (
     RunPlan,
     RunStep,
 )
+from elyndra.autonomy.scope import WorkspaceScope
 from elyndra.db import Database
 
 _STEP_ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
@@ -621,16 +622,61 @@ class AutonomyRepository:
                 )
 
             if step.capability is Capability.PROCESS_EXEC:
-                raise PermissionError(
-                    "process.exec permanece deshabilitado hasta que "
-                    "la reserva durable esté ligada al CommandSnapshot."
-                )
+                command = step.command
+                if command is None:
+                    raise PermissionError(
+                        "process.exec persistido no tiene CommandSpec."
+                    )
+
+                if not grant.allows_executable(command.executable):
+                    raise PermissionError(
+                        "Ejecutable fuera del allowlist persistido."
+                    )
+
+                if command.timeout_seconds > grant.max_runtime_seconds:
+                    raise PermissionError(
+                        "El timeout del comando excede el grant persistido."
+                    )
+
+                if runtime_seconds != command.timeout_seconds:
+                    raise PermissionError(
+                        "process.exec requiere reservar el timeout exacto "
+                        "del CommandSpec."
+                    )
+
+                try:
+                    workspace = WorkspaceScope.from_root(
+                        str(row["workspace_root"])
+                    )
+                    resolved_cwd = workspace.resolve(
+                        command.cwd,
+                        must_exist=True,
+                    )
+                    current_snapshot = CommandSnapshot.capture(
+                        command,
+                        resolved_cwd=resolved_cwd,
+                    )
+                except (OSError, PermissionError, ValueError) as exc:
+                    raise PermissionError(
+                        "No se pudo revalidar CommandSnapshot "
+                        "desde autoridad persistida."
+                    ) from exc
+
+                if (
+                    current_snapshot.command_sha256
+                    != request.command_sha256
+                ):
+                    raise PermissionError(
+                        "ExecutionRequest no coincide con "
+                        "CommandSnapshot actual."
+                    )
 
             existing = connection.execute(
                 """
                 SELECT
                     run_id,
-                    request_sha256
+                    request_sha256,
+                    command_sha256
                 FROM assistant_autonomy_execution_reservations
                 WHERE request_id = ?
                 """,
@@ -638,10 +684,18 @@ class AutonomyRepository:
             ).fetchone()
 
             if existing is not None:
+                stored_command_sha256 = (
+                    ""
+                    if existing["command_sha256"] is None
+                    else str(existing["command_sha256"])
+                )
+
                 if (
                     int(existing["run_id"]) != int(row["id"])
                     or str(existing["request_sha256"])
                     != request_sha256
+                    or stored_command_sha256
+                    != request.command_sha256
                 ):
                     raise PermissionError(
                         "request_id reutilizado con una reserva diferente."
@@ -684,10 +738,11 @@ class AutonomyRepository:
                     sequence,
                     step_id,
                     capability,
+                    command_sha256,
                     runtime_seconds,
                     is_retry,
                     created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     request.request_id,
@@ -696,6 +751,7 @@ class AutonomyRepository:
                     sequence,
                     request.step_id,
                     request.capability.value,
+                    request.command_sha256 or None,
                     runtime_seconds,
                     1 if retry else 0,
                     _now(),
@@ -1290,18 +1346,25 @@ def _reservation_sha256(
     runtime_seconds: int,
     retry: bool,
 ) -> str:
+    payload = {
+        "request_id": request.request_id,
+        "run_id": request.run_id,
+        "step_id": request.step_id,
+        "capability": request.capability.value,
+        "action": request.action,
+        "target": request.target,
+        "requires_human_gate": request.requires_human_gate,
+        "runtime_seconds": runtime_seconds,
+        "retry": retry,
+    }
+
+    # Keep the pre-schema-54 fingerprint byte-compatible for non-process
+    # reservations so an old request_id remains idempotently replayable.
+    if request.command_sha256:
+        payload["command_sha256"] = request.command_sha256
+
     encoded = json.dumps(
-        {
-            "request_id": request.request_id,
-            "run_id": request.run_id,
-            "step_id": request.step_id,
-            "capability": request.capability.value,
-            "action": request.action,
-            "target": request.target,
-            "requires_human_gate": request.requires_human_gate,
-            "runtime_seconds": runtime_seconds,
-            "retry": retry,
-        },
+        payload,
         ensure_ascii=False,
         sort_keys=True,
         separators=(",", ":"),
