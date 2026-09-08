@@ -409,6 +409,13 @@ class ExecutionContract:
                 f"El step {step.step_id} requiere HumanGate aprobado."
             )
 
+        if step.capability is Capability.PROCESS_EXEC:
+            raise ExecutionDenied(
+                "process.exec permanece deshabilitado hasta que "
+                "ExecutionRequest y la reserva durable estén ligados "
+                "al CommandSnapshot."
+            )
+
         resolved_target = self._resolve_target(step)
 
         request = ExecutionRequest(

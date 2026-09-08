@@ -9,6 +9,7 @@ from elyndra.autonomy import (
     AutonomyRun,
     Capability,
     CapabilityGrant,
+    CommandSpec,
     HumanGate,
     HumanGateStatus,
     RunPlan,
@@ -330,3 +331,84 @@ def test_human_gate_starts_pending() -> None:
     )
 
     assert gate.status is HumanGateStatus.PENDING
+
+def _command_spec(executable: str) -> CommandSpec:
+    return CommandSpec(
+        executable=executable,
+        argv=(executable, "--version"),
+        cwd=".",
+        timeout_seconds=10,
+    )
+
+
+def test_capability_grant_uses_exact_executable_allowlist() -> None:
+    now = datetime.now(UTC)
+
+    grant = CapabilityGrant(
+        capabilities=frozenset({Capability.PROCESS_EXEC}),
+        issued_at=now,
+        expires_at=now + timedelta(hours=1),
+        allowed_executables=(
+            "/usr/bin/python3.13",
+            "/usr/bin/python3.13",
+        ),
+    )
+
+    assert grant.allowed_executables == ("/usr/bin/python3.13",)
+    assert grant.allows_executable("/usr/bin/python3.13")
+    assert not grant.allows_executable("/usr/bin/python3")
+
+
+def test_process_exec_step_requires_command_spec() -> None:
+    with pytest.raises(ValueError, match="requiere CommandSpec"):
+        RunStep(
+            step_id="run",
+            capability=Capability.PROCESS_EXEC,
+            action="run controlled command",
+            target=".",
+        )
+
+
+def test_non_process_step_rejects_command_spec() -> None:
+    command = _command_spec("/usr/bin/python3.13")
+
+    with pytest.raises(ValueError, match="Solo un step process.exec"):
+        RunStep(
+            step_id="read",
+            capability=Capability.WORKSPACE_READ,
+            action="inspect",
+            target=".",
+            command=command,
+        )
+
+
+def test_autonomy_run_requires_exact_executable_authority(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "project"
+    root.mkdir()
+
+    command = _command_spec("/usr/bin/python3.13")
+    plan = RunPlan(
+        objective="Run one frozen command",
+        steps=(
+            RunStep(
+                step_id="run",
+                capability=Capability.PROCESS_EXEC,
+                action="run controlled command",
+                target=".",
+                command=command,
+            ),
+        ),
+    )
+
+    with pytest.raises(
+        PermissionError,
+        match="Ejecutable fuera del allowlist",
+    ):
+        AutonomyRun(
+            actor="owner",
+            workspace=WorkspaceScope.from_root(root),
+            grant=_grant(Capability.PROCESS_EXEC),
+            plan=plan,
+        )

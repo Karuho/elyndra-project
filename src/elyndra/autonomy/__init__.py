@@ -5,6 +5,14 @@ from elyndra.autonomy.binding import (
     ExecutionBindingError,
 )
 from elyndra.autonomy.capabilities import Capability, CapabilityGrant
+from elyndra.autonomy.commands import (
+    CommandEnvironmentProfile,
+    CommandSandboxProfile,
+    CommandSnapshot,
+    CommandSpec,
+    CommandStdinPolicy,
+    ExecutableIdentity,
+)
 from elyndra.autonomy.execution import (
     CancellationToken,
     ExecutionBudget,
@@ -57,4 +65,10 @@ __all__ = [
     "RunPlan",
     "RunStep",
     "WorkspaceScope",
+    "CommandEnvironmentProfile",
+    "CommandSandboxProfile",
+    "CommandSnapshot",
+    "CommandSpec",
+    "CommandStdinPolicy",
+    "ExecutableIdentity",
 ]
