@@ -16,6 +16,7 @@ from elyndra.autonomy import (
     ExecutionContract,
     ExecutionDenied,
     ExecutionOutcome,
+    ExecutionRequest,
     ExecutionResult,
     RunPlan,
     RunStep,
@@ -523,7 +524,7 @@ def test_execution_result_is_bounded_and_normalized() -> None:
             duration_ms=-1,
         )
 
-def test_process_exec_remains_fail_closed_before_command_binding(
+def test_process_exec_requires_durable_reservation_backend(
     tmp_path: Path,
 ) -> None:
     root = tmp_path / "project"
@@ -570,11 +571,39 @@ def test_process_exec_remains_fail_closed_before_command_binding(
 
     with pytest.raises(
         ExecutionDenied,
-        match="process.exec permanece deshabilitado",
+        match="backend durable",
     ):
-        contract.prepare(
-            "run",
-            runtime_seconds=10,
-        )
+        contract.prepare("run")
 
     assert contract.budget.snapshot().commands_reserved == 0
+
+
+def test_process_execution_request_requires_command_sha256() -> None:
+    with pytest.raises(
+        ValueError,
+        match="command_sha256",
+    ):
+        ExecutionRequest(
+            run_id="process-run",
+            step_id="run",
+            capability=Capability.PROCESS_EXEC,
+            action="run version check",
+            target=".",
+            requires_human_gate=False,
+        )
+
+
+def test_non_process_execution_request_rejects_command_sha256() -> None:
+    with pytest.raises(
+        ValueError,
+        match="Solo process.exec",
+    ):
+        ExecutionRequest(
+            run_id="read-run",
+            step_id="read",
+            capability=Capability.WORKSPACE_READ,
+            action="inspect source",
+            target="src/main.py",
+            requires_human_gate=False,
+            command_sha256="0" * 64,
+        )

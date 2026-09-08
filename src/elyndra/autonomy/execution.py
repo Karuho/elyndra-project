@@ -7,6 +7,10 @@ from enum import StrEnum
 from typing import Protocol
 
 from elyndra.autonomy.capabilities import Capability, CapabilityGrant
+from elyndra.autonomy.commands import (
+    CommandSnapshot,
+    valid_command_sha256,
+)
 from elyndra.autonomy.models import RunPlan, RunStep
 from elyndra.autonomy.scope import WorkspaceScope
 
@@ -250,6 +254,7 @@ class ExecutionRequest:
     action: str
     target: str
     requires_human_gate: bool
+    command_sha256: str = ""
     request_id: str = field(default_factory=lambda: uuid.uuid4().hex)
 
     def __post_init__(self) -> None:
@@ -267,12 +272,25 @@ class ExecutionRequest:
         if len(target) > 2_000:
             raise ValueError("target supera 2000 caracteres.")
 
+        command_sha256 = self.command_sha256.strip().casefold()
+
+        if capability is Capability.PROCESS_EXEC:
+            if not valid_command_sha256(command_sha256):
+                raise ValueError(
+                    "process.exec requiere command_sha256 válido."
+                )
+        elif command_sha256:
+            raise ValueError(
+                "Solo process.exec puede llevar command_sha256."
+            )
+
         object.__setattr__(self, "run_id", run_id)
         object.__setattr__(self, "step_id", step_id)
         object.__setattr__(self, "action", action)
         object.__setattr__(self, "request_id", request_id)
         object.__setattr__(self, "capability", capability)
         object.__setattr__(self, "target", target)
+        object.__setattr__(self, "command_sha256", command_sha256)
 
 
 class ExecutionReservationBackend(Protocol):
@@ -293,11 +311,30 @@ class PreparedExecution:
     request: ExecutionRequest
     resolved_target: str | None
     budget: ExecutionBudgetSnapshot
+    command_snapshot: CommandSnapshot | None = None
     prepared_at: datetime = field(default_factory=lambda: datetime.now(UTC))
 
     def __post_init__(self) -> None:
         if self.prepared_at.tzinfo is None or self.prepared_at.utcoffset() is None:
             raise ValueError("prepared_at debe incluir zona horaria.")
+
+        if self.request.capability is Capability.PROCESS_EXEC:
+            if not isinstance(self.command_snapshot, CommandSnapshot):
+                raise ValueError(
+                    "process.exec requiere CommandSnapshot preparado."
+                )
+
+            if (
+                self.command_snapshot.command_sha256
+                != self.request.command_sha256
+            ):
+                raise ValueError(
+                    "CommandSnapshot no coincide con ExecutionRequest."
+                )
+        elif self.command_snapshot is not None:
+            raise ValueError(
+                "Solo process.exec puede llevar CommandSnapshot."
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -409,14 +446,52 @@ class ExecutionContract:
                 f"El step {step.step_id} requiere HumanGate aprobado."
             )
 
-        if step.capability is Capability.PROCESS_EXEC:
-            raise ExecutionDenied(
-                "process.exec permanece deshabilitado hasta que "
-                "ExecutionRequest y la reserva durable estén ligados "
-                "al CommandSnapshot."
-            )
+        command_snapshot: CommandSnapshot | None = None
+        reservation_runtime = runtime_seconds
 
-        resolved_target = self._resolve_target(step)
+        if step.capability is Capability.PROCESS_EXEC:
+            if self.reservation_backend is None:
+                raise ExecutionDenied(
+                    "process.exec requiere un backend durable de reservas."
+                )
+
+            command = step.command
+            if command is None:
+                raise ExecutionDenied(
+                    "process.exec requiere CommandSpec congelado."
+                )
+
+            if isinstance(runtime_seconds, bool) or not isinstance(
+                runtime_seconds,
+                int,
+            ):
+                raise TypeError("runtime_seconds debe ser un entero.")
+
+            if runtime_seconds not in (0, command.timeout_seconds):
+                raise ExecutionDenied(
+                    "process.exec debe reservar exactamente el timeout "
+                    "del CommandSpec."
+                )
+
+            reservation_runtime = command.timeout_seconds
+
+            try:
+                resolved_cwd = self.workspace.resolve(
+                    command.cwd,
+                    must_exist=True,
+                )
+                command_snapshot = CommandSnapshot.capture(
+                    command,
+                    resolved_cwd=resolved_cwd,
+                )
+            except (OSError, PermissionError, ValueError) as exc:
+                raise ExecutionDenied(
+                    "No se pudo congelar CommandSnapshot para process.exec."
+                ) from exc
+
+            resolved_target = str(resolved_cwd)
+        else:
+            resolved_target = self._resolve_target(step)
 
         request = ExecutionRequest(
             run_id=self.run_id,
@@ -425,17 +500,22 @@ class ExecutionContract:
             action=step.action,
             target=step.target,
             requires_human_gate=step.requires_human_gate,
+            command_sha256=(
+                command_snapshot.command_sha256
+                if command_snapshot is not None
+                else ""
+            ),
         )
 
         if self.reservation_backend is None:
             budget = self.budget.reserve(
-                runtime_seconds=runtime_seconds,
+                runtime_seconds=reservation_runtime,
                 retry=retry,
             )
         else:
             reserved = self.reservation_backend.reserve(
                 request,
-                runtime_seconds=runtime_seconds,
+                runtime_seconds=reservation_runtime,
                 retry=retry,
             )
             budget = self._accept_reserved_snapshot(reserved)
@@ -444,6 +524,7 @@ class ExecutionContract:
             request=request,
             resolved_target=resolved_target,
             budget=budget,
+            command_snapshot=command_snapshot,
             prepared_at=_utcnow(),
         )
 

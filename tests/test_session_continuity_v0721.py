@@ -304,6 +304,6 @@ def test_schema_advances_to_29_with_chat_session_focus(
                 "SELECT name FROM sqlite_master WHERE type = 'table'"
             ).fetchall()
         }
-    assert schema == "53"
+    assert schema == "54"
     assert "assistant_chat_session_focus" in tables
     assert len(app.skills.list_all()) == 102

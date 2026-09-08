@@ -252,7 +252,7 @@ def test_schema_39_adds_non_destructive_knowledge_governance(
                 "PRAGMA table_info(assistant_general_knowledge)"
             )
         }
-    assert schema == "53"
+    assert schema == "54"
     assert __version__ == "0.8.10-alpha"
     assert conflict_table is not None
     assert {"revalidate_after", "validation_status", "last_revalidated_at"} <= columns

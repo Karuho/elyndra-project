@@ -2356,8 +2356,9 @@ class Database:
             if effective_role == "vault":
                 self._migrate_autonomy_phase2(connection)
                 self._migrate_autonomy_phase5(connection)
+                self._migrate_autonomy_phase6a3(connection)
             connection.execute(
-                "INSERT OR REPLACE INTO schema_meta(key, value) VALUES('schema_version', '53')"
+                "INSERT OR REPLACE INTO schema_meta(key, value) VALUES('schema_version', '54')"
             )
         with suppress(PermissionError):
             self.path.chmod(0o600)
@@ -2666,6 +2667,29 @@ class Database:
             END;
             """
         )
+
+    @staticmethod
+    def _migrate_autonomy_phase6a3(
+        connection: sqlite3.Connection,
+    ) -> None:
+        columns = {
+            str(row[1])
+            for row in connection.execute(
+                "PRAGMA table_info(assistant_autonomy_execution_reservations)"
+            )
+        }
+
+        if "command_sha256" not in columns:
+            connection.execute(
+                """
+                ALTER TABLE assistant_autonomy_execution_reservations
+                ADD COLUMN command_sha256 TEXT
+                    CHECK(
+                        command_sha256 IS NULL
+                        OR length(command_sha256) = 64
+                    )
+                """
+            )
 
     @staticmethod
     def _create_memory_fts(connection: sqlite3.Connection) -> bool:
