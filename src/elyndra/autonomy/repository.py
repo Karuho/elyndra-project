@@ -1362,6 +1362,33 @@ class AutonomyRepository:
 
         return results
 
+    def execution_result(
+        self,
+        run_id: str,
+        request_id: str,
+        *,
+        actor: str,
+    ) -> dict[str, Any] | None:
+        """Return one exact durable result without latest-result inference."""
+
+        clean_request_id = _required(request_id, "request_id", 128)
+        with self.database.connect() as connection:
+            run_row = self._owned_run(connection, run_id, actor=actor)
+            row = connection.execute(
+                """
+                SELECT request_id FROM assistant_autonomy_execution_results
+                WHERE run_id = ? AND request_id = ?
+                """,
+                (int(run_row["id"]), clean_request_id),
+            ).fetchone()
+        if row is None:
+            return None
+        return next(
+            item
+            for item in self.execution_results(run_id, actor=actor)
+            if item["request_id"] == clean_request_id
+        )
+
     def execution_observation_gaps(
         self,
         run_id: str,

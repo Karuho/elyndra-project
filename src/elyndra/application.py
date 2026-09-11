@@ -41,6 +41,7 @@ from elyndra.cognitive_executive import (
 from elyndra.cognitive_executive import (
     actual_route as executive_actual_route,
 )
+from elyndra.cognitive_loop import LocalCognitiveActionLoop
 from elyndra.config import AppConfig
 from elyndra.db import Database
 from elyndra.development_sessions import DevelopmentSessionRepository
@@ -249,6 +250,7 @@ class ElyndraApplication:
     tutor_evolution: TutorEvolutionRepository
     general_knowledge: GeneralKnowledgeRepository
     cognitive_executive: CognitiveExecutiveRepository
+    cognitive_loop: LocalCognitiveActionLoop | None
     personal_organizer: PersonalOrganizerRepository
     wellbeing: WellbeingRepository
     automation: AutomationRepository
@@ -387,6 +389,15 @@ class ElyndraApplication:
         dictionary = LocalDictionary(structured_packs, lexical_service=lexical_service)
         translator = LocalTranslationService(dictionary)
         preferences = PreferenceLearningRepository(database, memories)
+        cognitive_loop = (
+            LocalCognitiveActionLoop(
+                database,
+                language_engine=language_engine,
+                memory=tiered_memory,
+            )
+            if database.role == "vault"
+            else None
+        )
         audit_repository = AuditRepository(database)
         account_internal_id = ""
         if selected_public_id:
@@ -476,6 +487,7 @@ class ElyndraApplication:
             tutor_evolution=tutor_evolution,
             general_knowledge=general_knowledge,
             cognitive_executive=cognitive_executive,
+            cognitive_loop=cognitive_loop,
             personal_organizer=personal_organizer,
             wellbeing=wellbeing,
             automation=automation,
