@@ -363,6 +363,11 @@ def _approved_step_ids(
                 "HumanGate aprobado sin evento append-only de aprobación."
             )
 
+        if kind is HumanGateKind.RETRY_REVIEW:
+            # Retry authority is consumed only by the durable reservation
+            # transaction and can never approve a normal gated RunStep.
+            continue
+
         # A generic HumanGate can resume a run, but it grants no step-specific
         # execution authority.
         if not step_id:
