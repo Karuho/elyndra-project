@@ -463,7 +463,7 @@ def test_schema_33_and_cli_expose_structured_packs(
     )
     status = app.structured_packs.status()
 
-    assert version == "57"
+    assert version == "58"
     assert {
         "alexandria_structured_packs",
         "alexandria_structured_sources",

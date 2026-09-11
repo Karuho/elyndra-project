@@ -35,6 +35,7 @@ class SupervisedTickResult:
     step_id: str = ""
     execution_outcome: ExecutionOutcome | None = None
     reason: str = ""
+    request_id: str = ""
 
 
 class SupervisedAutonomyRunner:
@@ -206,4 +207,5 @@ class SupervisedAutonomyRunner:
             outcome=tick_outcome,
             step_id=next_step.step_id,
             execution_outcome=result.outcome,
+            request_id=result.request_id,
         )
