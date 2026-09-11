@@ -31,6 +31,7 @@ class HumanGateKind(StrEnum):
     APPROVAL = "approval"
     REVIEW = "review"
     EXTERNAL_SIDE_EFFECT = "external_side_effect"
+    RETRY_REVIEW = "retry_review"
 
 
 class HumanGateStatus(StrEnum):

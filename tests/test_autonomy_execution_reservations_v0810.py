@@ -118,7 +118,7 @@ def _request(
     )
 
 
-def test_schema_56_reservation_ledger_is_vault_scoped_and_idempotent(
+def test_schema_57_reservation_ledger_is_vault_scoped_and_idempotent(
     tmp_path: Path,
 ) -> None:
     root = Database(tmp_path / "root.sqlite3", role="root")
@@ -135,7 +135,7 @@ def test_schema_56_reservation_ledger_is_vault_scoped_and_idempotent(
             SELECT value FROM schema_meta
             WHERE key='schema_version'
             """
-        ).fetchone()[0] == "56"
+        ).fetchone()[0] == "57"
 
         assert connection.execute(
             """
@@ -152,7 +152,7 @@ def test_schema_56_reservation_ledger_is_vault_scoped_and_idempotent(
             SELECT value FROM schema_meta
             WHERE key='schema_version'
             """
-        ).fetchone()[0] == "56"
+        ).fetchone()[0] == "57"
 
         assert connection.execute(
             """
@@ -206,7 +206,7 @@ def test_schema_51_upgrade_preserves_run_and_creates_ledger(
             SELECT value FROM schema_meta
             WHERE key='schema_version'
             """
-        ).fetchone()[0] == "56"
+        ).fetchone()[0] == "57"
 
         assert connection.execute(
             """
@@ -322,7 +322,7 @@ def test_command_budget_survives_rebind(tmp_path: Path) -> None:
     ).snapshot().commands_reserved == 1
 
 
-def test_retry_budget_survives_rebind(tmp_path: Path) -> None:
+def test_unreviewed_retry_fails_closed_without_budget_mutation(tmp_path: Path) -> None:
     _database, repository, run = _state(
         tmp_path,
         max_commands=5,
@@ -330,27 +330,17 @@ def test_retry_budget_survives_rebind(tmp_path: Path) -> None:
     )
     _start(repository, run)
 
-    first = AutonomyExecutionBinding(repository).bind(
-        run.run_id,
-        actor="owner",
-    )
-    first.prepare("inspect", retry=True)
-
-    rebound = AutonomyExecutionBinding(repository).bind(
-        run.run_id,
-        actor="owner",
-    )
-
-    with pytest.raises(ExecutionDenied, match="max_retries"):
-        rebound.prepare("inspect", retry=True)
+    bound = AutonomyExecutionBinding(repository).bind(run.run_id, actor="owner")
+    with pytest.raises(PermissionError, match="process.exec"):
+        bound.prepare("inspect", retry=True)
 
     snapshot = repository.execution_budget(
         run.run_id,
         actor="owner",
     ).snapshot()
 
-    assert snapshot.commands_reserved == 1
-    assert snapshot.retries_reserved == 1
+    assert snapshot.commands_reserved == 0
+    assert snapshot.retries_reserved == 0
 
 
 def test_runtime_budget_survives_rebind(tmp_path: Path) -> None:
@@ -400,19 +390,19 @@ def test_duplicate_request_id_is_idempotent(tmp_path: Path) -> None:
         request,
         actor="owner",
         runtime_seconds=3,
-        retry=True,
+        retry=False,
     )
 
     second = repository.reserve_execution(
         request,
         actor="owner",
         runtime_seconds=3,
-        retry=True,
+        retry=False,
     )
 
     assert first.commands_reserved == 1
     assert second.commands_reserved == 1
-    assert second.retries_reserved == 1
+    assert second.retries_reserved == 0
     assert second.runtime_seconds_reserved == 3
 
     with database.connect() as connection:
@@ -714,7 +704,7 @@ def test_schema_53_upgrade_adds_command_sha256_without_losing_reservation(
             SELECT value FROM schema_meta
             WHERE key='schema_version'
             """
-        ).fetchone()[0] == "56"
+        ).fetchone()[0] == "57"
 
         columns = {
             str(row[1])
@@ -936,7 +926,7 @@ def test_schema_54_upgrade_creates_one_shot_launch_ledger(
             FROM schema_meta
             WHERE key='schema_version'
             """
-        ).fetchone()[0] == "56"
+        ).fetchone()[0] == "57"
 
         assert connection.execute(
             """
@@ -1050,7 +1040,7 @@ def test_schema_55_upgrade_creates_execution_results_ledger(
             FROM schema_meta
             WHERE key='schema_version'
             """
-        ).fetchone()[0] == "56"
+        ).fetchone()[0] == "57"
 
         assert connection.execute(
             """
@@ -1107,53 +1097,10 @@ def test_schema_55_upgrade_creates_execution_results_ledger(
         command_sha256=snapshot.command_sha256,
         request_id="schema-56-provenance-launch",
     )
-    repository.reserve_execution(
-        second_request,
-        actor="owner",
-        runtime_seconds=command.timeout_seconds,
-        retry=True,
-    )
-    repository._claim_execution_launch(
-        second_request,
-        actor="owner",
-        runtime_seconds=command.timeout_seconds,
-        retry=True,
-    )
-
-    with database.connect() as connection:
-        commitment = connection.execute(
-            """
-            SELECT observation_receipt_sha256
-            FROM assistant_autonomy_execution_launches
-            WHERE request_id = ?
-            """,
-            (second_request.request_id,),
-        ).fetchone()[0]
-
-    assert isinstance(commitment, str)
-    assert len(commitment) == 64
-
-    with pytest.raises(
-        sqlite3.IntegrityError,
-        match="autonomy_execution_launches_append_only",
-    ), database.connect() as connection:
-        connection.execute(
-            """
-            UPDATE assistant_autonomy_execution_launches
-            SET observation_receipt_sha256 = ?
-            WHERE request_id = ?
-            """,
-            ("0" * 64, second_request.request_id),
-        )
-
-    with pytest.raises(
-        sqlite3.IntegrityError,
-        match="autonomy_execution_launches_append_only",
-    ), database.connect() as connection:
-        connection.execute(
-            """
-            DELETE FROM assistant_autonomy_execution_launches
-            WHERE request_id = ?
-            """,
-            (second_request.request_id,),
+    with pytest.raises(PermissionError, match="intento durable incompleto"):
+        repository.reserve_execution(
+            second_request,
+            actor="owner",
+            runtime_seconds=command.timeout_seconds,
+            retry=True,
         )

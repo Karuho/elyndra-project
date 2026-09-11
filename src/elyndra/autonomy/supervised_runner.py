@@ -144,10 +144,14 @@ class SupervisedAutonomyRunner:
             for result in results
             if result["step_id"] == next_step.step_id
         ]
-        if any(
-            result["outcome"]
+        latest = previous[-1] if previous else None
+        retry = bool(
+            latest
+            and latest["outcome"]
             in {ExecutionOutcome.FAILED.value, ExecutionOutcome.CANCELLED.value}
-            for result in previous
+        )
+        if retry and not self.repository.retry_review_available(
+            run_id, next_step.step_id, actor=self.actor
         ):
             return SupervisedTickResult(
                 run_id=run_id,
@@ -164,7 +168,7 @@ class SupervisedAutonomyRunner:
             )
 
         try:
-            prepared = contract.prepare(next_step.step_id, retry=False)
+            prepared = contract.prepare(next_step.step_id, retry=retry)
             result = BubblewrapExecutor(
                 self.repository,
                 actor=self.actor,

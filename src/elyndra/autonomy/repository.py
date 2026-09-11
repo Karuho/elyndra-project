@@ -367,6 +367,11 @@ class AutonomyRepository:
         except ValueError as exc:
             raise ValueError("Tipo de HumanGate inválido.") from exc
 
+        if clean_kind is HumanGateKind.RETRY_REVIEW:
+            raise PermissionError(
+                "retry_review solo puede crearse mediante request_retry_review."
+            )
+
         clean_reason = _required(reason, "reason", 2_000)
         clean_step = _step_id(step_id)
         gate_id = uuid.uuid4().hex
@@ -429,6 +434,104 @@ class AutonomyRepository:
             raise RuntimeError("No se pudo recuperar el run después del HumanGate.")
         return item
 
+    def request_retry_review(
+        self,
+        run_id: str,
+        step_id: str,
+        *,
+        actor: str,
+    ) -> dict[str, Any]:
+        """Request owner review of the exact latest failed process attempt."""
+
+        clean_step = _step_id(step_id)
+        gate_id = uuid.uuid4().hex
+        review_id = uuid.uuid4().hex
+        now = _now()
+
+        with self.database.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = self._owned_run(connection, run_id, actor=actor)
+            if str(row["status"]) != AutonomyRunStatus.RUNNING.value:
+                raise ValueError("Solo un run running puede solicitar retry review.")
+
+            grant = _grant_from_json(str(row["grant_json"]))
+            if grant.is_expired(at=_utcnow()):
+                raise PermissionError("CapabilityGrant expirado.")
+            plan = _plan_from_json(str(row["plan_json"]))
+            source = self._retry_source(
+                connection,
+                run_db_id=int(row["id"]),
+                plan=plan,
+                requested_step_id=clean_step,
+            )
+
+            budget = self._execution_budget_from_connection(
+                connection, run_db_id=int(row["id"]), grant=grant
+            )
+            step = next(item for item in plan.steps if item.step_id == clean_step)
+            runtime_seconds = step.command.timeout_seconds if step.command else 0
+            state = budget.snapshot()
+            ExecutionBudget(
+                max_commands=state.max_commands,
+                max_retries=state.max_retries,
+                max_runtime_seconds=state.max_runtime_seconds,
+                commands_reserved=state.commands_reserved,
+                retries_reserved=state.retries_reserved,
+                runtime_seconds_reserved=state.runtime_seconds_reserved,
+            ).reserve(runtime_seconds=runtime_seconds, retry=True)
+
+            if connection.execute(
+                "SELECT 1 FROM assistant_autonomy_retry_reviews "
+                "WHERE source_request_id = ?",
+                (str(source["request_id"]),),
+            ).fetchone() is not None:
+                raise PermissionError("El resultado ya tiene un retry review.")
+
+            reason = "Revisión del propietario requerida para un reintento explícito."
+            connection.execute(
+                """
+                INSERT INTO assistant_autonomy_human_gates(
+                    public_id, run_id, kind, status, reason, created_at,
+                    resolved_at, resolved_by
+                ) VALUES (?, ?, ?, 'pending', ?, ?, NULL, NULL)
+                """,
+                (gate_id, int(row["id"]), HumanGateKind.RETRY_REVIEW.value, reason, now),
+            )
+            connection.execute(
+                """
+                INSERT INTO assistant_autonomy_retry_reviews(
+                    public_id, run_id, step_id, source_request_id, gate_id, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (review_id, int(row["id"]), clean_step, source["request_id"], gate_id, now),
+            )
+            self._set_status(connection, row, AutonomyRunStatus.WAITING_HUMAN, now=now)
+            self._insert_event(
+                connection,
+                run_db_id=int(row["id"]),
+                event_type="human_gate_requested",
+                from_status=AutonomyRunStatus.RUNNING,
+                to_status=AutonomyRunStatus.WAITING_HUMAN,
+                summary=reason,
+                payload={
+                    "gate_id": gate_id,
+                    "kind": HumanGateKind.RETRY_REVIEW.value,
+                    "retry_review_id": review_id,
+                    "source_request_id": str(source["request_id"]),
+                },
+                created_at=now,
+                step_id="",
+            )
+
+        return {
+            "run_id": run_id,
+            "step_id": clean_step,
+            "source_request_id": str(source["request_id"]),
+            "gate_id": gate_id,
+            "retry_review_id": review_id,
+            "status": HumanGateStatus.PENDING.value,
+        }
+
     def resolve_human_gate(
         self,
         gate_id: str,
@@ -482,6 +585,15 @@ class AutonomyRepository:
                 raise ValueError(
                     "El run asociado no está esperando intervención humana."
                 )
+
+            if str(gate["kind"]) == HumanGateKind.RETRY_REVIEW.value:
+                linkage = connection.execute(
+                    "SELECT 1 FROM assistant_autonomy_retry_reviews "
+                    "WHERE gate_id = ? AND run_id = ?",
+                    (clean_gate_id, int(gate["run_id"])),
+                ).fetchone()
+                if linkage is None:
+                    raise PermissionError("Retry review sin linkage durable válido.")
 
             if resolution is HumanGateStatus.APPROVED:
                 _require_grant_active_json(str(gate["run_grant_json"]))
@@ -556,6 +668,49 @@ class AutonomyRepository:
                 run_db_id=int(row["id"]),
                 grant=grant,
             )
+
+    def retry_review_available(
+        self,
+        run_id: str,
+        step_id: str,
+        *,
+        actor: str,
+    ) -> bool:
+        """Return whether the exact blocking result has one usable approval."""
+
+        clean_step = _step_id(step_id)
+        with self.database.connect() as connection:
+            row = self._owned_run(connection, run_id, actor=actor)
+            if str(row["status"]) != AutonomyRunStatus.RUNNING.value:
+                return False
+            plan = _plan_from_json(str(row["plan_json"]))
+            try:
+                source = self._retry_source(
+                    connection,
+                    run_db_id=int(row["id"]),
+                    plan=plan,
+                    requested_step_id=clean_step,
+                )
+            except PermissionError:
+                return False
+            available = connection.execute(
+                """
+                SELECT 1
+                FROM assistant_autonomy_retry_reviews AS review
+                JOIN assistant_autonomy_human_gates AS gate
+                  ON gate.public_id = review.gate_id
+                LEFT JOIN assistant_autonomy_retry_consumptions AS consumed
+                  ON consumed.retry_review_id = review.id
+                WHERE review.run_id = ? AND review.step_id = ?
+                  AND review.source_request_id = ?
+                  AND gate.run_id = review.run_id
+                  AND gate.kind = 'retry_review'
+                  AND gate.status = 'approved'
+                  AND consumed.id IS NULL
+                """,
+                (int(row["id"]), clean_step, str(source["request_id"])),
+            ).fetchone()
+            return available is not None
 
     def reserve_execution(
         self,
@@ -726,6 +881,44 @@ class AutonomyRepository:
                     grant=grant,
                 ).snapshot()
 
+            retry_review = None
+            if retry:
+                source = self._retry_source(
+                    connection,
+                    run_db_id=int(row["id"]),
+                    plan=plan,
+                    requested_step_id=request.step_id,
+                )
+                retry_review = connection.execute(
+                    """
+                    SELECT review.id, review.public_id, review.gate_id,
+                           review.source_request_id
+                    FROM assistant_autonomy_retry_reviews AS review
+                    JOIN assistant_autonomy_human_gates AS gate
+                      ON gate.public_id = review.gate_id
+                    LEFT JOIN assistant_autonomy_retry_consumptions AS consumed
+                      ON consumed.retry_review_id = review.id
+                    WHERE review.run_id = ?
+                      AND review.step_id = ?
+                      AND review.source_request_id = ?
+                      AND gate.run_id = review.run_id
+                      AND gate.kind = ?
+                      AND gate.status = ?
+                      AND consumed.id IS NULL
+                    """,
+                    (
+                        int(row["id"]),
+                        request.step_id,
+                        str(source["request_id"]),
+                        HumanGateKind.RETRY_REVIEW.value,
+                        HumanGateStatus.APPROVED.value,
+                    ),
+                ).fetchone()
+                if retry_review is None:
+                    raise PermissionError(
+                        "Retry sin review exacto aprobado y no consumido."
+                    )
+
             budget = self._execution_budget_from_connection(
                 connection,
                 run_db_id=int(row["id"]),
@@ -814,6 +1007,36 @@ class AutonomyRepository:
                     _now(),
                 ),
             )
+
+            if retry:
+                if retry_review is None:
+                    raise RuntimeError("Retry review no fue revalidado.")
+                connection.execute(
+                    """
+                    INSERT INTO assistant_autonomy_retry_consumptions(
+                        retry_review_id, retry_request_id, created_at
+                    ) VALUES (?, ?, ?)
+                    """,
+                    (int(retry_review["id"]), request.request_id, _now()),
+                )
+                self._insert_event(
+                    connection,
+                    run_db_id=int(row["id"]),
+                    event_type="retry_review_consumed",
+                    from_status=AutonomyRunStatus.RUNNING,
+                    to_status=AutonomyRunStatus.RUNNING,
+                    summary="Retry review aprobado consumido por una reserva durable.",
+                    payload={
+                        "retry_review_id": str(retry_review["public_id"]),
+                        "gate_id": str(retry_review["gate_id"]),
+                        "source_request_id": str(
+                            retry_review["source_request_id"]
+                        ),
+                        "retry_request_id": request.request_id,
+                    },
+                    created_at=_now(),
+                    step_id=request.step_id,
+                )
 
             return snapshot
 
@@ -1848,6 +2071,9 @@ class AutonomyRepository:
                     "Audit de solicitud de HumanGate con kind inválido."
                 ) from exc
 
+            if audited_kind is HumanGateKind.RETRY_REVIEW:
+                continue
+
             gate = connection.execute(
                 """
                 SELECT
@@ -1931,6 +2157,63 @@ class AutonomyRepository:
             raise PermissionError(
                 "El ledger persistido excede o viola el CapabilityGrant."
             ) from exc
+
+    @staticmethod
+    def _retry_source(
+        connection: Any,
+        *,
+        run_db_id: int,
+        plan: RunPlan,
+        requested_step_id: str,
+    ) -> Any:
+        gap = connection.execute(
+            """
+            SELECT 1
+            FROM assistant_autonomy_execution_reservations AS reservation
+            LEFT JOIN assistant_autonomy_execution_results AS result
+              ON result.request_id = reservation.request_id
+            WHERE reservation.run_id = ? AND result.request_id IS NULL
+            LIMIT 1
+            """,
+            (run_db_id,),
+        ).fetchone()
+        if gap is not None:
+            raise PermissionError("Existe un intento durable incompleto.")
+
+        succeeded = {
+            str(item["step_id"])
+            for item in connection.execute(
+                "SELECT step_id FROM assistant_autonomy_execution_results "
+                "WHERE run_id = ? AND outcome = 'succeeded'",
+                (run_db_id,),
+            ).fetchall()
+        }
+        first = next((step for step in plan.steps if step.step_id not in succeeded), None)
+        if first is None or first.step_id != requested_step_id:
+            raise PermissionError("El step no es el primer step incompleto del plan.")
+        if first.capability is not Capability.PROCESS_EXEC:
+            raise PermissionError("Solo process.exec admite retry review.")
+
+        source = connection.execute(
+            """
+            SELECT result.request_id, result.outcome, reservation.sequence
+            FROM assistant_autonomy_execution_reservations AS reservation
+            JOIN assistant_autonomy_execution_results AS result
+              ON result.request_id = reservation.request_id
+            WHERE reservation.run_id = ? AND reservation.step_id = ?
+            ORDER BY reservation.sequence DESC
+            LIMIT 1
+            """,
+            (run_db_id, requested_step_id),
+        ).fetchone()
+        if source is None or str(source["outcome"]) not in {
+            ExecutionOutcome.FAILED.value,
+            ExecutionOutcome.CANCELLED.value,
+        }:
+            raise PermissionError(
+                "Retry requiere el último resultado durable failed o cancelled."
+            )
+        return source
 
     def _owned_run(
         self,

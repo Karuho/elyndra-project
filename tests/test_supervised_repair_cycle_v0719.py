@@ -319,7 +319,7 @@ def test_schema_and_cli_expose_validation_cycles(
             "SELECT name FROM sqlite_master WHERE type='table' "
             "AND name='assistant_validation_cycles'"
         ).fetchone()
-    assert schema == "56"
+    assert schema == "57"
     assert table is not None
 
     parser = build_parser()

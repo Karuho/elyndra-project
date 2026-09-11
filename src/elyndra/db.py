@@ -2359,8 +2359,9 @@ class Database:
                 self._migrate_autonomy_phase6a3(connection)
                 self._migrate_autonomy_phase7a(connection)
                 self._migrate_autonomy_phase7b1(connection)
+                self._migrate_autonomy_phase7b3(connection)
             connection.execute(
-                "INSERT OR REPLACE INTO schema_meta(key, value) VALUES('schema_version', '56')"
+                "INSERT OR REPLACE INTO schema_meta(key, value) VALUES('schema_version', '57')"
             )
         with suppress(PermissionError):
             self.path.chmod(0o600)
@@ -2667,6 +2668,124 @@ class Database:
                     'autonomy_execution_reservations_append_only'
                 );
             END;
+            """
+        )
+
+    @staticmethod
+    def _migrate_autonomy_phase7b3(connection: sqlite3.Connection) -> None:
+        gate_sql_row = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' "
+            "AND name='assistant_autonomy_human_gates'"
+        ).fetchone()
+        if gate_sql_row is not None and "'retry_review'" not in str(gate_sql_row[0]):
+            connection.executescript(
+                """
+                DROP INDEX IF EXISTS idx_autonomy_gates_run;
+                DROP INDEX IF EXISTS idx_autonomy_one_pending_gate;
+                DROP TRIGGER IF EXISTS trg_autonomy_gate_identity_immutable;
+                DROP TRIGGER IF EXISTS trg_autonomy_gate_resolved_immutable;
+                DROP TRIGGER IF EXISTS trg_autonomy_gate_resolution_status;
+                ALTER TABLE assistant_autonomy_human_gates
+                    RENAME TO assistant_autonomy_human_gates_schema56;
+                CREATE TABLE assistant_autonomy_human_gates (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    public_id TEXT NOT NULL UNIQUE
+                        CHECK(length(public_id) BETWEEN 1 AND 128),
+                    run_id INTEGER NOT NULL,
+                    kind TEXT NOT NULL CHECK(kind IN (
+                        'approval', 'review', 'external_side_effect', 'retry_review'
+                    )),
+                    status TEXT NOT NULL CHECK(status IN (
+                        'pending', 'approved', 'rejected', 'cancelled'
+                    )),
+                    reason TEXT NOT NULL CHECK(length(reason) BETWEEN 1 AND 2000),
+                    created_at TEXT NOT NULL,
+                    resolved_at TEXT,
+                    resolved_by TEXT CHECK(
+                        resolved_by IS NULL OR length(resolved_by) BETWEEN 1 AND 200
+                    ),
+                    FOREIGN KEY(run_id) REFERENCES assistant_autonomy_runs(id)
+                        ON DELETE RESTRICT,
+                    CHECK((status = 'pending' AND resolved_at IS NULL
+                           AND resolved_by IS NULL)
+                       OR (status IN ('approved', 'rejected', 'cancelled')
+                           AND resolved_at IS NOT NULL AND resolved_by IS NOT NULL))
+                );
+                INSERT INTO assistant_autonomy_human_gates
+                SELECT * FROM assistant_autonomy_human_gates_schema56;
+                DROP TABLE assistant_autonomy_human_gates_schema56;
+                """
+            )
+
+        connection.executescript(
+            """
+            CREATE INDEX IF NOT EXISTS idx_autonomy_gates_run
+            ON assistant_autonomy_human_gates(run_id, id DESC);
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_autonomy_one_pending_gate
+            ON assistant_autonomy_human_gates(run_id) WHERE status = 'pending';
+            CREATE TRIGGER IF NOT EXISTS trg_autonomy_gate_identity_immutable
+            BEFORE UPDATE OF public_id, run_id, kind, reason, created_at
+            ON assistant_autonomy_human_gates
+            WHEN NEW.public_id != OLD.public_id OR NEW.run_id != OLD.run_id
+              OR NEW.kind != OLD.kind OR NEW.reason != OLD.reason
+              OR NEW.created_at != OLD.created_at
+            BEGIN SELECT RAISE(ABORT, 'autonomy_gate_identity_immutable'); END;
+            CREATE TRIGGER IF NOT EXISTS trg_autonomy_gate_resolved_immutable
+            BEFORE UPDATE ON assistant_autonomy_human_gates
+            WHEN OLD.status != 'pending'
+            BEGIN SELECT RAISE(ABORT, 'autonomy_gate_already_resolved'); END;
+            CREATE TRIGGER IF NOT EXISTS trg_autonomy_gate_resolution_status
+            BEFORE UPDATE OF status ON assistant_autonomy_human_gates
+            WHEN NEW.status NOT IN ('approved', 'rejected', 'cancelled')
+            BEGIN SELECT RAISE(ABORT, 'autonomy_gate_invalid_resolution'); END;
+
+            CREATE TABLE IF NOT EXISTS assistant_autonomy_retry_reviews (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                public_id TEXT NOT NULL UNIQUE
+                    CHECK(length(public_id) BETWEEN 1 AND 128),
+                run_id INTEGER NOT NULL,
+                step_id TEXT NOT NULL CHECK(length(step_id) BETWEEN 1 AND 64),
+                source_request_id TEXT NOT NULL UNIQUE
+                    CHECK(length(source_request_id) BETWEEN 1 AND 128),
+                gate_id TEXT NOT NULL UNIQUE
+                    CHECK(length(gate_id) BETWEEN 1 AND 128),
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(run_id) REFERENCES assistant_autonomy_runs(id)
+                    ON DELETE RESTRICT,
+                FOREIGN KEY(source_request_id)
+                    REFERENCES assistant_autonomy_execution_results(request_id)
+                    ON DELETE RESTRICT,
+                FOREIGN KEY(gate_id)
+                    REFERENCES assistant_autonomy_human_gates(public_id)
+                    ON DELETE RESTRICT
+            );
+            CREATE INDEX IF NOT EXISTS idx_autonomy_retry_reviews_run_step
+            ON assistant_autonomy_retry_reviews(run_id, step_id, id);
+            CREATE TRIGGER IF NOT EXISTS trg_autonomy_retry_reviews_no_update
+            BEFORE UPDATE ON assistant_autonomy_retry_reviews
+            BEGIN SELECT RAISE(ABORT, 'autonomy_retry_reviews_append_only'); END;
+            CREATE TRIGGER IF NOT EXISTS trg_autonomy_retry_reviews_no_delete
+            BEFORE DELETE ON assistant_autonomy_retry_reviews
+            BEGIN SELECT RAISE(ABORT, 'autonomy_retry_reviews_append_only'); END;
+
+            CREATE TABLE IF NOT EXISTS assistant_autonomy_retry_consumptions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                retry_review_id INTEGER NOT NULL UNIQUE,
+                retry_request_id TEXT NOT NULL UNIQUE
+                    CHECK(length(retry_request_id) BETWEEN 1 AND 128),
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(retry_review_id)
+                    REFERENCES assistant_autonomy_retry_reviews(id) ON DELETE RESTRICT,
+                FOREIGN KEY(retry_request_id)
+                    REFERENCES assistant_autonomy_execution_reservations(request_id)
+                    ON DELETE RESTRICT
+            );
+            CREATE TRIGGER IF NOT EXISTS trg_autonomy_retry_consumptions_no_update
+            BEFORE UPDATE ON assistant_autonomy_retry_consumptions
+            BEGIN SELECT RAISE(ABORT, 'autonomy_retry_consumptions_append_only'); END;
+            CREATE TRIGGER IF NOT EXISTS trg_autonomy_retry_consumptions_no_delete
+            BEFORE DELETE ON assistant_autonomy_retry_consumptions
+            BEGIN SELECT RAISE(ABORT, 'autonomy_retry_consumptions_append_only'); END;
             """
         )
 
