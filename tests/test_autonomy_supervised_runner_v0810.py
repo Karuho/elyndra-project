@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import inspect
 import subprocess
-import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
@@ -28,6 +27,13 @@ from elyndra.autonomy import (
     WorkspaceScope,
 )
 from elyndra.db import Database
+
+
+def _sandbox_python() -> str:
+    candidate = Path("/usr/bin/python3")
+    if not candidate.exists():
+        pytest.fail("El Python del sandbox no está disponible en /usr/bin/python3.")
+    return str(candidate.resolve(strict=True))
 
 
 def _require_runtime() -> None:
@@ -70,7 +76,7 @@ def _require_runtime() -> None:
             "--tmpfs",
             "/tmp",
             "--",
-            str(Path(sys.executable).resolve()),
+            _sandbox_python(),
             "--version",
         )
     )
@@ -88,7 +94,7 @@ def _require_runtime() -> None:
 
 
 def _process_step(step_id: str, code: str, *, timeout: int = 3) -> RunStep:
-    executable = str(Path(sys.executable).resolve(strict=True))
+    executable = _sandbox_python()
     return RunStep(
         step_id=step_id,
         capability=Capability.PROCESS_EXEC,
@@ -109,7 +115,7 @@ def _state(
 ) -> tuple[Database, AutonomyRepository, AutonomyRun]:
     root = tmp_path / "project"
     root.mkdir()
-    executable = str(Path(sys.executable).resolve(strict=True))
+    executable = _sandbox_python()
     capabilities = frozenset(step.capability for step in steps)
     now = datetime.now(UTC)
     run = AutonomyRun(

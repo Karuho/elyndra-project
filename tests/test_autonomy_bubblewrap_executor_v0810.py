@@ -36,6 +36,13 @@ from elyndra.autonomy.repository import _ExecutionObservationReceipt
 from elyndra.db import Database
 
 
+def _sandbox_python() -> str:
+    candidate = Path("/usr/bin/python3")
+    if not candidate.exists():
+        pytest.fail("El Python del sandbox no está disponible en /usr/bin/python3.")
+    return str(candidate.resolve(strict=True))
+
+
 def _require_runtime() -> None:
     bwrap = Path("/usr/bin/bwrap")
 
@@ -77,7 +84,7 @@ def _require_runtime() -> None:
             "--tmpfs",
             "/tmp",
             "--",
-            "/usr/bin/python3.13",
+            _sandbox_python(),
             "--version",
         )
     )
@@ -118,14 +125,7 @@ def _state(
     root = tmp_path / "project"
     root.mkdir(exist_ok=True)
 
-    resolved_executable = (
-        executable
-        or str(
-            Path(sys.executable).resolve(
-                strict=True
-            )
-        )
-    )
+    resolved_executable = executable or _sandbox_python()
 
     command = CommandSpec(
         executable=resolved_executable,
