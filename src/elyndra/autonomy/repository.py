@@ -5,9 +5,10 @@ import hmac
 import json
 import re
 import secrets
+import sqlite3
 import uuid
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from elyndra.autonomy.capabilities import Capability, CapabilityGrant
@@ -60,6 +61,18 @@ _PLAN_STEP_KEYS_V1 = frozenset(
 )
 
 _PLAN_STEP_KEYS_V2 = _PLAN_STEP_KEYS_V1 | {"command"}
+
+_SUCCESSOR_GRANT_SPEC_KEYS = frozenset(
+    {
+        "capabilities",
+        "allowed_executables",
+        "max_steps",
+        "max_commands",
+        "max_retries",
+        "max_runtime_seconds",
+        "duration_seconds",
+    }
+)
 
 _TERMINAL_STATUSES = frozenset(
     {
@@ -121,6 +134,18 @@ class AutonomyRepository:
         self.database = database
 
     def create(self, run: AutonomyRun) -> dict[str, Any]:
+        with self.database.connect() as connection:
+            self._insert_run_connection(connection, run)
+
+        item = self.get(run.run_id)
+        if item is None:
+            raise RuntimeError("No se pudo recuperar el run persistido.")
+        return item
+
+    def _insert_run_connection(
+        self, connection: sqlite3.Connection, run: AutonomyRun
+    ) -> sqlite3.Row:
+        """Insert one frozen planned run using the caller-owned transaction."""
         if run.status is not AutonomyRunStatus.PLANNED:
             raise ValueError("Un run nuevo debe comenzar en estado planned.")
 
@@ -133,8 +158,7 @@ class AutonomyRepository:
         plan_json = _json_dump(_plan_data(run.plan), maximum=262_144)
         created_at = run.created_at.isoformat()
 
-        with self.database.connect() as connection:
-            connection.execute(
+        connection.execute(
                 """
                 INSERT INTO assistant_autonomy_runs(
                     public_id,
@@ -160,33 +184,29 @@ class AutonomyRepository:
                     created_at,
                     created_at,
                 ),
-            )
+        )
 
-            row = connection.execute(
+        row = connection.execute(
                 """
                 SELECT * FROM assistant_autonomy_runs
                 WHERE public_id = ?
                 """,
                 (run.run_id,),
-            ).fetchone()
-            if row is None:
-                raise RuntimeError("No se pudo recuperar el run recién creado.")
+        ).fetchone()
+        if row is None:
+            raise RuntimeError("No se pudo recuperar el run recién creado.")
 
-            self._insert_event(
-                connection,
-                run_db_id=int(row["id"]),
-                event_type="run_created",
-                from_status=None,
-                to_status=AutonomyRunStatus.PLANNED,
-                summary="Run autónomo creado con autoridad congelada.",
-                payload={},
-                created_at=created_at,
-            )
-
-        item = self.get(run.run_id)
-        if item is None:
-            raise RuntimeError("No se pudo recuperar el run persistido.")
-        return item
+        self._insert_event(
+            connection,
+            run_db_id=int(row["id"]),
+            event_type="run_created",
+            from_status=None,
+            to_status=AutonomyRunStatus.PLANNED,
+            summary="Run autónomo creado con autoridad congelada.",
+            payload={},
+            created_at=created_at,
+        )
+        return row
 
     def get(self, run_id: str) -> dict[str, Any] | None:
         clean_id = _required(run_id, "run_id", 128)
@@ -318,40 +338,537 @@ class AutonomyRepository:
         _json_dump(payload_data, maximum=16_384)
 
         with self.database.connect() as connection:
-            row = self._owned_run(connection, run_id, actor=actor)
-            current = AutonomyRunStatus(str(row["status"]))
-
-            if target is AutonomyRunStatus.RUNNING:
-                _require_grant_active_json(str(row["grant_json"]))
-
-            if (
-                current is AutonomyRunStatus.WAITING_HUMAN
-                or target is AutonomyRunStatus.WAITING_HUMAN
-            ):
-                raise ValueError(
-                    "waiting_human solo puede gestionarse mediante HumanGate."
-                )
-
-            self._require_transition(current, target)
-
-            now = _now()
-            self._set_status(connection, row, target, now=now)
-            self._insert_event(
+            self._transition_connection(
                 connection,
-                run_db_id=int(row["id"]),
-                event_type=_transition_event(target),
-                from_status=current,
-                to_status=target,
+                run_id,
+                target,
+                actor=actor,
                 summary=clean_summary,
-                payload=payload_data,
-                created_at=now,
                 step_id=clean_step,
+                payload=payload_data,
             )
 
         item = self.get(run_id)
         if item is None:
             raise RuntimeError("El run desapareció después de la transición.")
         return item
+
+    def _transition_connection(
+        self,
+        connection: sqlite3.Connection,
+        run_id: str,
+        target: AutonomyRunStatus,
+        *,
+        actor: str,
+        summary: str,
+        step_id: str = "",
+        payload: dict[str, Any] | None = None,
+        now: str | None = None,
+    ) -> sqlite3.Row:
+        """Apply one validated run transition in the caller-owned transaction."""
+        row = self._owned_run(connection, run_id, actor=actor)
+        current = AutonomyRunStatus(str(row["status"]))
+        if target is AutonomyRunStatus.RUNNING:
+            _require_grant_active_json(str(row["grant_json"]))
+        if (
+            current is AutonomyRunStatus.WAITING_HUMAN
+            or target is AutonomyRunStatus.WAITING_HUMAN
+        ):
+            raise ValueError("waiting_human solo puede gestionarse mediante HumanGate.")
+        self._require_transition(current, target)
+        changed_at = now or _now()
+        self._set_status(connection, row, target, now=changed_at)
+        self._insert_event(
+            connection,
+            run_db_id=int(row["id"]),
+            event_type=_transition_event(target),
+            from_status=current,
+            to_status=target,
+            summary=_required(summary, "summary", 2_000),
+            payload=payload or {},
+            created_at=changed_at,
+            step_id=_step_id(step_id),
+        )
+        updated = connection.execute(
+            "SELECT * FROM assistant_autonomy_runs WHERE id=?", (int(row["id"]),)
+        ).fetchone()
+        assert updated is not None
+        return updated
+
+    def _require_continuable_run_connection(
+        self, connection: sqlite3.Connection, run_id: str, *, actor: str
+    ) -> sqlite3.Row:
+        """Require active, running, gap-free authority on the supplied connection."""
+        row = self._owned_run(connection, run_id, actor=actor)
+        if str(row["status"]) != AutonomyRunStatus.RUNNING.value:
+            raise PermissionError("El AutonomyRun no está running.")
+        _require_grant_active_json(str(row["grant_json"]))
+        gap = connection.execute(
+            """SELECT 1 FROM assistant_autonomy_execution_reservations reservation
+               LEFT JOIN assistant_autonomy_execution_results result
+                 ON result.request_id=reservation.request_id
+               WHERE reservation.run_id=? AND result.request_id IS NULL LIMIT 1""",
+            (int(row["id"]),),
+        ).fetchone()
+        if gap is not None:
+            raise PermissionError("El AutonomyRun tiene un intento incompleto.")
+        return row
+
+    def _require_no_execution_gap_connection(
+        self, connection: sqlite3.Connection, run_id: str, *, actor: str
+    ) -> sqlite3.Row:
+        """Require every exact reservation to have its durable result."""
+        row = self._owned_run(connection, run_id, actor=actor)
+        gap = connection.execute(
+            """SELECT 1
+               FROM assistant_autonomy_execution_reservations reservation
+               LEFT JOIN assistant_autonomy_execution_results result
+                 ON result.request_id=reservation.request_id
+               WHERE reservation.run_id=? AND result.request_id IS NULL
+               LIMIT 1""",
+            (int(row["id"]),),
+        ).fetchone()
+        if gap is not None:
+            raise PermissionError("El AutonomyRun tiene un intento incompleto.")
+        return row
+
+    def _cancel_run_connection(
+        self,
+        connection: sqlite3.Connection,
+        run_id: str,
+        *,
+        actor: str,
+        summary: str,
+        now: str | None = None,
+    ) -> sqlite3.Row:
+        """Cancel running/planned/waiting-human state in one caller transaction."""
+        row = self._owned_run(connection, run_id, actor=actor)
+        current = AutonomyRunStatus(str(row["status"]))
+        changed_at = now or _now()
+        if current is not AutonomyRunStatus.WAITING_HUMAN:
+            if current not in {AutonomyRunStatus.PLANNED, AutonomyRunStatus.RUNNING}:
+                raise PermissionError("El AutonomyRun ya es terminal o no cancelable.")
+            return self._transition_connection(
+                connection,
+                run_id,
+                AutonomyRunStatus.CANCELLED,
+                actor=actor,
+                summary=summary,
+                now=changed_at,
+            )
+        gates = connection.execute(
+            "SELECT * FROM assistant_autonomy_human_gates "
+            "WHERE run_id=? AND status='pending' ORDER BY id ASC",
+            (int(row["id"]),),
+        ).fetchall()
+        if len(gates) != 1:
+            raise PermissionError("waiting_human requiere un HumanGate pendiente exacto.")
+        gate = gates[0]
+        connection.execute(
+            """UPDATE assistant_autonomy_human_gates
+               SET status='cancelled', resolved_at=?, resolved_by=?
+               WHERE id=? AND status='pending'""",
+            (changed_at, actor, int(gate["id"])),
+        )
+        self._set_status(connection, row, AutonomyRunStatus.CANCELLED, now=changed_at)
+        self._insert_event(
+            connection,
+            run_db_id=int(row["id"]),
+            event_type="human_gate_cancelled",
+            from_status=AutonomyRunStatus.WAITING_HUMAN,
+            to_status=AutonomyRunStatus.CANCELLED,
+            summary=_required(summary, "summary", 2_000),
+            payload={"gate_id": str(gate["public_id"]), "decision": "cancelled"},
+            created_at=changed_at,
+        )
+        updated = connection.execute(
+            "SELECT * FROM assistant_autonomy_runs WHERE id=?", (int(row["id"]),)
+        ).fetchone()
+        assert updated is not None
+        return updated
+
+    def _predecessor_state_sha256(
+        self,
+        connection: sqlite3.Connection,
+        run_id: str,
+        cycle_id: str,
+        wait_id: str,
+        *,
+        actor: str,
+    ) -> str:
+        """Fingerprint exact durable predecessor lineage without selecting latest state."""
+        lineage = connection.execute(
+            """
+            SELECT r.id AS run_db_id, r.public_id AS run_public_id, r.status AS run_status,
+                   r.grant_json, r.plan_json, r.workspace_root, r.objective,
+                   c.id AS cycle_db_id, c.public_id AS cycle_public_id,
+                   c.status AS cycle_status, w.public_id AS wait_public_id,
+                   w.state AS wait_state, w.reason AS wait_reason,
+                   w.source_turn_id, w.gate_id, w.source_request_id
+            FROM assistant_autonomy_runs r
+            JOIN assistant_cognitive_cycles c ON c.autonomy_run_id=r.id
+            JOIN assistant_cognitive_owner_waits w ON w.cycle_id=c.id
+            WHERE r.public_id=? AND c.public_id=? AND w.public_id=? AND r.actor=?
+            """,
+            (
+                _required(run_id, "run_id", 128),
+                _required(cycle_id, "cycle_id", 128),
+                _required(wait_id, "wait_id", 128),
+                _required(actor, "actor", 200),
+            ),
+        ).fetchone()
+        if lineage is None:
+            raise PermissionError("Linaje predecesor exacto inválido.")
+        run_db_id = int(lineage["run_db_id"])
+        cycle_db_id = int(lineage["cycle_db_id"])
+        payload = {
+            "autonomy_events": self._fingerprint_collection(
+                connection,
+                "autonomy_events",
+                """SELECT id, run_id, sequence, event_type, from_status, to_status,
+                          step_id, summary, payload_json, created_at
+                   FROM assistant_autonomy_events WHERE run_id=? ORDER BY id ASC""",
+                (run_db_id,),
+            ),
+            "cycle": {
+                "event_high_water_id": int(
+                    connection.execute(
+                        "SELECT COALESCE(MAX(id),0) FROM assistant_cognitive_cycle_events "
+                        "WHERE cycle_id=?",
+                        (cycle_db_id,),
+                    ).fetchone()[0]
+                ),
+                "public_id": str(lineage["cycle_public_id"]),
+                "status": str(lineage["cycle_status"]),
+                "turn_high_water_id": int(
+                    connection.execute(
+                        "SELECT COALESCE(MAX(id),0) FROM assistant_cognitive_turns "
+                        "WHERE cycle_id=?",
+                        (cycle_db_id,),
+                    ).fetchone()[0]
+                ),
+            },
+            "human_gates": self._fingerprint_collection(
+                connection,
+                "human_gates",
+                """SELECT id, public_id, run_id, kind, status, reason, created_at,
+                          resolved_at, resolved_by
+                   FROM assistant_autonomy_human_gates WHERE run_id=? ORDER BY id ASC""",
+                (run_db_id,),
+            ),
+            "launches": self._fingerprint_collection(
+                connection,
+                "launches",
+                """SELECT id, request_id, request_sha256, run_id, command_sha256,
+                          created_at, observation_receipt_sha256
+                   FROM assistant_autonomy_execution_launches
+                   WHERE run_id=? ORDER BY id ASC""",
+                (run_db_id,),
+            ),
+            "reservations": self._fingerprint_collection(
+                connection,
+                "reservations",
+                """SELECT id, request_id, request_sha256, run_id, sequence, step_id,
+                          capability, runtime_seconds, is_retry, created_at, command_sha256
+                   FROM assistant_autonomy_execution_reservations
+                   WHERE run_id=? ORDER BY id ASC""",
+                (run_db_id,),
+            ),
+            "results": self._fingerprint_collection(
+                connection,
+                "results",
+                """SELECT id, request_id, request_sha256, run_id, sequence, step_id,
+                          command_sha256, runtime_seconds, is_retry, outcome, exit_code,
+                          duration_ms, summary, error_code, stdout_sha256, stderr_sha256,
+                          timed_out, stdout_truncated, stderr_truncated, created_at
+                   FROM assistant_autonomy_execution_results
+                   WHERE run_id=? ORDER BY id ASC""",
+                (run_db_id,),
+            ),
+            "retry_consumptions": self._fingerprint_collection(
+                connection,
+                "retry_consumptions",
+                """SELECT rc.id, rc.retry_review_id, rc.retry_request_id, rc.created_at
+                   FROM assistant_autonomy_retry_consumptions rc
+                   JOIN assistant_autonomy_retry_reviews rr
+                     ON rr.id=rc.retry_review_id
+                   WHERE rr.run_id=? ORDER BY rc.id ASC""",
+                (run_db_id,),
+            ),
+            "retry_reviews": self._fingerprint_collection(
+                connection,
+                "retry_reviews",
+                """SELECT id, public_id, run_id, step_id, source_request_id, gate_id,
+                          created_at
+                   FROM assistant_autonomy_retry_reviews
+                   WHERE run_id=? ORDER BY id ASC""",
+                (run_db_id,),
+            ),
+            "run": {
+                "grant_sha256": _utf8_sha256(str(lineage["grant_json"])),
+                "objective": str(lineage["objective"]),
+                "plan_sha256": _utf8_sha256(str(lineage["plan_json"])),
+                "public_id": str(lineage["run_public_id"]),
+                "status": str(lineage["run_status"]),
+                "workspace_root": str(lineage["workspace_root"]),
+            },
+            "wait": {
+                "gate_id": lineage["gate_id"],
+                "public_id": str(lineage["wait_public_id"]),
+                "reason": str(lineage["wait_reason"]),
+                "source_request_id": lineage["source_request_id"],
+                "source_turn_id": lineage["source_turn_id"],
+                "state": str(lineage["wait_state"]),
+            },
+        }
+        return _domain_sha256("elyndra.phase8b.predecessor-state.v1", payload)
+
+    def _successor_candidate_connection(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        run_id: str,
+        cycle_id: str,
+        wait_id: str,
+        actor: str,
+        objective: str,
+        workspace_root: str,
+        plan: RunPlan,
+        grant_spec: dict[str, Any],
+        predecessor_state_sha256: str,
+    ) -> dict[str, Any]:
+        """Validate and commit to owner-supplied successor metadata only."""
+        lineage = connection.execute(
+            """SELECT r.* FROM assistant_autonomy_runs r
+               JOIN assistant_cognitive_cycles c ON c.autonomy_run_id=r.id
+               JOIN assistant_cognitive_owner_waits w ON w.cycle_id=c.id
+               WHERE r.public_id=? AND c.public_id=? AND w.public_id=?
+                 AND r.actor=? AND c.actor=?""",
+            (run_id, cycle_id, wait_id, actor, actor),
+        ).fetchone()
+        if lineage is None:
+            raise PermissionError("Linaje predecesor exacto inválido.")
+        if not isinstance(objective, str) or objective != str(lineage["objective"]):
+            raise PermissionError("El objetivo sucesor debe ser idéntico al predecesor.")
+        if not isinstance(plan, RunPlan) or plan.objective != objective:
+            raise PermissionError("El RunPlan sucesor debe conservar el objetivo exacto.")
+
+        predecessor_workspace = WorkspaceScope.from_root(str(lineage["workspace_root"]))
+        candidate_workspace = WorkspaceScope.from_root(workspace_root)
+        if candidate_workspace.root != predecessor_workspace.root:
+            raise PermissionError("El workspace sucesor debe ser idéntico al predecesor.")
+
+        predecessor_grant = _grant_from_json(str(lineage["grant_json"]))
+        canonical_grant = _validate_successor_grant_spec(
+            grant_spec, predecessor_grant=predecessor_grant
+        )
+        _validate_successor_plan(
+            plan,
+            workspace=candidate_workspace,
+            grant_spec=canonical_grant,
+        )
+        plan_data = _plan_data(plan)
+        plan_json = _json_dump(plan_data, maximum=262_144)
+        grant_json = _json_dump(canonical_grant, maximum=65_536)
+        payload = {
+            "predecessor": {
+                "run_public_id": run_id,
+                "cycle_public_id": cycle_id,
+                "wait_public_id": wait_id,
+                "predecessor_state_sha256": predecessor_state_sha256,
+            },
+            "objective": objective,
+            "workspace_root": str(candidate_workspace.root),
+            "plan": plan_data,
+            "grant_spec": canonical_grant,
+        }
+        return {
+            "candidate_sha256": _domain_sha256(
+                "elyndra.phase8b.successor-candidate.v1", payload
+            ),
+            "workspace_root": str(candidate_workspace.root),
+            "plan_json": plan_json,
+            "grant_spec_json": grant_json,
+        }
+
+    def _verify_successor_candidate_replay(
+        self,
+        row: sqlite3.Row,
+        *,
+        objective: str,
+        workspace_root: str,
+        plan: RunPlan,
+        grant_spec: dict[str, Any],
+    ) -> None:
+        """Compare caller semantics with one immutable stored candidate snapshot."""
+        try:
+            stored_plan = json.loads(str(row["plan_json"]))
+            stored_grant = json.loads(str(row["grant_spec_json"]))
+            if _json_dump(stored_plan, maximum=262_144) != str(row["plan_json"]):
+                raise ValueError("stored plan is not canonical")
+            if _json_dump(stored_grant, maximum=65_536) != str(row["grant_spec_json"]):
+                raise ValueError("stored grant is not canonical")
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise PermissionError("El candidato persistido no supera integridad.") from exc
+        stored_payload = {
+            "predecessor": {
+                "run_public_id": str(row["run_public_id"]),
+                "cycle_public_id": str(row["cycle_public_id"]),
+                "wait_public_id": str(row["wait_public_id"]),
+                "predecessor_state_sha256": str(row["predecessor_state_sha256"]),
+            },
+            "objective": str(row["objective"]),
+            "workspace_root": str(row["workspace_root"]),
+            "plan": stored_plan,
+            "grant_spec": stored_grant,
+        }
+        if _domain_sha256(
+            "elyndra.phase8b.successor-candidate.v1", stored_payload
+        ) != str(row["candidate_sha256"]):
+            raise PermissionError("El compromiso del candidato persistido es inválido.")
+        if not isinstance(objective, str) or objective != str(row["objective"]):
+            raise PermissionError("El candidato no coincide con el request_key persistido.")
+        if not isinstance(plan, RunPlan):
+            raise TypeError("plan debe ser RunPlan.")
+        caller_plan_json = _json_dump(_plan_data(plan), maximum=262_144)
+        caller_grant_json = _json_dump(
+            _canonicalize_successor_grant_spec(grant_spec), maximum=65_536
+        )
+        stored_workspace = str(row["workspace_root"])
+        if workspace_root == stored_workspace:
+            caller_workspace = workspace_root
+        else:
+            if not isinstance(workspace_root, str):
+                raise TypeError("workspace_root debe ser texto.")
+            caller_workspace = str(WorkspaceScope.from_root(workspace_root).root)
+        if (
+            caller_workspace != stored_workspace
+            or caller_plan_json != str(row["plan_json"])
+            or caller_grant_json != str(row["grant_spec_json"])
+        ):
+            raise PermissionError("El candidato no coincide con el request_key persistido.")
+
+    def _successor_run_from_handoff_connection(
+        self,
+        connection: sqlite3.Connection,
+        row: sqlite3.Row,
+        *,
+        actor: str,
+    ) -> AutonomyRun:
+        """Revalidate stored authority and mint one fresh in-memory successor run."""
+        stored_plan, stored_grant = _verified_stored_successor_candidate(row)
+        predecessor = self._owned_run(
+            connection, str(row["run_public_id"]), actor=actor
+        )
+        if str(predecessor["objective"]) != str(row["objective"]):
+            raise PermissionError("El objetivo sucesor no coincide con el predecesor.")
+        predecessor_workspace = WorkspaceScope.from_root(
+            str(predecessor["workspace_root"])
+        )
+        candidate_workspace = WorkspaceScope.from_root(str(row["workspace_root"]))
+        if candidate_workspace.root != predecessor_workspace.root:
+            raise PermissionError("El workspace sucesor no coincide con el predecesor.")
+        predecessor_grant = _grant_from_json(str(predecessor["grant_json"]))
+        canonical_grant = _validate_successor_grant_spec(
+            stored_grant, predecessor_grant=predecessor_grant
+        )
+        if canonical_grant != stored_grant:
+            raise PermissionError("grant_spec persistido no es canónico.")
+        plan = _plan_from_json(str(row["plan_json"]))
+        if _plan_data(plan) != stored_plan or plan.objective != str(row["objective"]):
+            raise PermissionError("RunPlan sucesor persistido inconsistente.")
+        _validate_successor_plan(
+            plan, workspace=candidate_workspace, grant_spec=canonical_grant
+        )
+        issued_at = _utcnow()
+        grant = CapabilityGrant(
+            capabilities=frozenset({Capability.PROCESS_EXEC}),
+            issued_at=issued_at,
+            expires_at=issued_at + timedelta(seconds=canonical_grant["duration_seconds"]),
+            max_steps=canonical_grant["max_steps"],
+            max_commands=canonical_grant["max_commands"],
+            max_retries=canonical_grant["max_retries"],
+            max_runtime_seconds=canonical_grant["max_runtime_seconds"],
+            allowed_hosts=(),
+            allowed_executables=tuple(canonical_grant["allowed_executables"]),
+        )
+        return AutonomyRun(
+            actor=actor,
+            workspace=candidate_workspace,
+            grant=grant,
+            plan=plan,
+            status=AutonomyRunStatus.PLANNED,
+        )
+
+    def _require_accepted_successor_integrity_connection(
+        self,
+        connection: sqlite3.Connection,
+        row: sqlite3.Row,
+        *,
+        actor: str,
+    ) -> sqlite3.Row:
+        """Validate immutable accepted linkage without old-state or filesystem checks."""
+        stored_plan, stored_grant = _verified_stored_successor_candidate(row)
+        successor_id = row["successor_run_id"]
+        if successor_id is None:
+            raise PermissionError("Handoff accepted sin sucesor exacto.")
+        successor = connection.execute(
+            "SELECT * FROM assistant_autonomy_runs WHERE id=?", (int(successor_id),)
+        ).fetchone()
+        if successor is None or str(successor["actor"]) != actor:
+            raise PermissionError("Sucesor accepted exacto inválido.")
+        if (
+            str(successor["objective"]) != str(row["objective"])
+            or str(successor["workspace_root"]) != str(row["workspace_root"])
+            or str(successor["plan_json"]) != str(row["plan_json"])
+        ):
+            raise PermissionError("Snapshots inmutables del sucesor no coinciden.")
+        grant = _grant_from_json(str(successor["grant_json"]))
+        authority = {
+            "capabilities": sorted(item.value for item in grant.capabilities),
+            "allowed_executables": list(grant.allowed_executables),
+            "max_steps": grant.max_steps,
+            "max_commands": grant.max_commands,
+            "max_retries": grant.max_retries,
+            "max_runtime_seconds": grant.max_runtime_seconds,
+        }
+        expected = {
+            key: stored_grant[key]
+            for key in (
+                "capabilities",
+                "allowed_executables",
+                "max_steps",
+                "max_commands",
+                "max_retries",
+                "max_runtime_seconds",
+            )
+        }
+        duration = grant.expires_at - grant.issued_at
+        if (
+            authority != expected
+            or grant.allowed_hosts != ()
+            or duration != timedelta(seconds=stored_grant["duration_seconds"])
+        ):
+            raise PermissionError("Autoridad durable del sucesor no coincide.")
+        if _plan_data(_plan_from_json(str(successor["plan_json"]))) != stored_plan:
+            raise PermissionError("Plan durable del sucesor no coincide.")
+        return successor
+
+    @staticmethod
+    def _fingerprint_collection(
+        connection: sqlite3.Connection,
+        name: str,
+        query: str,
+        parameters: tuple[Any, ...],
+    ) -> dict[str, Any]:
+        rows = [dict(row) for row in connection.execute(query, parameters).fetchall()]
+        return {
+            "count": len(rows),
+            "max_id": max((int(row["id"]) for row in rows), default=0),
+            "rows_sha256": _domain_sha256(
+                f"elyndra.phase8b.rows.{name}.v1", rows
+            ),
+        }
 
     def request_human_gate(
         self,
@@ -378,6 +895,7 @@ class AutonomyRepository:
         now = _now()
 
         with self.database.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
             row = self._owned_run(connection, run_id, actor=actor)
             current = AutonomyRunStatus(str(row["status"]))
 
@@ -2410,6 +2928,157 @@ def _plan_data(plan: RunPlan) -> dict[str, Any]:
     }
 
 
+def _validate_successor_grant_spec(
+    raw: dict[str, Any], *, predecessor_grant: CapabilityGrant
+) -> dict[str, Any]:
+    canonical = _canonicalize_successor_grant_spec(raw)
+    if Capability.PROCESS_EXEC not in predecessor_grant.capabilities:
+        raise PermissionError("El predecesor no concede process.exec.")
+    if any(
+        value not in predecessor_grant.allowed_executables
+        for value in canonical["allowed_executables"]
+    ):
+        raise PermissionError("El ejecutable sucesor no pertenece al grant predecesor.")
+
+    def within(name: str, minimum: int, maximum: int) -> int:
+        value = int(canonical[name])
+        if not minimum <= value <= maximum:
+            raise PermissionError(f"{name} excede la autoridad sucesora permitida.")
+        return value
+
+    original_duration = int(
+        (predecessor_grant.expires_at - predecessor_grant.issued_at).total_seconds()
+    )
+    canonical["max_steps"] = within(
+        "max_steps", 1, min(predecessor_grant.max_steps, 4)
+    )
+    canonical["max_commands"] = within(
+        "max_commands", 1, min(predecessor_grant.max_commands, 4)
+    )
+    canonical["max_retries"] = within(
+        "max_retries", 0, predecessor_grant.max_retries
+    )
+    canonical["max_runtime_seconds"] = within(
+        "max_runtime_seconds", 1, predecessor_grant.max_runtime_seconds
+    )
+    canonical["duration_seconds"] = within(
+        "duration_seconds", 1, min(original_duration, 3_600)
+    )
+    return canonical
+
+
+def _verified_stored_successor_candidate(
+    row: sqlite3.Row,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    sha_pattern = re.compile(r"^[0-9a-f]{64}$")
+    if not sha_pattern.fullmatch(str(row["predecessor_state_sha256"])) or not (
+        sha_pattern.fullmatch(str(row["candidate_sha256"]))
+    ):
+        raise PermissionError("Hashes persistidos del candidato inválidos.")
+    try:
+        stored_plan = json.loads(str(row["plan_json"]))
+        stored_grant = json.loads(str(row["grant_spec_json"]))
+        if not isinstance(stored_plan, dict) or not isinstance(stored_grant, dict):
+            raise TypeError("candidate snapshots must be objects")
+        if _json_dump(stored_plan, maximum=262_144) != str(row["plan_json"]):
+            raise ValueError("stored plan is not canonical")
+        if _json_dump(stored_grant, maximum=65_536) != str(row["grant_spec_json"]):
+            raise ValueError("stored grant is not canonical")
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise PermissionError("El candidato persistido no supera integridad.") from exc
+    payload = {
+        "predecessor": {
+            "run_public_id": str(row["run_public_id"]),
+            "cycle_public_id": str(row["cycle_public_id"]),
+            "wait_public_id": str(row["wait_public_id"]),
+            "predecessor_state_sha256": str(row["predecessor_state_sha256"]),
+        },
+        "objective": str(row["objective"]),
+        "workspace_root": str(row["workspace_root"]),
+        "plan": stored_plan,
+        "grant_spec": stored_grant,
+    }
+    if _domain_sha256("elyndra.phase8b.successor-candidate.v1", payload) != str(
+        row["candidate_sha256"]
+    ):
+        raise PermissionError("El compromiso del candidato persistido es inválido.")
+    return stored_plan, stored_grant
+
+
+def _canonicalize_successor_grant_spec(raw: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(raw, dict) or frozenset(raw) != _SUCCESSOR_GRANT_SPEC_KEYS:
+        raise ValueError("grant_spec requiere exactamente los campos Phase 8B.")
+    capabilities = raw["capabilities"]
+    executables = raw["allowed_executables"]
+    if not isinstance(capabilities, (list, tuple)) or isinstance(
+        capabilities, (str, bytes)
+    ):
+        raise TypeError("capabilities debe ser una secuencia.")
+    if not isinstance(executables, (list, tuple)) or isinstance(executables, (str, bytes)):
+        raise TypeError("allowed_executables debe ser una secuencia.")
+    if any(not isinstance(value, str) for value in capabilities):
+        raise TypeError("capabilities solo admite identificadores de texto.")
+    if len(capabilities) != len(set(capabilities)):
+        raise ValueError("capabilities no admite duplicados.")
+    if any(not isinstance(value, str) for value in executables):
+        raise TypeError("allowed_executables solo admite rutas de texto.")
+    if len(executables) != len(set(executables)):
+        raise ValueError("allowed_executables no admite duplicados.")
+    try:
+        normalized_capabilities = sorted(Capability(value).value for value in capabilities)
+    except (TypeError, ValueError) as exc:
+        raise PermissionError("Capability sucesora inválida.") from exc
+    if normalized_capabilities != [Capability.PROCESS_EXEC.value]:
+        raise PermissionError("Phase 8B solo admite exactamente process.exec.")
+    if not executables:
+        raise ValueError("allowed_executables requiere rutas exactas no vacías.")
+    # CapabilityGrant performs the existing exact lexical executable validation.
+    normalized_executables = CapabilityGrant(
+        capabilities=frozenset({Capability.PROCESS_EXEC}),
+        issued_at=datetime(2000, 1, 1, tzinfo=UTC),
+        expires_at=datetime(2000, 1, 2, tzinfo=UTC),
+        max_steps=1,
+        max_commands=1,
+        max_retries=0,
+        max_runtime_seconds=1,
+        allowed_executables=tuple(executables),
+    ).allowed_executables
+    if len(normalized_executables) != len(executables):
+        raise ValueError("allowed_executables colapsa a rutas canónicas duplicadas.")
+
+    def exact_int(name: str) -> int:
+        value = raw[name]
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise TypeError(f"{name} debe ser un entero exacto.")
+        return value
+
+    return {
+        "capabilities": normalized_capabilities,
+        "allowed_executables": sorted(normalized_executables),
+        "max_steps": exact_int("max_steps"),
+        "max_commands": exact_int("max_commands"),
+        "max_retries": exact_int("max_retries"),
+        "max_runtime_seconds": exact_int("max_runtime_seconds"),
+        "duration_seconds": exact_int("duration_seconds"),
+    }
+
+
+def _validate_successor_plan(
+    plan: RunPlan, *, workspace: WorkspaceScope, grant_spec: dict[str, Any]
+) -> None:
+    if not 1 <= len(plan.steps) <= min(int(grant_spec["max_steps"]), 4):
+        raise PermissionError("El plan sucesor excede max_steps.")
+    allowed = frozenset(grant_spec["allowed_executables"])
+    for step in plan.steps:
+        if step.capability is not Capability.PROCESS_EXEC or step.command is None:
+            raise PermissionError("Todos los steps sucesores deben ser process.exec.")
+        if step.command.executable not in allowed:
+            raise PermissionError("Ejecutable del plan fuera del grant_spec.")
+        if step.command.timeout_seconds > int(grant_spec["max_runtime_seconds"]):
+            raise PermissionError("Timeout del plan excede max_runtime_seconds.")
+        workspace.resolve(step.command.cwd)
+
+
 def _public_event(event: dict[str, Any]) -> dict[str, Any]:
     event["payload"] = json.loads(event.pop("payload_json"))
     return event
@@ -2433,6 +3102,25 @@ def _json_dump(value: Any, *, maximum: int) -> str:
         )
 
     return encoded
+
+
+def _canonical_json_bytes(value: Any) -> bytes:
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+
+
+def _domain_sha256(domain: str, value: Any) -> str:
+    material = domain.encode("utf-8") + b"\0" + _canonical_json_bytes(value)
+    return hashlib.sha256(material).hexdigest()
+
+
+def _utf8_sha256(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
 def _step_id(value: str) -> str:

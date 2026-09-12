@@ -271,6 +271,19 @@ ethics, authorization policy, single-use approvals or knowledge review. Goal and
 task records do not authorize execution. Outcome verification is explicit and
 cannot silently mark an action successful.
 
+## Local cognitive action loop and reviewed continuation — 0.8.10-alpha
+
+The cognitive loop is entered only through explicit owner operations against a frozen, authorized
+AutonomyRun. Model replies and recalled memory are untrusted context, never authority. Each advance
+performs at most one model call or one supervised Bubblewrap action, and only durable execution
+results establish success.
+
+Schema 59 records typed owner waits and reviewed successor handoffs without prompts, raw model
+replies, chain of thought, stdout/stderr copies or secrets. One-shot owner context is bounded and
+does not become memory or learning. Successor acceptance is a single SQLite transaction that mints
+a fresh bounded grant, cancels the predecessor and leaves the successor `PLANNED`; it adds no
+network, Git/GitHub, background or self-modification authority.
+
 ## Personal organizer — 0.8.1-alpha
 
 Organizer data is private local data. Commitments, birthdays, routines,

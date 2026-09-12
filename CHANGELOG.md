@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.8.10-alpha — Local cognitive action loop and reviewed continuation
+
+- Adds a bounded, foreground-only cognitive loop for frozen `process.exec` AutonomyRuns; every
+  advance performs one model inference or one supervised Bubblewrap action, never both.
+- Adds schema 59 typed owner waits, one-shot non-authoritative owner context, and reviewed successor
+  proposals committed to canonical plan/grant and predecessor-state hashes.
+- Accepts a successor in one SQLite transaction, cancelling the historical predecessor and creating
+  a fresh successor in `PLANNED`; start, cycle creation and execution remain separate owner actions.
+- Adds no model-issued authority, silent learning, network, Git/GitHub, background execution,
+  self-modification or raw chain-of-thought persistence.
+
 ## 0.8.9-alpha — HTTP observability correction
 
 - Future rejected downloads preserve only final HTTP status/class, normalized final host and bounded

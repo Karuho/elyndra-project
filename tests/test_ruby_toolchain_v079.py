@@ -289,7 +289,7 @@ def test_ruby_profile_and_control_center(isolated_home: ElyndraPaths) -> None:
         version = connection.execute(
             "SELECT value FROM schema_meta WHERE key = 'schema_version'"
         ).fetchone()[0]
-    assert version == "58"
+    assert version == "59"
 
 
 def test_ruby_knowledge_package_is_valid(isolated_home: ElyndraPaths) -> None:

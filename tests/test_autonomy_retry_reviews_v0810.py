@@ -595,6 +595,11 @@ def test_exact_schema_56_upgrade_preserves_data_without_fake_reviews(
         )
         connection.executescript(
             """
+            DROP TABLE assistant_cognitive_successor_handoffs;
+            DROP TABLE assistant_cognitive_owner_waits;
+            DROP TABLE assistant_cognitive_cycle_events;
+            DROP TABLE assistant_cognitive_turns;
+            DROP TABLE assistant_cognitive_cycles;
             DROP TABLE assistant_autonomy_retry_consumptions;
             DROP TABLE assistant_autonomy_retry_reviews;
             DROP INDEX idx_autonomy_gates_run;
@@ -630,6 +635,23 @@ def test_exact_schema_56_upgrade_preserves_data_without_fake_reviews(
             UPDATE schema_meta SET value='56' WHERE key='schema_version';
             """
         )
+        assert connection.execute(
+            "SELECT value FROM schema_meta WHERE key='schema_version'"
+        ).fetchone()[0] == "56"
+        for absent in (
+            "assistant_autonomy_retry_reviews",
+            "assistant_autonomy_retry_consumptions",
+            "assistant_cognitive_owner_waits",
+            "assistant_cognitive_successor_handoffs",
+        ):
+            assert connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE name=?", (absent,)
+            ).fetchone() is None
+        assert connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='trigger' "
+            "AND sql LIKE '%assistant_autonomy_retry_reviews%'"
+        ).fetchone() is None
+    database.migrate()
     database.migrate()
     assert repository.get(run.run_id) is not None
     assert repository.execution_results(run.run_id, actor="owner")[0][
@@ -638,7 +660,7 @@ def test_exact_schema_56_upgrade_preserves_data_without_fake_reviews(
     with database.connect() as connection:
         assert connection.execute(
             "SELECT value FROM schema_meta WHERE key='schema_version'"
-        ).fetchone()[0] == "58"
+        ).fetchone()[0] == "59"
         assert connection.execute(
             "SELECT COUNT(*) FROM assistant_autonomy_retry_reviews"
         ).fetchone()[0] == 0
@@ -649,6 +671,7 @@ def test_exact_schema_56_upgrade_preserves_data_without_fake_reviews(
             ).fetchone()
         )
         assert gate_after == gate_before
+        assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
 
 
 @pytest.mark.parametrize(
