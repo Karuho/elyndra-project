@@ -37,6 +37,20 @@ from elyndra.autonomy.models import (
     RunPlan,
     RunStep,
 )
+from elyndra.autonomy.mutations import (
+    MAX_MUTATION_ITEMS,
+    MAX_ORIGINAL_BYTES,
+    MAX_PATH_COMPONENT_BYTES,
+    MAX_PROPOSAL_LIFETIME,
+    MAX_PROPOSED_BYTES_PER_ITEM,
+    MAX_RELATIVE_PATH_BYTES,
+    MAX_TOTAL_PROPOSED_BYTES,
+    MUTATION_PROPOSAL_DOMAIN,
+    MUTATION_PROPOSAL_FORMAT,
+    MutationItem,
+    MutationOperation,
+    MutationProposal,
+)
 from elyndra.autonomy.repository import AutonomyRepository
 from elyndra.autonomy.scope import WorkspaceScope
 from elyndra.autonomy.supervised_runner import (
@@ -68,6 +82,18 @@ __all__ = [
     "HumanGate",
     "HumanGateKind",
     "HumanGateStatus",
+    "MAX_MUTATION_ITEMS",
+    "MAX_ORIGINAL_BYTES",
+    "MAX_PATH_COMPONENT_BYTES",
+    "MAX_PROPOSAL_LIFETIME",
+    "MAX_PROPOSED_BYTES_PER_ITEM",
+    "MAX_RELATIVE_PATH_BYTES",
+    "MAX_TOTAL_PROPOSED_BYTES",
+    "MUTATION_PROPOSAL_DOMAIN",
+    "MUTATION_PROPOSAL_FORMAT",
+    "MutationItem",
+    "MutationOperation",
+    "MutationProposal",
     "PreparedExecution",
     "RunPlan",
     "RunStep",
