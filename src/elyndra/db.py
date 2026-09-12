@@ -2361,10 +2361,11 @@ class Database:
                 self._migrate_autonomy_phase7a(connection)
                 self._migrate_autonomy_phase7b1(connection)
                 self._migrate_autonomy_phase7b3(connection)
+                self._migrate_autonomy_phase9a(connection)
                 self._migrate_cognitive_loop_phase8a(connection)
                 self._migrate_cognitive_handoff_phase8b1(connection)
             connection.execute(
-                "INSERT OR REPLACE INTO schema_meta(key, value) VALUES('schema_version', '59')"
+                "INSERT OR REPLACE INTO schema_meta(key, value) VALUES('schema_version', '60')"
             )
         with suppress(PermissionError):
             self.path.chmod(0o600)
@@ -2789,6 +2790,102 @@ class Database:
             CREATE TRIGGER IF NOT EXISTS trg_autonomy_retry_consumptions_no_delete
             BEFORE DELETE ON assistant_autonomy_retry_consumptions
             BEGIN SELECT RAISE(ABORT, 'autonomy_retry_consumptions_append_only'); END;
+            """
+        )
+
+    @staticmethod
+    def _migrate_autonomy_phase9a(connection: sqlite3.Connection) -> None:
+        """Create the final immutable proposal portion of schema 60."""
+
+        connection.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS assistant_autonomy_mutation_proposals (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                public_id TEXT NOT NULL UNIQUE
+                    CHECK(length(public_id) BETWEEN 1 AND 128),
+                request_key TEXT NOT NULL UNIQUE
+                    CHECK(length(request_key) BETWEEN 1 AND 128),
+                run_id INTEGER NOT NULL,
+                step_id TEXT NOT NULL
+                    CHECK(length(step_id) BETWEEN 1 AND 64),
+                actor TEXT NOT NULL
+                    CHECK(length(actor) BETWEEN 1 AND 200),
+                workspace_root TEXT NOT NULL
+                    CHECK(length(workspace_root) BETWEEN 1 AND 4096),
+                proposal_sha256 TEXT NOT NULL
+                    CHECK(length(proposal_sha256) = 64
+                          AND proposal_sha256 NOT GLOB '*[^0-9a-f]*'),
+                format_version TEXT NOT NULL
+                    CHECK(length(format_version) BETWEEN 1 AND 32),
+                created_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                item_count INTEGER NOT NULL
+                    CHECK(item_count BETWEEN 1 AND 3),
+                total_proposed_bytes INTEGER NOT NULL
+                    CHECK(total_proposed_bytes BETWEEN 0 AND 131072),
+                FOREIGN KEY(run_id) REFERENCES assistant_autonomy_runs(id)
+                    ON DELETE RESTRICT
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_autonomy_mutation_proposals_run
+            ON assistant_autonomy_mutation_proposals(run_id, id DESC);
+
+            CREATE TABLE IF NOT EXISTS assistant_autonomy_mutation_items (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                proposal_id INTEGER NOT NULL,
+                ordinal INTEGER NOT NULL CHECK(ordinal BETWEEN 0 AND 2),
+                relative_path TEXT NOT NULL
+                    CHECK(length(relative_path) BETWEEN 1 AND 512),
+                operation TEXT NOT NULL CHECK(operation IN ('create', 'replace')),
+                original_exists INTEGER NOT NULL
+                    CHECK(original_exists IN (0, 1)),
+                original_sha256 TEXT CHECK(
+                    original_sha256 IS NULL OR
+                    (length(original_sha256) = 64
+                     AND original_sha256 NOT GLOB '*[^0-9a-f]*')
+                ),
+                original_size INTEGER CHECK(
+                    original_size IS NULL OR
+                    original_size BETWEEN 0 AND 262144
+                ),
+                proposed_content BLOB NOT NULL
+                    CHECK(typeof(proposed_content) = 'blob'
+                          AND length(proposed_content) <= 65536),
+                proposed_sha256 TEXT NOT NULL
+                    CHECK(length(proposed_sha256) = 64
+                          AND proposed_sha256 NOT GLOB '*[^0-9a-f]*'),
+                proposed_size INTEGER NOT NULL
+                    CHECK(proposed_size BETWEEN 0 AND 65536
+                          AND proposed_size = length(proposed_content)),
+                FOREIGN KEY(proposal_id)
+                    REFERENCES assistant_autonomy_mutation_proposals(id)
+                    ON DELETE RESTRICT,
+                UNIQUE(proposal_id, ordinal),
+                UNIQUE(proposal_id, relative_path),
+                CHECK(
+                    (operation = 'create' AND original_exists = 0
+                     AND original_sha256 IS NULL AND original_size IS NULL)
+                    OR
+                    (operation = 'replace' AND original_exists = 1
+                     AND original_sha256 IS NOT NULL AND original_size IS NOT NULL)
+                )
+            );
+
+            CREATE TRIGGER IF NOT EXISTS trg_autonomy_mutation_proposals_no_update
+            BEFORE UPDATE ON assistant_autonomy_mutation_proposals
+            BEGIN SELECT RAISE(ABORT, 'autonomy_mutation_proposals_append_only'); END;
+
+            CREATE TRIGGER IF NOT EXISTS trg_autonomy_mutation_proposals_no_delete
+            BEFORE DELETE ON assistant_autonomy_mutation_proposals
+            BEGIN SELECT RAISE(ABORT, 'autonomy_mutation_proposals_append_only'); END;
+
+            CREATE TRIGGER IF NOT EXISTS trg_autonomy_mutation_items_no_update
+            BEFORE UPDATE ON assistant_autonomy_mutation_items
+            BEGIN SELECT RAISE(ABORT, 'autonomy_mutation_items_append_only'); END;
+
+            CREATE TRIGGER IF NOT EXISTS trg_autonomy_mutation_items_no_delete
+            BEFORE DELETE ON assistant_autonomy_mutation_items
+            BEGIN SELECT RAISE(ABORT, 'autonomy_mutation_items_append_only'); END;
             """
         )
 

@@ -50,6 +50,7 @@ from elyndra.autonomy.mutations import (
     MutationItem,
     MutationOperation,
     MutationProposal,
+    PersistedMutationProposal,
 )
 from elyndra.autonomy.repository import AutonomyRepository
 from elyndra.autonomy.scope import WorkspaceScope
@@ -94,6 +95,7 @@ __all__ = [
     "MutationItem",
     "MutationOperation",
     "MutationProposal",
+    "PersistedMutationProposal",
     "PreparedExecution",
     "RunPlan",
     "RunStep",

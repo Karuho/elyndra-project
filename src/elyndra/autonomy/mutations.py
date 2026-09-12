@@ -227,6 +227,21 @@ class MutationProposal:
         return _canonical_json_bytes(self.canonical_data())
 
 
+@dataclass(frozen=True, slots=True)
+class PersistedMutationProposal:
+    """Vault lookup identity paired with its immutable proposal."""
+
+    public_id: str
+    request_key: str
+    proposal: MutationProposal
+
+    def __post_init__(self) -> None:
+        _required_exact(self.public_id, "public_id", 128)
+        _required_exact(self.request_key, "request_key", 128)
+        if not isinstance(self.proposal, MutationProposal):
+            raise TypeError("proposal debe ser MutationProposal.")
+
+
 def _validated_relative_path(value: str) -> str:
     if not isinstance(value, str):
         raise TypeError("relative_path debe ser texto.")

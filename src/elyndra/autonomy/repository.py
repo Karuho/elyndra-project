@@ -28,6 +28,12 @@ from elyndra.autonomy.models import (
     RunPlan,
     RunStep,
 )
+from elyndra.autonomy.mutations import (
+    MutationItem,
+    MutationOperation,
+    MutationProposal,
+    PersistedMutationProposal,
+)
 from elyndra.autonomy.scope import WorkspaceScope
 from elyndra.db import Database
 
@@ -316,6 +322,302 @@ class AutonomyRepository:
                 ).fetchall()
 
         return [dict(row) for row in rows]
+
+    def create_mutation_proposal(
+        self,
+        proposal: MutationProposal,
+        *,
+        request_key: str,
+        actor: str,
+    ) -> PersistedMutationProposal:
+        """Persist one immutable, non-authoritative mutation candidate."""
+
+        if not isinstance(proposal, MutationProposal):
+            raise TypeError("proposal debe ser MutationProposal.")
+        clean_actor = _required_exact(actor, "actor", 200)
+        clean_key = _required_exact(request_key, "request_key", 128)
+        rebuilt = MutationProposal(
+            run_id=proposal.run_id,
+            step_id=proposal.step_id,
+            actor=proposal.actor,
+            workspace_root=proposal.workspace_root,
+            items=proposal.items,
+            created_at=proposal.created_at,
+            expires_at=proposal.expires_at,
+            format_version=proposal.format_version,
+        )
+        if not hmac.compare_digest(
+            proposal.proposal_sha256,
+            rebuilt.proposal_sha256,
+        ):
+            raise PermissionError("Commitment de propuesta inconsistente.")
+        if rebuilt.actor != clean_actor:
+            raise PermissionError("El actor no coincide con la propuesta.")
+
+        now = _utcnow()
+        with self.database.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            run = self._owned_run(connection, rebuilt.run_id, actor=clean_actor)
+            plan = _plan_from_json(str(run["plan_json"]))
+            step = next(
+                (item for item in plan.steps if item.step_id == rebuilt.step_id),
+                None,
+            )
+            if step is None:
+                raise PermissionError("La propuesta apunta a un step inexistente.")
+            if step.capability is not Capability.SELF_MODIFY:
+                raise PermissionError("El step no concede self.modify.")
+
+            grant = _grant_from_json(str(run["grant_json"]))
+            if Capability.SELF_MODIFY not in grant.capabilities:
+                raise PermissionError("El grant no concede self.modify.")
+            if rebuilt.expires_at > grant.expires_at:
+                raise PermissionError("La propuesta excede la vigencia del grant.")
+            if rebuilt.workspace_root != str(run["workspace_root"]):
+                raise PermissionError("El workspace de la propuesta no coincide.")
+
+            existing = connection.execute(
+                """
+                SELECT * FROM assistant_autonomy_mutation_proposals
+                WHERE request_key = ?
+                """,
+                (clean_key,),
+            ).fetchone()
+            if existing is not None:
+                if (
+                    int(existing["run_id"]) != int(run["id"])
+                    or str(existing["actor"]) != clean_actor
+                    or not hmac.compare_digest(
+                        str(existing["proposal_sha256"]),
+                        rebuilt.proposal_sha256,
+                    )
+                ):
+                    raise PermissionError(
+                        "request_key reutilizado con otra propuesta."
+                    )
+                return self._mutation_proposal_from_row(connection, existing)
+
+            if rebuilt.expires_at <= now:
+                raise PermissionError("La propuesta de mutación expiró.")
+            grant.require(Capability.SELF_MODIFY, at=now)
+
+            public_id = uuid.uuid4().hex
+            total_bytes = sum(item.proposed_size for item in rebuilt.items)
+            connection.execute(
+                """
+                INSERT INTO assistant_autonomy_mutation_proposals(
+                    public_id, request_key, run_id, step_id, actor,
+                    workspace_root, proposal_sha256, format_version,
+                    created_at, expires_at, item_count, total_proposed_bytes
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    public_id,
+                    clean_key,
+                    int(run["id"]),
+                    rebuilt.step_id,
+                    clean_actor,
+                    rebuilt.workspace_root,
+                    rebuilt.proposal_sha256,
+                    rebuilt.format_version,
+                    rebuilt.created_at.isoformat(),
+                    rebuilt.expires_at.isoformat(),
+                    len(rebuilt.items),
+                    total_bytes,
+                ),
+            )
+            proposal_db_id = int(
+                connection.execute("SELECT last_insert_rowid()").fetchone()[0]
+            )
+            for ordinal, item in enumerate(rebuilt.items):
+                connection.execute(
+                    """
+                    INSERT INTO assistant_autonomy_mutation_items(
+                        proposal_id, ordinal, relative_path, operation,
+                        original_exists, original_sha256, original_size,
+                        proposed_content, proposed_sha256, proposed_size
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        proposal_db_id,
+                        ordinal,
+                        item.relative_path,
+                        item.operation.value,
+                        int(item.original_exists),
+                        item.original_sha256,
+                        item.original_size,
+                        sqlite3.Binary(item.proposed_content),
+                        item.proposed_sha256,
+                        item.proposed_size,
+                    ),
+                )
+            stored = connection.execute(
+                "SELECT * FROM assistant_autonomy_mutation_proposals WHERE id = ?",
+                (proposal_db_id,),
+            ).fetchone()
+            assert stored is not None
+            result = self._mutation_proposal_from_row(connection, stored)
+        return result
+
+    def mutation_proposal(
+        self,
+        proposal_id: str,
+        *,
+        actor: str,
+    ) -> PersistedMutationProposal | None:
+        clean_id = _required_exact(proposal_id, "proposal_id", 128)
+        clean_actor = _required_exact(actor, "actor", 200)
+        with self.database.connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM assistant_autonomy_mutation_proposals WHERE public_id = ?",
+                (clean_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            if str(row["actor"]) != clean_actor:
+                raise PermissionError("El actor no es propietario de la propuesta.")
+            return self._mutation_proposal_from_row(connection, row)
+
+    def list_mutation_proposals(
+        self,
+        run_id: str,
+        *,
+        actor: str,
+        limit: int = 50,
+    ) -> list[PersistedMutationProposal]:
+        clean_run = _required_exact(run_id, "run_id", 128)
+        clean_actor = _required_exact(actor, "actor", 200)
+        bounded_limit = max(1, min(int(limit), 200))
+        with self.database.connect() as connection:
+            run = self._owned_run(connection, clean_run, actor=clean_actor)
+            rows = connection.execute(
+                """
+                SELECT * FROM assistant_autonomy_mutation_proposals
+                WHERE run_id = ? ORDER BY id DESC LIMIT ?
+                """,
+                (int(run["id"]), bounded_limit),
+            ).fetchall()
+            return [
+                self._mutation_proposal_from_row(connection, row) for row in rows
+            ]
+
+    @staticmethod
+    def _mutation_proposal_from_row(
+        connection: sqlite3.Connection,
+        row: sqlite3.Row,
+    ) -> PersistedMutationProposal:
+        try:
+            run_row = connection.execute(
+                """
+                SELECT public_id, actor, workspace_root, grant_json, plan_json
+                FROM assistant_autonomy_runs WHERE id = ?
+                """,
+                (int(row["run_id"]),),
+            ).fetchone()
+            if run_row is None:
+                raise ValueError("run missing")
+            if (
+                str(row["actor"]) != str(run_row["actor"])
+                or str(row["workspace_root"]) != str(run_row["workspace_root"])
+            ):
+                raise ValueError("run lineage mismatch")
+            plan = _plan_from_json(str(run_row["plan_json"]))
+            step = next(
+                (item for item in plan.steps if item.step_id == str(row["step_id"])),
+                None,
+            )
+            if step is None or step.capability is not Capability.SELF_MODIFY:
+                raise ValueError("step lineage mismatch")
+            grant = _grant_from_json(str(run_row["grant_json"]))
+            if Capability.SELF_MODIFY not in grant.capabilities:
+                raise ValueError("grant lineage mismatch")
+
+            item_rows = connection.execute(
+                """
+                SELECT * FROM assistant_autonomy_mutation_items
+                WHERE proposal_id = ? ORDER BY ordinal ASC
+                """,
+                (int(row["id"]),),
+            ).fetchall()
+            expected_count = int(row["item_count"])
+            if len(item_rows) != expected_count:
+                raise ValueError("item count mismatch")
+            if [int(item["ordinal"]) for item in item_rows] != list(
+                range(expected_count)
+            ):
+                raise ValueError("ordinal mismatch")
+
+            items: list[MutationItem] = []
+            total_bytes = 0
+            stored_paths: list[str] = []
+            for item_row in item_rows:
+                content = item_row["proposed_content"]
+                if not isinstance(content, bytes):
+                    raise TypeError("proposed content must be bytes")
+                stored_size = int(item_row["proposed_size"])
+                stored_sha256 = str(item_row["proposed_sha256"])
+                if stored_size != len(content):
+                    raise ValueError("proposed size mismatch")
+                if not hmac.compare_digest(
+                    stored_sha256,
+                    hashlib.sha256(content).hexdigest(),
+                ):
+                    raise ValueError("proposed sha mismatch")
+                item = MutationItem(
+                    relative_path=str(item_row["relative_path"]),
+                    operation=MutationOperation(str(item_row["operation"])),
+                    original_exists=bool(int(item_row["original_exists"])),
+                    original_sha256=(
+                        None
+                        if item_row["original_sha256"] is None
+                        else str(item_row["original_sha256"])
+                    ),
+                    original_size=(
+                        None
+                        if item_row["original_size"] is None
+                        else int(item_row["original_size"])
+                    ),
+                    proposed_content=content,
+                )
+                items.append(item)
+                stored_paths.append(item.relative_path)
+                total_bytes += item.proposed_size
+
+            canonical_paths = sorted(
+                stored_paths,
+                key=lambda path: path.encode("utf-8"),
+            )
+            if stored_paths != canonical_paths:
+                raise ValueError("item ordering mismatch")
+            if total_bytes != int(row["total_proposed_bytes"]):
+                raise ValueError("total bytes mismatch")
+
+            proposal = MutationProposal(
+                run_id=str(run_row["public_id"]),
+                step_id=str(row["step_id"]),
+                actor=str(row["actor"]),
+                workspace_root=str(row["workspace_root"]),
+                items=tuple(items),
+                created_at=_parse_iso_datetime(row["created_at"], "created_at"),
+                expires_at=_parse_iso_datetime(row["expires_at"], "expires_at"),
+                format_version=str(row["format_version"]),
+            )
+            if proposal.expires_at > grant.expires_at:
+                raise ValueError("grant expiry mismatch")
+            if not hmac.compare_digest(
+                str(row["proposal_sha256"]),
+                proposal.proposal_sha256,
+            ):
+                raise ValueError("proposal sha mismatch")
+            return PersistedMutationProposal(
+                public_id=str(row["public_id"]),
+                request_key=str(row["request_key"]),
+                proposal=proposal,
+            )
+        except (IndexError, TypeError, ValueError) as exc:
+            raise PermissionError(
+                "Propuesta de mutación durable inconsistente; acceso denegado."
+            ) from exc
 
     def transition(
         self,
@@ -3141,6 +3443,16 @@ def _required(value: str, label: str, maximum: int) -> str:
             f"{label} supera el máximo de {maximum} caracteres."
         )
     return clean
+
+
+def _required_exact(value: str, label: str, maximum: int) -> str:
+    if not isinstance(value, str):
+        raise TypeError(f"{label} debe ser texto.")
+    if not value or value != value.strip() or "\x00" in value:
+        raise ValueError(f"{label} debe ser texto canónico no vacío.")
+    if len(value) > maximum:
+        raise ValueError(f"{label} supera el máximo de {maximum} caracteres.")
+    return value
 
 
 def _require_grant_active_json(encoded: str) -> None:
