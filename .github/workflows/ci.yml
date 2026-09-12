@@ -30,7 +30,11 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install --no-install-recommends -y bubblewrap
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
           bwrap --version
+          bwrap --unshare-all --die-with-parent --new-session --clearenv \
+            --cap-drop ALL --ro-bind / / --proc /proc --dev /dev \
+            --tmpfs /tmp -- /usr/bin/true
 
       - name: Install
         run: |
