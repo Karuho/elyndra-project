@@ -466,9 +466,11 @@
 - [x] Bind persisted authority to frozen command identity and exact execution snapshots.
 - [x] Add Bubblewrap as the sole sandboxed autonomous process-execution boundary.
 - [x] Persist provenance-bound durable execution observations and explicit unresolved launch gaps.
-- [ ] Add a synchronous supervised one-tick runner with at most one process launch per tick.
-- [ ] Add explicit reviewed retry/failure handling with fresh bounded authority per retry.
-- [ ] Add bounded multi-step orchestration without hidden background continuation.
+- [x] Add a synchronous supervised one-tick runner with at most one process launch per tick.
+- [x] Add explicit reviewed retry/failure handling with fresh bounded authority per retry.
+- [x] Add a bounded local cognitive action loop with durable observations and typed owner waits.
+- [x] Add reviewed, hash-bound successor proposals and atomic acceptance into a new planned run.
+- [x] Add bounded multi-step orchestration without hidden background continuation.
 - [ ] Add separately authorized transactional self-modification.
 - [ ] Add bounded validation and supervised repair without unbounded repair loops.
 - [ ] Keep external networking and automatic Git/GitHub publication outside the autonomous runtime unless separately specified.

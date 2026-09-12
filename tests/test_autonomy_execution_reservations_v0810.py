@@ -135,7 +135,7 @@ def test_schema_57_reservation_ledger_is_vault_scoped_and_idempotent(
             SELECT value FROM schema_meta
             WHERE key='schema_version'
             """
-        ).fetchone()[0] == "58"
+        ).fetchone()[0] == "59"
 
         assert connection.execute(
             """
@@ -152,7 +152,7 @@ def test_schema_57_reservation_ledger_is_vault_scoped_and_idempotent(
             SELECT value FROM schema_meta
             WHERE key='schema_version'
             """
-        ).fetchone()[0] == "58"
+        ).fetchone()[0] == "59"
 
         assert connection.execute(
             """
@@ -206,7 +206,7 @@ def test_schema_51_upgrade_preserves_run_and_creates_ledger(
             SELECT value FROM schema_meta
             WHERE key='schema_version'
             """
-        ).fetchone()[0] == "58"
+        ).fetchone()[0] == "59"
 
         assert connection.execute(
             """
@@ -704,7 +704,7 @@ def test_schema_53_upgrade_adds_command_sha256_without_losing_reservation(
             SELECT value FROM schema_meta
             WHERE key='schema_version'
             """
-        ).fetchone()[0] == "58"
+        ).fetchone()[0] == "59"
 
         columns = {
             str(row[1])
@@ -926,7 +926,7 @@ def test_schema_54_upgrade_creates_one_shot_launch_ledger(
             FROM schema_meta
             WHERE key='schema_version'
             """
-        ).fetchone()[0] == "58"
+        ).fetchone()[0] == "59"
 
         assert connection.execute(
             """
@@ -991,14 +991,22 @@ def test_schema_55_upgrade_creates_execution_results_ledger(
     )
 
     with database.connect() as connection:
+        result_trigger_names = [
+            str(row[0])
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master "
+                "WHERE type='trigger' AND sql LIKE "
+                "'%assistant_autonomy_execution_results%'"
+            ).fetchall()
+        ]
+        for trigger_name in result_trigger_names:
+            connection.execute(f'DROP TRIGGER "{trigger_name}"')
         connection.execute(
-            """
-            DROP TABLE assistant_autonomy_execution_results
-            """
+            "DROP TRIGGER trg_autonomy_execution_launches_receipt_required"
         )
         connection.execute(
             """
-            DROP TRIGGER trg_autonomy_execution_launches_receipt_required
+            DROP TABLE assistant_autonomy_execution_results
             """
         )
         connection.execute(
@@ -1040,7 +1048,7 @@ def test_schema_55_upgrade_creates_execution_results_ledger(
             FROM schema_meta
             WHERE key='schema_version'
             """
-        ).fetchone()[0] == "58"
+        ).fetchone()[0] == "59"
 
         assert connection.execute(
             """

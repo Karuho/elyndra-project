@@ -68,7 +68,7 @@ def test_alexandria_schema_and_private_directory(
             "SELECT value FROM schema_meta WHERE key = 'schema_version'"
         ).fetchone()[0]
 
-    assert version == "58"
+    assert version == "59"
     assert isolated_home.alexandria_dir.is_dir()
 
 

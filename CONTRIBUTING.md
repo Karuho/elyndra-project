@@ -96,6 +96,9 @@ node --check src/elyndra/web/static/app.js
 - CLI execution must consume a previously stored exact preview ID and must reject reuse or plan-ID mismatches.
 - Orchestration results sent to a language model must be bounded, sanitized and derived only from completed skill results.
 - Do not add autonomous file writes, package installation, network access, recursive planning or background execution to supervised plans.
+- Cognitive owner operations must target exact typed wait/handoff IDs. They must not infer a latest
+  authority record, route through ordinary chat, reuse predecessor approvals, or auto-start an
+  accepted successor. Owner context remains bounded, one-shot and non-authoritative.
 - Validation cycles must start from an applied proposal, freeze an exact allowlisted plan and require a separate single-use approval before execution.
 - Failed validation evidence supplied to a repair model must be bounded, sanitized and derived from real completed skill results.
 - Do not create automatic repair loops: every repair proposal, application and revalidation requires a new explicit owner action.

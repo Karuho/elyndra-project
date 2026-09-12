@@ -22,6 +22,7 @@ from elyndra.alexandria import (
 from elyndra.attachments import AttachmentRepository
 from elyndra.audit import AuditRepository
 from elyndra.automation import AutomationRepository, automation_query
+from elyndra.autonomy import RunPlan
 from elyndra.canonical import canonical_answer
 from elyndra.change_proposals import (
     AssistantChangePlanner,
@@ -267,6 +268,110 @@ class ElyndraApplication:
     language_engine: LanguageEngine
     persona: AgentPersona
     online_gateway: OnlineGatewayService | None
+
+    def _required_cognitive_loop(self) -> LocalCognitiveActionLoop:
+        if self.cognitive_loop is None:
+            raise PermissionError("El bucle cognitivo requiere una bóveda de cuenta activa.")
+        return self.cognitive_loop
+
+    def list_cognitive_owner_waits(self) -> list[dict[str, Any]]:
+        return self._required_cognitive_loop().list_owner_waits(
+            actor=self.identity.system_user
+        )
+
+    def cognitive_owner_wait(self, wait_id: str) -> dict[str, Any] | None:
+        return self._required_cognitive_loop().owner_wait(
+            wait_id, actor=self.identity.system_user
+        )
+
+    def list_cognitive_successor_handoffs(self) -> list[dict[str, Any]]:
+        return self._required_cognitive_loop().list_successor_handoffs(
+            actor=self.identity.system_user
+        )
+
+    def cognitive_successor_handoff(self, handoff_id: str) -> dict[str, Any] | None:
+        return self._required_cognitive_loop().successor_handoff(
+            handoff_id, actor=self.identity.system_user
+        )
+
+    def continue_cognitive_wait_with_context(
+        self, wait_id: str, *, context: str
+    ) -> dict[str, Any]:
+        return self._required_cognitive_loop().continue_with_context(
+            wait_id, actor=self.identity.system_user, context=context
+        )
+
+    def retry_cognitive_reasoning(self, wait_id: str) -> dict[str, Any]:
+        return self._required_cognitive_loop().retry_reasoning(
+            wait_id, actor=self.identity.system_user
+        )
+
+    def continue_cognitive_wait_after_ordinary_gate(
+        self, wait_id: str
+    ) -> dict[str, Any]:
+        return self._required_cognitive_loop().continue_after_ordinary_gate(
+            wait_id, actor=self.identity.system_user
+        )
+
+    def continue_cognitive_wait_after_retry_review(
+        self, wait_id: str, retry_review_id: str, gate_id: str
+    ) -> dict[str, Any]:
+        return self._required_cognitive_loop().continue_after_retry_review(
+            wait_id,
+            retry_review_id,
+            gate_id,
+            actor=self.identity.system_user,
+        )
+
+    def continue_cognitive_wait_without_replan(self, wait_id: str) -> dict[str, Any]:
+        return self._required_cognitive_loop().continue_without_replan(
+            wait_id, actor=self.identity.system_user
+        )
+
+    def continue_abandoned_cognitive_action(self, wait_id: str) -> dict[str, Any]:
+        return self._required_cognitive_loop().continue_abandoned_action(
+            wait_id, actor=self.identity.system_user
+        )
+
+    def stop_cognitive_wait(self, wait_id: str) -> dict[str, Any]:
+        return self._required_cognitive_loop().stop_wait(
+            wait_id, actor=self.identity.system_user
+        )
+
+    def cancel_cognitive_wait(self, wait_id: str) -> dict[str, Any]:
+        return self._required_cognitive_loop().cancel_wait(
+            wait_id, actor=self.identity.system_user
+        )
+
+    def propose_cognitive_successor(
+        self,
+        wait_id: str,
+        *,
+        request_key: str,
+        objective: str,
+        workspace_root: str,
+        plan: RunPlan,
+        grant_spec: dict[str, Any],
+    ) -> dict[str, Any]:
+        return self._required_cognitive_loop().propose_successor(
+            wait_id,
+            actor=self.identity.system_user,
+            request_key=request_key,
+            objective=objective,
+            workspace_root=workspace_root,
+            plan=plan,
+            grant_spec=grant_spec,
+        )
+
+    def reject_cognitive_successor(self, handoff_id: str) -> dict[str, Any]:
+        return self._required_cognitive_loop().reject_successor(
+            handoff_id, actor=self.identity.system_user
+        )
+
+    def accept_cognitive_successor(self, handoff_id: str) -> dict[str, Any]:
+        return self._required_cognitive_loop().accept_successor(
+            handoff_id, actor=self.identity.system_user
+        )
 
     @classmethod
     def load(

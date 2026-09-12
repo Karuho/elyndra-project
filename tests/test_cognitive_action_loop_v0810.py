@@ -24,6 +24,8 @@ from elyndra.autonomy import (
     RunPlan,
     RunStep,
     SupervisedAutonomyRunner,
+    SupervisedTickOutcome,
+    SupervisedTickResult,
     WorkspaceScope,
 )
 from elyndra.cognitive_loop import LocalCognitiveActionLoop
@@ -169,7 +171,7 @@ def test_schema_58_is_vault_only_idempotent_and_preserves_schema_57(tmp_path: Pa
     with database.connect() as connection:
         assert connection.execute(
             "SELECT value FROM schema_meta WHERE key='schema_version'"
-        ).fetchone()[0] == "58"
+        ).fetchone()[0] == "59"
 
 
 def test_schema_constraints_immutability_and_append_only(tmp_path: Path) -> None:
@@ -423,12 +425,20 @@ def test_cancel_denied_from_ready_does_not_mutate_run(tmp_path: Path) -> None:
 
 
 def test_valid_waiting_owner_cancel_terminalizes_cycle_then_run(tmp_path: Path) -> None:
-    _database, repository, run, loop, _engine = _state(
+    database, repository, run, loop, _engine = _state(
         tmp_path, engine=_Engine(['{"decision":"request_human"}'])
     )
     cycle_id = str(_cycle(loop, run)["public_id"])
     loop.advance(cycle_id, actor="owner")
-    cancelled = loop.cancel(cycle_id, actor="owner")
+    with database.connect() as connection:
+        wait_id = connection.execute(
+            "SELECT public_id FROM assistant_cognitive_owner_waits"
+        ).fetchone()[0]
+    with pytest.raises(PermissionError):
+        loop.cancel(cycle_id, actor="owner")
+    assert loop.get(cycle_id, actor="owner")["status"] == "waiting_owner"  # type: ignore[index]
+    assert repository.get(run.run_id)["status"] == "running"  # type: ignore[index]
+    cancelled = loop.cancel_wait(wait_id, actor="owner")
     assert cancelled["status"] == "cancelled"
     assert repository.get(run.run_id)["status"] == "cancelled"  # type: ignore[index]
 
@@ -436,7 +446,7 @@ def test_valid_waiting_owner_cancel_terminalizes_cycle_then_run(tmp_path: Path) 
 def test_pending_gate_cannot_resume_but_exact_approved_gate_can(
     tmp_path: Path,
 ) -> None:
-    _database, repository, run, loop, _engine = _state(tmp_path, requires_gate=True)
+    database, repository, run, loop, _engine = _state(tmp_path, requires_gate=True)
     cycle_id = str(_cycle(loop, run)["public_id"])
     loop.advance(cycle_id, actor="owner")
     loop.advance(cycle_id, actor="owner")
@@ -445,15 +455,23 @@ def test_pending_gate_cannot_resume_but_exact_approved_gate_can(
     gate_id = str(item["human_gates"][0]["public_id"])
     with pytest.raises(PermissionError):
         loop.resume(cycle_id, actor="owner")
+    with database.connect() as connection:
+        wait_id = connection.execute(
+            "SELECT public_id FROM assistant_cognitive_owner_waits "
+            "WHERE cycle_id=(SELECT id FROM assistant_cognitive_cycles WHERE public_id=?)",
+            (cycle_id,),
+        ).fetchone()[0]
+    with pytest.raises(PermissionError):
+        loop.continue_after_ordinary_gate(wait_id, actor="owner")
     repository.resolve_human_gate(gate_id, actor="owner", decision="approved")
-    assert loop.resume(cycle_id, actor="owner")["status"] == "action_ready"
+    assert loop.continue_after_ordinary_gate(wait_id, actor="owner")["status"] == "action_ready"
 
 
 def test_retry_blocker_requires_exact_approved_review(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _database, repository, run, loop, _engine = _state(
+    database, repository, run, loop, _engine = _state(
         tmp_path,
         engine=_Engine(
             [
@@ -477,17 +495,88 @@ def test_retry_blocker_requires_exact_approved_review(
     with pytest.raises(PermissionError):
         loop.resume(cycle_id, actor="owner")
     review = repository.request_retry_review(run.run_id, "run1", actor="owner")
+    with database.connect() as connection:
+        wait_id = connection.execute(
+            "SELECT public_id FROM assistant_cognitive_owner_waits "
+            "WHERE cycle_id=(SELECT id FROM assistant_cognitive_cycles WHERE public_id=?)",
+            (cycle_id,),
+        ).fetchone()[0]
+    with pytest.raises(PermissionError):
+        loop.continue_after_retry_review(
+            wait_id,
+            str(review["retry_review_id"]),
+            str(review["gate_id"]),
+            actor="owner",
+        )
     repository.resolve_human_gate(
         str(review["gate_id"]), actor="owner", decision="approved"
     )
-    assert loop.resume(cycle_id, actor="owner")["status"] == "action_ready"
+    with pytest.raises(PermissionError):
+        loop.continue_after_retry_review(
+            wait_id, "wrong-review", str(review["gate_id"]), actor="owner"
+        )
+    with pytest.raises(PermissionError):
+        loop.continue_after_retry_review(
+            wait_id, str(review["retry_review_id"]), "wrong-gate", actor="owner"
+        )
+    assert loop.continue_after_retry_review(
+        wait_id,
+        str(review["retry_review_id"]),
+        str(review["gate_id"]),
+        actor="owner",
+    )["status"] == "action_ready"
+    with database.connect() as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM assistant_autonomy_retry_consumptions"
+        ).fetchone()[0] == 0
+
+
+def test_retry_review_race_keeps_exact_retry_wait(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database, repository, run, loop, _engine = _state(
+        tmp_path,
+        engine=_Engine(
+            [
+                '{"decision":"execute_next","step_id":"run1"}',
+                '{"decision":"execute_next","step_id":"run1"}',
+            ]
+        ),
+    )
+    monkeypatch.setattr(BubblewrapExecutor, "__init__", lambda self, *args, **kwargs: None)
+    monkeypatch.setattr(
+        BubblewrapExecutor,
+        "execute",
+        _fake_execution(repository, ExecutionOutcome.FAILED),
+    )
+    cycle_id = str(_cycle(loop, run)["public_id"])
+    loop.advance(cycle_id, actor="owner")
+    failed = loop.advance(cycle_id, actor="owner")
+    source_request_id = failed.source_request_id
+    loop.advance(cycle_id, actor="owner")
+    monkeypatch.setattr(loop.autonomy, "retry_review_available", lambda *args, **kwargs: True)
+    monkeypatch.setattr(
+        SupervisedAutonomyRunner,
+        "tick",
+        lambda *args, **kwargs: SupervisedTickResult(
+            run.run_id, SupervisedTickOutcome.BLOCKED_PREVIOUS_RESULT
+        ),
+    )
+    blocked = loop.advance(cycle_id, actor="owner")
+    assert blocked.disposition == "authority_blocked"
+    with database.connect() as connection:
+        wait = connection.execute(
+            "SELECT reason, source_request_id FROM assistant_cognitive_owner_waits "
+            "WHERE state='pending'"
+        ).fetchone()
+        assert tuple(wait) == ("retry_review_required", source_request_id)
 
 
 def test_abandoned_act_before_delegation_may_resume(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _database, _repository, run, loop, _engine = _state(tmp_path)
+    database, _repository, run, loop, _engine = _state(tmp_path)
     cycle_id = str(_cycle(loop, run)["public_id"])
     loop.advance(cycle_id, actor="owner")
     monkeypatch.setattr(
@@ -500,7 +589,13 @@ def test_abandoned_act_before_delegation_may_resume(
     item = loop.get(cycle_id, actor="owner")
     assert item is not None
     loop.abandon_turn(cycle_id, str(item["turns"][-1]["public_id"]), actor="owner")
-    assert loop.resume(cycle_id, actor="owner")["status"] == "action_ready"
+    with database.connect() as connection:
+        wait_id = connection.execute(
+            "SELECT public_id FROM assistant_cognitive_owner_waits "
+            "WHERE cycle_id=(SELECT id FROM assistant_cognitive_cycles WHERE public_id=?)",
+            (cycle_id,),
+        ).fetchone()[0]
+    assert loop.continue_abandoned_action(wait_id, actor="owner")["status"] == "action_ready"
 
 
 def test_abandoned_act_after_delegation_cannot_resume_or_delegate_again(
@@ -520,8 +615,14 @@ def test_abandoned_act_after_delegation_cannot_resume_or_delegate_again(
     item = loop.get(cycle_id, actor="owner")
     assert item is not None
     loop.abandon_turn(cycle_id, str(item["turns"][-1]["public_id"]), actor="owner")
-    with pytest.raises(PermissionError, match="enlace cognitivo"):
-        loop.resume(cycle_id, actor="owner")
+    with database.connect() as connection:
+        wait_id = connection.execute(
+            "SELECT public_id FROM assistant_cognitive_owner_waits "
+            "WHERE cycle_id=(SELECT id FROM assistant_cognitive_cycles WHERE public_id=?)",
+            (cycle_id,),
+        ).fetchone()[0]
+    with pytest.raises(PermissionError):
+        loop.continue_abandoned_action(wait_id, actor="owner")
     with database.connect() as connection:
         assert connection.execute(
             "SELECT COUNT(*) FROM assistant_cognitive_cycle_events "
@@ -803,9 +904,9 @@ def test_concurrent_action_advances_delegate_at_most_once(
 
 
 def test_max_advances_and_model_calls_deny_before_model_invocation(tmp_path: Path) -> None:
-    for label, count, expected_error in (
-        ("advances", 12, "max_advances"),
-        ("models", 8, "max_model_calls"),
+    for label, count in (
+        ("advances", 12),
+        ("models", 8),
     ):
         database, _repository, run, loop, engine = _state(tmp_path / label)
         cycle = _cycle(loop, run)
@@ -824,8 +925,9 @@ def test_max_advances_and_model_calls_deny_before_model_invocation(tmp_path: Pat
                     """,
                     (f"{label}-{sequence}", cycle_db_id, sequence),
                 )
-        with pytest.raises(PermissionError, match=expected_error):
-            loop.advance(str(cycle["public_id"]), actor="owner")
+        denied = loop.advance(str(cycle["public_id"]), actor="owner")
+        assert denied.status == "waiting_owner"
+        assert denied.disposition == "limit_exhausted"
         assert len(engine.calls) == 0  # type: ignore[attr-defined]
 
 
@@ -853,7 +955,7 @@ def test_max_replans_denies_third_durable_replan(tmp_path: Path) -> None:
     result = loop.advance(str(cycle["public_id"]), actor="owner")
     assert result.status == "waiting_owner"
     assert result.decision == ""
-    assert result.disposition == "authority_blocked"
+    assert result.disposition == "limit_exhausted"
     assert len(engine.calls) == 1  # type: ignore[attr-defined]
     assert loop.get(str(cycle["public_id"]), actor="owner")["usage"]["replans"] == 2  # type: ignore[index]
 
@@ -900,9 +1002,9 @@ def test_max_actions_uses_delegation_events_and_never_calls_runner(
     )
     denied = loop.advance(cycle_id, actor="owner")
     assert denied.status == "waiting_owner"
-    assert denied.disposition == "authority_blocked"
+    assert denied.disposition == "limit_exhausted"
     assert loop.get(cycle_id, actor="owner")["usage"]["actions"] == 4  # type: ignore[index]
-    with pytest.raises(PermissionError, match="max_actions"):
+    with pytest.raises(PermissionError):
         loop.resume(cycle_id, actor="owner")
     with database.connect() as connection:
         assert connection.execute(

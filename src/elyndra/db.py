@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import sqlite3
 from contextlib import suppress
 from pathlib import Path
@@ -2361,8 +2362,9 @@ class Database:
                 self._migrate_autonomy_phase7b1(connection)
                 self._migrate_autonomy_phase7b3(connection)
                 self._migrate_cognitive_loop_phase8a(connection)
+                self._migrate_cognitive_handoff_phase8b1(connection)
             connection.execute(
-                "INSERT OR REPLACE INTO schema_meta(key, value) VALUES('schema_version', '58')"
+                "INSERT OR REPLACE INTO schema_meta(key, value) VALUES('schema_version', '59')"
             )
         with suppress(PermissionError):
             self.path.chmod(0o600)
@@ -2880,7 +2882,7 @@ class Database:
                 disposition TEXT CHECK(disposition IS NULL OR disposition IN (
                     'model_unavailable', 'authority_blocked', 'incomplete_attempt',
                     'execution_observed', 'malformed_model_output', 'model_error',
-                    'durable_run_completed'
+                    'durable_run_completed', 'limit_exhausted'
                 )),
                 step_id TEXT CHECK(step_id IS NULL OR length(step_id) BETWEEN 1 AND 64),
                 source_request_id TEXT CHECK(source_request_id IS NULL OR
@@ -3014,6 +3016,673 @@ class Database:
             BEGIN SELECT RAISE(ABORT, 'cognitive_events_append_only'); END;
             """
         )
+
+    @staticmethod
+    def _migrate_cognitive_handoff_phase8b1(connection: sqlite3.Connection) -> None:
+        Database._extend_cognitive_turn_dispositions_phase8b1(connection)
+        connection.executescript(
+            """
+            DROP TRIGGER IF EXISTS trg_cognitive_cycles_status_transition;
+            CREATE TRIGGER trg_cognitive_cycles_status_transition
+            BEFORE UPDATE OF status ON assistant_cognitive_cycles
+            WHEN NOT (
+                (OLD.status = 'ready' AND NEW.status = 'reasoning_reserved') OR
+                (OLD.status IN ('ready', 'action_ready', 'evaluation_ready')
+                 AND NEW.status = 'waiting_owner'
+                 AND EXISTS (SELECT 1 FROM assistant_cognitive_owner_waits w
+                     WHERE w.cycle_id=OLD.id AND w.state='pending'
+                       AND w.reason='limit_exhausted')) OR
+                (OLD.status = 'reasoning_reserved' AND NEW.status IN
+                    ('action_ready', 'waiting_owner', 'replan_proposed', 'stopped')) OR
+                (OLD.status = 'action_ready' AND NEW.status = 'action_reserved') OR
+                (OLD.status = 'action_reserved' AND NEW.status IN
+                    ('evaluation_ready', 'blocked_incomplete', 'waiting_owner')) OR
+                (OLD.status = 'evaluation_ready' AND NEW.status = 'evaluation_reserved') OR
+                (OLD.status = 'evaluation_reserved' AND NEW.status IN
+                    ('action_ready', 'completed', 'waiting_owner',
+                     'replan_proposed', 'stopped')) OR
+                (OLD.status = 'replan_proposed' AND NEW.status = 'waiting_owner') OR
+                (OLD.status = 'waiting_owner' AND NEW.status IN
+                    ('ready', 'action_ready', 'evaluation_ready', 'stopped', 'cancelled')) OR
+                (OLD.status = 'blocked_incomplete' AND NEW.status IN
+                    ('stopped', 'cancelled'))
+            )
+            BEGIN SELECT RAISE(ABORT, 'cognitive_cycle_invalid_transition'); END;
+
+            CREATE TABLE IF NOT EXISTS assistant_cognitive_owner_waits (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                public_id TEXT NOT NULL UNIQUE
+                    CHECK(length(public_id) BETWEEN 1 AND 128),
+                cycle_id INTEGER NOT NULL,
+                sequence INTEGER NOT NULL CHECK(sequence BETWEEN 1 AND 64),
+                source_turn_id INTEGER,
+                reason TEXT NOT NULL CHECK(reason IN (
+                    'model_request_human', 'insufficient_evidence',
+                    'replan_requested', 'ordinary_gate_required',
+                    'retry_review_required', 'model_unavailable', 'model_error',
+                    'malformed_model_output', 'abandoned_before_delegation',
+                    'execution_linkage_unknown', 'incomplete_attempt',
+                    'recovery_required', 'limit_exhausted'
+                )),
+                gate_id TEXT CHECK(gate_id IS NULL OR
+                    length(gate_id) BETWEEN 1 AND 128),
+                source_request_id TEXT CHECK(source_request_id IS NULL OR
+                    length(source_request_id) BETWEEN 1 AND 128),
+                state TEXT NOT NULL CHECK(state IN ('pending', 'resolved')),
+                resolution TEXT CHECK(resolution IS NULL OR resolution IN (
+                    'context_continued', 'reasoning_retried',
+                    'ordinary_gate_continued', 'retry_review_continued',
+                    'replan_declined', 'abandoned_action_continued',
+                    'successor_accepted', 'stopped', 'cancelled'
+                )),
+                owner_context TEXT CHECK(owner_context IS NULL OR
+                    length(CAST(owner_context AS BLOB)) BETWEEN 1 AND 2000),
+                resumed_turn_id INTEGER,
+                created_at TEXT NOT NULL,
+                resolved_at TEXT,
+                resolved_by TEXT CHECK(resolved_by IS NULL OR
+                    length(resolved_by) BETWEEN 1 AND 200),
+                FOREIGN KEY(cycle_id) REFERENCES assistant_cognitive_cycles(id)
+                    ON DELETE RESTRICT,
+                FOREIGN KEY(source_turn_id) REFERENCES assistant_cognitive_turns(id)
+                    ON DELETE RESTRICT,
+                FOREIGN KEY(gate_id) REFERENCES assistant_autonomy_human_gates(public_id)
+                    ON DELETE RESTRICT,
+                FOREIGN KEY(source_request_id)
+                    REFERENCES assistant_autonomy_execution_results(request_id)
+                    ON DELETE RESTRICT,
+                FOREIGN KEY(resumed_turn_id) REFERENCES assistant_cognitive_turns(id)
+                    ON DELETE RESTRICT,
+                UNIQUE(cycle_id, sequence),
+                CHECK(
+                    (state='pending' AND resolution IS NULL AND owner_context IS NULL
+                     AND resumed_turn_id IS NULL AND resolved_at IS NULL
+                     AND resolved_by IS NULL)
+                    OR
+                    (state='resolved' AND resolution IS NOT NULL
+                     AND resolved_at IS NOT NULL AND resolved_by IS NOT NULL)
+                ),
+                CHECK((resolution='context_continued' AND owner_context IS NOT NULL)
+                      OR (resolution IS NULL AND owner_context IS NULL)
+                      OR (resolution!='context_continued' AND owner_context IS NULL)),
+                CHECK(resumed_turn_id IS NULL OR resolution='context_continued')
+            );
+
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_cognitive_one_pending_wait
+            ON assistant_cognitive_owner_waits(cycle_id) WHERE state='pending';
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_cognitive_wait_unique_resumed_turn
+            ON assistant_cognitive_owner_waits(resumed_turn_id)
+            WHERE resumed_turn_id IS NOT NULL;
+
+            CREATE TRIGGER IF NOT EXISTS trg_cognitive_wait_provenance_insert
+            BEFORE INSERT ON assistant_cognitive_owner_waits
+            WHEN NOT (
+                (NEW.reason IN ('model_request_human', 'insufficient_evidence',
+                    'replan_requested', 'model_unavailable', 'model_error',
+                    'malformed_model_output')
+                 AND NEW.source_turn_id IS NOT NULL AND NEW.gate_id IS NULL
+                 AND EXISTS (SELECT 1 FROM assistant_cognitive_turns t
+                     WHERE t.id=NEW.source_turn_id AND t.cycle_id=NEW.cycle_id
+                       AND t.kind IN ('reason','evaluate') AND t.state='completed'
+                       AND t.source_request_id IS NEW.source_request_id))
+                 AND (
+                    (NEW.reason='model_request_human' AND EXISTS (SELECT 1
+                        FROM assistant_cognitive_turns t WHERE t.id=NEW.source_turn_id
+                          AND t.decision='request_human'))
+                    OR (NEW.reason='insufficient_evidence' AND EXISTS (SELECT 1
+                        FROM assistant_cognitive_turns t WHERE t.id=NEW.source_turn_id
+                          AND t.decision='insufficient_evidence'))
+                    OR (NEW.reason='replan_requested' AND EXISTS (SELECT 1
+                        FROM assistant_cognitive_turns t WHERE t.id=NEW.source_turn_id
+                          AND t.decision='propose_replan'))
+                    OR (NEW.reason='model_unavailable' AND EXISTS (SELECT 1
+                        FROM assistant_cognitive_turns t WHERE t.id=NEW.source_turn_id
+                          AND t.disposition='model_unavailable'))
+                    OR (NEW.reason='model_error' AND EXISTS (SELECT 1
+                        FROM assistant_cognitive_turns t WHERE t.id=NEW.source_turn_id
+                          AND t.disposition='model_error'))
+                    OR (NEW.reason='malformed_model_output' AND EXISTS (SELECT 1
+                        FROM assistant_cognitive_turns t WHERE t.id=NEW.source_turn_id
+                          AND t.disposition='malformed_model_output'))
+                 )
+                OR
+                (NEW.reason='ordinary_gate_required'
+                 AND NEW.source_turn_id IS NOT NULL AND NEW.gate_id IS NOT NULL
+                 AND NEW.source_request_id IS NULL
+                 AND EXISTS (SELECT 1 FROM assistant_cognitive_turns t
+                     JOIN assistant_cognitive_cycle_events e
+                       ON e.cycle_id=t.cycle_id AND e.turn_id=t.id
+                      AND e.event_type='action_blocked' AND e.gate_id=NEW.gate_id
+                     JOIN assistant_cognitive_cycles c ON c.id=t.cycle_id
+                     JOIN assistant_autonomy_human_gates g ON g.public_id=NEW.gate_id
+                     WHERE t.id=NEW.source_turn_id AND t.cycle_id=NEW.cycle_id
+                       AND t.kind='act' AND t.state='completed'
+                       AND t.disposition='authority_blocked'
+                       AND g.run_id=c.autonomy_run_id
+                       AND g.kind!='retry_review'))
+                OR
+                (NEW.reason='retry_review_required'
+                 AND NEW.source_turn_id IS NOT NULL AND NEW.source_request_id IS NOT NULL
+                 AND NEW.gate_id IS NULL AND NEW.state='pending'
+                 AND EXISTS (SELECT 1 FROM assistant_cognitive_turns t
+                     JOIN assistant_cognitive_cycles c ON c.id=t.cycle_id
+                     JOIN assistant_autonomy_execution_results r
+                       ON r.request_id=NEW.source_request_id
+                     WHERE t.id=NEW.source_turn_id AND t.cycle_id=NEW.cycle_id
+                       AND t.kind='act' AND t.state='completed'
+                       AND t.disposition='authority_blocked'
+                       AND r.run_id=c.autonomy_run_id
+                       AND r.step_id=t.step_id AND r.outcome IN ('failed','cancelled')))
+                OR
+                (NEW.reason='abandoned_before_delegation'
+                 AND NEW.source_turn_id IS NOT NULL AND NEW.gate_id IS NULL
+                 AND NEW.source_request_id IS NULL
+                 AND EXISTS (SELECT 1 FROM assistant_cognitive_turns t
+                     WHERE t.id=NEW.source_turn_id AND t.cycle_id=NEW.cycle_id
+                       AND t.kind='act' AND t.state='abandoned')
+                 AND NOT EXISTS (SELECT 1 FROM assistant_cognitive_cycle_events e
+                     WHERE e.cycle_id=NEW.cycle_id AND e.turn_id=NEW.source_turn_id
+                       AND e.event_type='action_delegated'))
+                OR
+                (NEW.reason='execution_linkage_unknown'
+                 AND NEW.source_turn_id IS NOT NULL AND NEW.gate_id IS NULL
+                 AND NEW.source_request_id IS NULL
+                 AND EXISTS (SELECT 1 FROM assistant_cognitive_turns t
+                     WHERE t.id=NEW.source_turn_id AND t.cycle_id=NEW.cycle_id
+                       AND t.kind='act' AND t.state='abandoned'
+                       AND t.source_request_id IS NULL)
+                 AND EXISTS (SELECT 1 FROM assistant_cognitive_cycle_events e
+                     WHERE e.cycle_id=NEW.cycle_id AND e.turn_id=NEW.source_turn_id
+                       AND e.event_type='action_delegated'))
+                OR
+                (NEW.reason='incomplete_attempt'
+                 AND NEW.source_turn_id IS NOT NULL AND NEW.gate_id IS NULL
+                 AND NEW.source_request_id IS NULL
+                 AND EXISTS (SELECT 1 FROM assistant_cognitive_turns t
+                     WHERE t.id=NEW.source_turn_id AND t.cycle_id=NEW.cycle_id
+                       AND t.kind='act' AND t.state='completed'
+                       AND t.disposition='incomplete_attempt'))
+                OR
+                (NEW.reason='limit_exhausted' AND NEW.gate_id IS NULL
+                 AND ((NEW.source_turn_id IS NULL AND NEW.source_request_id IS NULL)
+                      OR EXISTS (SELECT 1 FROM assistant_cognitive_turns t
+                          WHERE t.id=NEW.source_turn_id AND t.cycle_id=NEW.cycle_id
+                            AND t.kind IN ('reason','evaluate') AND t.state='completed'
+                            AND t.disposition='limit_exhausted'
+                            AND t.source_request_id IS NEW.source_request_id)
+                      OR (EXISTS (SELECT 1 FROM assistant_cognitive_turns t
+                          WHERE t.id=NEW.source_turn_id AND t.cycle_id=NEW.cycle_id
+                            AND t.kind IN ('reason','evaluate') AND t.state='completed'
+                            AND t.disposition='authority_blocked'
+                            AND t.source_request_id IS NEW.source_request_id)
+                          AND (SELECT COUNT(*) FROM assistant_cognitive_turns prior
+                               WHERE prior.cycle_id=NEW.cycle_id
+                                 AND prior.state='completed'
+                                 AND prior.decision='propose_replan') >=
+                              (SELECT max_replans FROM assistant_cognitive_cycles
+                               WHERE id=NEW.cycle_id))))
+                OR
+                (NEW.reason='recovery_required' AND NEW.gate_id IS NULL
+                 AND NEW.source_request_id IS NULL
+                 AND (NEW.source_turn_id IS NULL OR EXISTS (
+                     SELECT 1 FROM assistant_cognitive_turns t
+                     WHERE t.id=NEW.source_turn_id AND t.cycle_id=NEW.cycle_id)))
+            )
+            BEGIN SELECT RAISE(ABORT, 'cognitive_wait_invalid_provenance'); END;
+
+            CREATE TRIGGER IF NOT EXISTS trg_cognitive_wait_initial_state
+            BEFORE INSERT ON assistant_cognitive_owner_waits
+            WHEN NEW.state!='pending'
+            BEGIN SELECT RAISE(ABORT, 'cognitive_wait_must_start_pending'); END;
+
+            CREATE TRIGGER IF NOT EXISTS trg_cognitive_wait_identity_immutable
+            BEFORE UPDATE OF public_id, cycle_id, sequence, source_turn_id, reason,
+                source_request_id, created_at
+            ON assistant_cognitive_owner_waits
+            WHEN NEW.public_id!=OLD.public_id OR NEW.cycle_id!=OLD.cycle_id
+              OR NEW.sequence!=OLD.sequence OR NEW.source_turn_id IS NOT OLD.source_turn_id
+              OR NEW.reason!=OLD.reason
+              OR NEW.source_request_id IS NOT OLD.source_request_id
+              OR NEW.created_at!=OLD.created_at
+            BEGIN SELECT RAISE(ABORT, 'cognitive_wait_identity_immutable'); END;
+
+            CREATE TRIGGER IF NOT EXISTS trg_cognitive_wait_transition
+            BEFORE UPDATE OF state ON assistant_cognitive_owner_waits
+            WHEN OLD.state!='pending' OR NEW.state!='resolved'
+            BEGIN SELECT RAISE(ABORT, 'cognitive_wait_invalid_transition'); END;
+
+            CREATE TRIGGER IF NOT EXISTS trg_cognitive_wait_resolution_reason
+            BEFORE UPDATE OF state ON assistant_cognitive_owner_waits
+            WHEN NEW.state='resolved' AND NOT (
+                (NEW.resolution='context_continued' AND OLD.reason IN (
+                    'model_request_human', 'insufficient_evidence',
+                    'model_unavailable', 'model_error', 'malformed_model_output'))
+                OR (NEW.resolution='reasoning_retried' AND OLD.reason IN (
+                    'model_request_human', 'insufficient_evidence',
+                    'model_unavailable', 'model_error', 'malformed_model_output'))
+                OR (NEW.resolution='ordinary_gate_continued'
+                    AND OLD.reason='ordinary_gate_required')
+                OR (NEW.resolution='retry_review_continued'
+                    AND OLD.reason='retry_review_required' AND NEW.gate_id IS NOT NULL)
+                OR (NEW.resolution='replan_declined' AND OLD.reason='replan_requested')
+                OR (NEW.resolution='abandoned_action_continued'
+                    AND OLD.reason='abandoned_before_delegation')
+                OR (NEW.resolution='successor_accepted'
+                    AND OLD.reason='replan_requested')
+                OR NEW.resolution IN ('stopped','cancelled')
+            )
+            BEGIN SELECT RAISE(ABORT, 'cognitive_wait_resolution_reason_mismatch'); END;
+
+            CREATE TRIGGER IF NOT EXISTS trg_cognitive_wait_gate_change
+            BEFORE UPDATE OF gate_id ON assistant_cognitive_owner_waits
+            WHEN NEW.gate_id IS NOT OLD.gate_id AND NOT (
+                OLD.state='pending' AND NEW.state='resolved'
+                AND OLD.reason='retry_review_required' AND OLD.gate_id IS NULL
+                AND NEW.gate_id IS NOT NULL
+                AND NEW.resolution='retry_review_continued'
+                AND EXISTS (SELECT 1 FROM assistant_cognitive_turns t
+                    JOIN assistant_cognitive_cycles c ON c.id=t.cycle_id
+                    JOIN assistant_autonomy_retry_reviews rr
+                      ON rr.gate_id=NEW.gate_id
+                    JOIN assistant_autonomy_human_gates g
+                      ON g.public_id=rr.gate_id
+                    WHERE t.id=OLD.source_turn_id AND t.cycle_id=OLD.cycle_id
+                      AND rr.run_id=c.autonomy_run_id AND rr.step_id=t.step_id
+                      AND rr.source_request_id=OLD.source_request_id
+                      AND g.kind='retry_review' AND g.status='approved'
+                      AND NOT EXISTS (SELECT 1
+                          FROM assistant_autonomy_retry_consumptions rc
+                          WHERE rc.retry_review_id=rr.id))
+            )
+            BEGIN SELECT RAISE(ABORT, 'cognitive_wait_invalid_gate_change'); END;
+
+            CREATE TRIGGER IF NOT EXISTS trg_cognitive_wait_resolved_immutable
+            BEFORE UPDATE ON assistant_cognitive_owner_waits
+            WHEN OLD.state='resolved' AND NOT (
+                OLD.resolution='context_continued'
+                AND OLD.resumed_turn_id IS NULL AND NEW.resumed_turn_id IS NOT NULL
+                AND NEW.public_id=OLD.public_id AND NEW.cycle_id=OLD.cycle_id
+                AND NEW.sequence=OLD.sequence
+                AND NEW.source_turn_id IS OLD.source_turn_id
+                AND NEW.reason=OLD.reason AND NEW.gate_id IS OLD.gate_id
+                AND NEW.source_request_id IS OLD.source_request_id
+                AND NEW.state=OLD.state AND NEW.resolution=OLD.resolution
+                AND NEW.owner_context=OLD.owner_context
+                AND NEW.created_at=OLD.created_at AND NEW.resolved_at=OLD.resolved_at
+                AND NEW.resolved_by=OLD.resolved_by
+            )
+            BEGIN SELECT RAISE(ABORT, 'cognitive_wait_resolved_immutable'); END;
+
+            CREATE TRIGGER IF NOT EXISTS trg_cognitive_wait_resumed_turn
+            BEFORE UPDATE OF resumed_turn_id ON assistant_cognitive_owner_waits
+            WHEN NEW.resumed_turn_id IS NOT OLD.resumed_turn_id AND NOT (
+                OLD.resumed_turn_id IS NULL AND NEW.resumed_turn_id IS NOT NULL
+                AND OLD.state='resolved' AND OLD.resolution='context_continued'
+                AND OLD.source_turn_id IS NOT NULL
+                AND EXISTS (SELECT 1 FROM assistant_cognitive_turns t
+                    WHERE t.id=NEW.resumed_turn_id AND t.cycle_id=OLD.cycle_id
+                      AND t.kind IN ('reason','evaluate') AND t.state='reserved'
+                      AND t.id>OLD.source_turn_id)
+                AND NOT EXISTS (SELECT 1 FROM assistant_cognitive_turns earlier
+                    WHERE earlier.cycle_id=OLD.cycle_id
+                      AND earlier.kind IN ('reason','evaluate')
+                      AND earlier.id>OLD.source_turn_id
+                      AND earlier.id<NEW.resumed_turn_id)
+            )
+            BEGIN SELECT RAISE(ABORT, 'cognitive_wait_invalid_resumed_turn'); END;
+
+            CREATE TRIGGER IF NOT EXISTS trg_cognitive_wait_no_delete
+            BEFORE DELETE ON assistant_cognitive_owner_waits
+            BEGIN SELECT RAISE(ABORT, 'cognitive_wait_immutable'); END;
+
+            CREATE TABLE IF NOT EXISTS assistant_cognitive_successor_handoffs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                public_id TEXT NOT NULL UNIQUE
+                    CHECK(length(public_id) BETWEEN 1 AND 128),
+                request_key TEXT NOT NULL UNIQUE
+                    CHECK(length(request_key) BETWEEN 1 AND 128),
+                wait_id INTEGER NOT NULL,
+                predecessor_cycle_id INTEGER NOT NULL,
+                predecessor_state_sha256 TEXT NOT NULL CHECK(
+                    length(predecessor_state_sha256)=64
+                    AND predecessor_state_sha256 NOT GLOB '*[^0-9a-f]*'),
+                objective TEXT NOT NULL CHECK(length(objective) BETWEEN 1 AND 4000),
+                workspace_root TEXT NOT NULL
+                    CHECK(length(workspace_root) BETWEEN 1 AND 4096),
+                plan_json TEXT NOT NULL CHECK(length(plan_json) BETWEEN 2 AND 262144
+                    AND json_valid(plan_json)),
+                grant_spec_json TEXT NOT NULL CHECK(
+                    length(grant_spec_json) BETWEEN 2 AND 65536
+                    AND json_valid(grant_spec_json)),
+                candidate_sha256 TEXT NOT NULL CHECK(length(candidate_sha256)=64
+                    AND candidate_sha256 NOT GLOB '*[^0-9a-f]*'),
+                status TEXT NOT NULL CHECK(status IN ('proposed','accepted','rejected')),
+                successor_run_id INTEGER UNIQUE,
+                created_at TEXT NOT NULL,
+                resolved_at TEXT,
+                resolved_by TEXT CHECK(resolved_by IS NULL OR
+                    length(resolved_by) BETWEEN 1 AND 200),
+                FOREIGN KEY(wait_id) REFERENCES assistant_cognitive_owner_waits(id)
+                    ON DELETE RESTRICT,
+                FOREIGN KEY(predecessor_cycle_id)
+                    REFERENCES assistant_cognitive_cycles(id) ON DELETE RESTRICT,
+                FOREIGN KEY(successor_run_id) REFERENCES assistant_autonomy_runs(id)
+                    ON DELETE RESTRICT,
+                CHECK((status='proposed' AND successor_run_id IS NULL
+                       AND resolved_at IS NULL AND resolved_by IS NULL)
+                   OR (status='accepted' AND successor_run_id IS NOT NULL
+                       AND resolved_at IS NOT NULL AND resolved_by IS NOT NULL)
+                   OR (status='rejected' AND successor_run_id IS NULL
+                       AND resolved_at IS NOT NULL AND resolved_by IS NOT NULL))
+            );
+
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_cognitive_one_proposed_handoff
+            ON assistant_cognitive_successor_handoffs(wait_id)
+            WHERE status='proposed';
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_cognitive_one_accepted_successor
+            ON assistant_cognitive_successor_handoffs(predecessor_cycle_id)
+            WHERE status='accepted';
+
+            CREATE TRIGGER IF NOT EXISTS trg_cognitive_handoff_cycle_insert
+            BEFORE INSERT ON assistant_cognitive_successor_handoffs
+            WHEN NOT EXISTS (SELECT 1 FROM assistant_cognitive_owner_waits w
+                WHERE w.id=NEW.wait_id AND w.cycle_id=NEW.predecessor_cycle_id
+                  AND w.state='pending' AND w.reason='replan_requested')
+            BEGIN SELECT RAISE(ABORT, 'cognitive_handoff_wait_cycle_mismatch'); END;
+
+            CREATE TRIGGER IF NOT EXISTS trg_cognitive_handoff_initial_state
+            BEFORE INSERT ON assistant_cognitive_successor_handoffs
+            WHEN NEW.status!='proposed'
+            BEGIN SELECT RAISE(ABORT, 'cognitive_handoff_must_start_proposed'); END;
+
+            CREATE TRIGGER IF NOT EXISTS trg_cognitive_handoff_identity_immutable
+            BEFORE UPDATE OF public_id, request_key, wait_id, predecessor_cycle_id,
+                predecessor_state_sha256, objective, workspace_root, plan_json,
+                grant_spec_json, candidate_sha256, created_at
+            ON assistant_cognitive_successor_handoffs
+            WHEN NEW.public_id!=OLD.public_id OR NEW.request_key!=OLD.request_key
+              OR NEW.wait_id!=OLD.wait_id
+              OR NEW.predecessor_cycle_id!=OLD.predecessor_cycle_id
+              OR NEW.predecessor_state_sha256!=OLD.predecessor_state_sha256
+              OR NEW.objective!=OLD.objective OR NEW.workspace_root!=OLD.workspace_root
+              OR NEW.plan_json!=OLD.plan_json OR NEW.grant_spec_json!=OLD.grant_spec_json
+              OR NEW.candidate_sha256!=OLD.candidate_sha256
+              OR NEW.created_at!=OLD.created_at
+            BEGIN SELECT RAISE(ABORT, 'cognitive_handoff_identity_immutable'); END;
+
+            CREATE TRIGGER IF NOT EXISTS trg_cognitive_handoff_transition
+            BEFORE UPDATE OF status ON assistant_cognitive_successor_handoffs
+            WHEN OLD.status!='proposed' OR NEW.status NOT IN ('accepted','rejected')
+            BEGIN SELECT RAISE(ABORT, 'cognitive_handoff_invalid_transition'); END;
+
+            CREATE TRIGGER IF NOT EXISTS trg_cognitive_handoff_resolved_immutable
+            BEFORE UPDATE ON assistant_cognitive_successor_handoffs
+            WHEN OLD.status IN ('accepted','rejected')
+            BEGIN SELECT RAISE(ABORT, 'cognitive_handoff_resolved_immutable'); END;
+
+            CREATE TRIGGER IF NOT EXISTS trg_cognitive_handoff_no_delete
+            BEFORE DELETE ON assistant_cognitive_successor_handoffs
+            BEGIN SELECT RAISE(ABORT, 'cognitive_handoff_immutable'); END;
+            """
+        )
+        Database._backfill_cognitive_owner_waits(connection)
+
+    @staticmethod
+    def _extend_cognitive_turn_dispositions_phase8b1(
+        connection: sqlite3.Connection,
+    ) -> None:
+        table_sql_row = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' "
+            "AND name='assistant_cognitive_turns'"
+        ).fetchone()
+        if table_sql_row is None or "'limit_exhausted'" in str(table_sql_row[0]):
+            return
+        connection.executescript(
+            """
+            PRAGMA foreign_keys=OFF;
+            PRAGMA legacy_alter_table=ON;
+            BEGIN IMMEDIATE;
+            ALTER TABLE assistant_cognitive_turns
+                RENAME TO assistant_cognitive_turns_phase8a;
+            CREATE TABLE assistant_cognitive_turns (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                public_id TEXT NOT NULL UNIQUE
+                    CHECK(length(public_id) BETWEEN 1 AND 128),
+                cycle_id INTEGER NOT NULL,
+                sequence INTEGER NOT NULL CHECK(sequence BETWEEN 1 AND 12),
+                kind TEXT NOT NULL CHECK(kind IN ('reason', 'evaluate', 'act')),
+                state TEXT NOT NULL CHECK(state IN ('reserved', 'completed', 'abandoned')),
+                decision TEXT CHECK(decision IS NULL OR decision IN (
+                    'execute_next', 'request_human', 'insufficient_evidence',
+                    'propose_replan', 'stop'
+                )),
+                disposition TEXT CHECK(disposition IS NULL OR disposition IN (
+                    'model_unavailable', 'authority_blocked', 'incomplete_attempt',
+                    'execution_observed', 'malformed_model_output', 'model_error',
+                    'durable_run_completed', 'limit_exhausted'
+                )),
+                step_id TEXT CHECK(step_id IS NULL OR length(step_id) BETWEEN 1 AND 64),
+                source_request_id TEXT CHECK(source_request_id IS NULL OR
+                    length(source_request_id) BETWEEN 1 AND 128),
+                created_at TEXT NOT NULL,
+                completed_at TEXT,
+                abandoned_at TEXT,
+                FOREIGN KEY(cycle_id)
+                    REFERENCES assistant_cognitive_cycles(id) ON DELETE RESTRICT,
+                FOREIGN KEY(source_request_id)
+                    REFERENCES assistant_autonomy_execution_results(request_id)
+                    ON DELETE RESTRICT,
+                UNIQUE(cycle_id, sequence),
+                CHECK(
+                    (state = 'reserved' AND decision IS NULL AND disposition IS NULL
+                     AND completed_at IS NULL AND abandoned_at IS NULL)
+                    OR
+                    (state = 'completed' AND completed_at IS NOT NULL
+                     AND abandoned_at IS NULL
+                     AND ((kind IN ('reason', 'evaluate') AND
+                           ((decision IS NOT NULL AND disposition IS NULL)
+                            OR (decision IS NULL AND disposition IS NOT NULL)))
+                          OR (kind = 'act' AND decision IS NULL
+                              AND disposition IS NOT NULL)))
+                    OR
+                    (state = 'abandoned' AND decision IS NULL AND disposition IS NULL
+                     AND completed_at IS NULL AND abandoned_at IS NOT NULL)
+                ),
+                CHECK((kind = 'reason' AND source_request_id IS NULL)
+                      OR (kind = 'evaluate' AND source_request_id IS NOT NULL)
+                      OR kind = 'act'),
+                CHECK(disposition != 'execution_observed'
+                      OR source_request_id IS NOT NULL)
+            );
+            INSERT INTO assistant_cognitive_turns
+            SELECT * FROM assistant_cognitive_turns_phase8a;
+            DROP TABLE assistant_cognitive_turns_phase8a;
+            CREATE UNIQUE INDEX idx_cognitive_one_reserved_turn
+            ON assistant_cognitive_turns(cycle_id) WHERE state = 'reserved';
+            CREATE TRIGGER trg_cognitive_turn_identity_immutable
+            BEFORE UPDATE OF public_id, cycle_id, sequence, kind, step_id, created_at
+            ON assistant_cognitive_turns
+            WHEN NEW.public_id != OLD.public_id OR NEW.cycle_id != OLD.cycle_id
+              OR NEW.sequence != OLD.sequence OR NEW.kind != OLD.kind
+              OR NEW.step_id IS NOT OLD.step_id OR NEW.created_at != OLD.created_at
+            BEGIN SELECT RAISE(ABORT, 'cognitive_turn_identity_immutable'); END;
+            CREATE TRIGGER trg_cognitive_turn_resolved_immutable
+            BEFORE UPDATE ON assistant_cognitive_turns
+            WHEN OLD.state != 'reserved'
+            BEGIN SELECT RAISE(ABORT, 'cognitive_turn_resolved_immutable'); END;
+            CREATE TRIGGER trg_cognitive_turn_transition
+            BEFORE UPDATE OF state ON assistant_cognitive_turns
+            WHEN OLD.state != 'reserved' OR NEW.state NOT IN ('completed', 'abandoned')
+            BEGIN SELECT RAISE(ABORT, 'cognitive_turn_invalid_transition'); END;
+            CREATE TRIGGER trg_cognitive_turn_act_source_insert
+            BEFORE INSERT ON assistant_cognitive_turns
+            WHEN NEW.kind = 'act' AND NEW.source_request_id IS NOT NULL
+            BEGIN SELECT RAISE(ABORT, 'cognitive_turn_act_source_requires_resolution'); END;
+            CREATE TRIGGER trg_cognitive_turn_source_immutable
+            BEFORE UPDATE OF source_request_id ON assistant_cognitive_turns
+            WHEN NEW.source_request_id IS NOT OLD.source_request_id
+              AND NOT (
+                  OLD.kind = 'act' AND OLD.state = 'reserved'
+                  AND OLD.source_request_id IS NULL
+                  AND NEW.source_request_id IS NOT NULL AND NEW.state = 'completed'
+                  AND NEW.disposition = 'execution_observed'
+              )
+            BEGIN SELECT RAISE(ABORT, 'cognitive_turn_source_immutable'); END;
+            CREATE TRIGGER trg_cognitive_turn_no_delete
+            BEFORE DELETE ON assistant_cognitive_turns
+            BEGIN SELECT RAISE(ABORT, 'cognitive_turn_immutable'); END;
+            COMMIT;
+            PRAGMA legacy_alter_table=OFF;
+            PRAGMA foreign_keys=ON;
+            """
+        )
+
+    @staticmethod
+    def _backfill_cognitive_owner_waits(connection: sqlite3.Connection) -> None:
+        cycles = connection.execute(
+            """
+            SELECT c.*, r.id AS run_db_id
+            FROM assistant_cognitive_cycles c
+            JOIN assistant_autonomy_runs r ON r.id=c.autonomy_run_id
+            WHERE c.status IN ('waiting_owner','blocked_incomplete')
+              AND NOT EXISTS (SELECT 1 FROM assistant_cognitive_owner_waits w
+                              WHERE w.cycle_id=c.id)
+            ORDER BY c.id
+            """
+        ).fetchall()
+        model_decisions = {
+            "request_human": "model_request_human",
+            "insufficient_evidence": "insufficient_evidence",
+            "propose_replan": "replan_requested",
+        }
+        model_dispositions = {
+            "model_unavailable": "model_unavailable",
+            "model_error": "model_error",
+            "malformed_model_output": "malformed_model_output",
+        }
+        for cycle in cycles:
+            turn = connection.execute(
+                "SELECT * FROM assistant_cognitive_turns WHERE cycle_id=? "
+                "ORDER BY sequence DESC LIMIT 1",
+                (int(cycle["id"]),),
+            ).fetchone()
+            reason = "recovery_required"
+            source_turn_id: int | None = None
+            gate_id: str | None = None
+            source_request_id: str | None = None
+            if turn is not None:
+                source_turn_id = int(turn["id"])
+                kind = str(turn["kind"])
+                if (
+                    str(cycle["status"]) == "blocked_incomplete"
+                    and kind == "act"
+                    and str(turn["disposition"]) == "incomplete_attempt"
+                ):
+                    reason = "incomplete_attempt"
+                elif kind in {"reason", "evaluate"}:
+                    reason = model_decisions.get(
+                        str(turn["decision"]),
+                        model_dispositions.get(str(turn["disposition"]), "recovery_required"),
+                    )
+                    if reason != "recovery_required":
+                        source_request_id = turn["source_request_id"]
+                    elif str(turn["disposition"]) == "authority_blocked":
+                        replans = int(
+                            connection.execute(
+                                "SELECT COUNT(*) FROM assistant_cognitive_turns "
+                                "WHERE cycle_id=? AND state='completed' "
+                                "AND decision='propose_replan'",
+                                (int(cycle["id"]),),
+                            ).fetchone()[0]
+                        )
+                        if replans >= int(cycle["max_replans"]):
+                            reason = "limit_exhausted"
+                            source_request_id = turn["source_request_id"]
+                elif kind == "act" and str(turn["state"]) == "abandoned":
+                    delegated = connection.execute(
+                        "SELECT 1 FROM assistant_cognitive_cycle_events "
+                        "WHERE cycle_id=? AND turn_id=? AND event_type='action_delegated'",
+                        (int(cycle["id"]), source_turn_id),
+                    ).fetchone()
+                    reason = (
+                        "execution_linkage_unknown"
+                        if delegated is not None
+                        else "abandoned_before_delegation"
+                    )
+                elif kind == "act" and str(turn["disposition"]) == "authority_blocked":
+                    blocked_events = connection.execute(
+                        "SELECT gate_id FROM assistant_cognitive_cycle_events "
+                        "WHERE cycle_id=? AND turn_id=? AND event_type='action_blocked'",
+                        (int(cycle["id"]), source_turn_id),
+                    ).fetchall()
+                    candidate_gate = (
+                        str(blocked_events[0]["gate_id"] or "")
+                        if len(blocked_events) == 1
+                        else ""
+                    )
+                    exact_gate = bool(candidate_gate) and connection.execute(
+                        "SELECT 1 FROM assistant_autonomy_human_gates "
+                        "WHERE public_id=? AND run_id=? AND kind!='retry_review'",
+                        (candidate_gate, int(cycle["run_db_id"])),
+                    ).fetchone()
+                    if exact_gate:
+                        reason = "ordinary_gate_required"
+                        gate_id = candidate_gate
+                    else:
+                        results = connection.execute(
+                            "SELECT request_id, outcome "
+                            "FROM assistant_autonomy_execution_results "
+                            "WHERE run_id=? AND step_id=?",
+                            (int(cycle["run_db_id"]), str(turn["step_id"])),
+                        ).fetchall()
+                        exact_result = results[0] if len(results) == 1 else None
+                        if exact_result is not None and str(exact_result["outcome"]) in {
+                            "failed",
+                            "cancelled",
+                        }:
+                            reason = "retry_review_required"
+                            source_request_id = str(exact_result["request_id"])
+                        elif not blocked_events and not results:
+                            actions = int(
+                                connection.execute(
+                                    "SELECT COUNT(*) "
+                                    "FROM assistant_cognitive_cycle_events "
+                                    "WHERE cycle_id=? AND event_type='action_delegated'",
+                                    (int(cycle["id"]),),
+                                ).fetchone()[0]
+                            )
+                            if actions >= int(cycle["max_actions"]):
+                                reason = "limit_exhausted"
+                                source_turn_id = None
+            if reason == "recovery_required":
+                gate_id = None
+                source_request_id = None
+            public_id_material = (
+                b"elyndra.phase8b.owner-wait.v1"
+                + b"\0"
+                + str(cycle["public_id"]).encode("utf-8")
+                + b"\0"
+                + b"1"
+            )
+            public_id = hashlib.sha256(public_id_material).hexdigest()
+            connection.execute(
+                """
+                INSERT INTO assistant_cognitive_owner_waits(
+                    public_id, cycle_id, sequence, source_turn_id, reason, gate_id,
+                    source_request_id, state, resolution, owner_context,
+                    resumed_turn_id, created_at, resolved_at, resolved_by
+                ) VALUES (?, ?, 1, ?, ?, ?, ?, 'pending', NULL, NULL, NULL, ?, NULL, NULL)
+                """,
+                (
+                    public_id,
+                    int(cycle["id"]),
+                    source_turn_id,
+                    reason,
+                    gate_id,
+                    source_request_id,
+                    str(cycle["updated_at"]),
+                ),
+            )
 
     @staticmethod
     def _migrate_autonomy_phase6a3(

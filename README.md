@@ -12,6 +12,20 @@ Its memory, permissions, tools and identity belong to the person running it.
 > Status: `0.8.10-alpha` — local assistant with a deny-by-default controlled HTTPS gateway validated
 > only against deterministic loopback dependencies in Phases 3 and 4.
 
+## Local cognitive action loop — 0.8.10-alpha
+
+The developer-facing autonomy service connects bounded local reasoning to frozen
+`process.exec` plans one supervised action at a time. Bubblewrap remains the sole process
+boundary, durable execution observations remain ground truth, and ordinary conversation never
+starts or continues a cognitive cycle.
+
+Typed owner waits make every continuation explicit. Owner context is bounded, one-shot and
+non-authoritative; reviewed successor proposals bind canonical plan/grant data to immutable hashes.
+Acceptance atomically cancels the predecessor and creates a fresh successor in `PLANNED`, which
+still requires a separate explicit start. Models cannot mint grants, approve gates, expand scope,
+persist chain of thought, learn silently, or gain network, Git/GitHub, background or self-modifying
+authority.
+
 ## Controlled Online Gateway — Phase 4
 
 Phase 4 completes the supervised official-pack acquisition path. Elyndra accepts only its closed,
