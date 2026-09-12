@@ -1021,7 +1021,11 @@ class LocalCognitiveActionLoop:
                 ).fetchone()
                 if (
                     gate is None
-                    or str(gate["kind"]) == HumanGateKind.RETRY_REVIEW.value
+                    or str(gate["kind"])
+                    in {
+                        HumanGateKind.RETRY_REVIEW.value,
+                        HumanGateKind.MUTATION_REVIEW.value,
+                    }
                     or str(gate["status"]) != HumanGateStatus.APPROVED.value
                 ):
                     raise PermissionError("El HumanGate exacto no está aprobado.")

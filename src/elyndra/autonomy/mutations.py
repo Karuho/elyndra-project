@@ -242,6 +242,43 @@ class PersistedMutationProposal:
             raise TypeError("proposal debe ser MutationProposal.")
 
 
+@dataclass(frozen=True, slots=True)
+class MutationReviewRecord:
+    """Bounded public metadata for one exact owner mutation review."""
+
+    proposal_id: str
+    proposal_sha256: str
+    gate_id: str
+    run_id: str
+    step_id: str
+    actor: str
+    gate_status: str
+    created_at: datetime
+    resolved_at: datetime | None
+    resolved_by: str | None
+
+    def __post_init__(self) -> None:
+        _required_exact(self.proposal_id, "proposal_id", 128)
+        _require_sha256(self.proposal_sha256, "proposal_sha256")
+        _required_exact(self.gate_id, "gate_id", 128)
+        _required_exact(self.run_id, "run_id", 128)
+        step_id = _required_exact(self.step_id, "step_id", 64)
+        if not _STEP_ID_RE.fullmatch(step_id):
+            raise ValueError("step_id no tiene el formato canónico esperado.")
+        _required_exact(self.actor, "actor", 200)
+        if self.gate_status not in {"pending", "approved", "rejected", "cancelled"}:
+            raise ValueError("gate_status inválido.")
+        _utc_datetime(self.created_at, "created_at")
+        if self.resolved_at is None:
+            if self.gate_status != "pending" or self.resolved_by is not None:
+                raise ValueError("Review pendiente con resolución inconsistente.")
+        else:
+            _utc_datetime(self.resolved_at, "resolved_at")
+            if self.gate_status == "pending" or self.resolved_by is None:
+                raise ValueError("Review resuelta con metadata inconsistente.")
+            _required_exact(self.resolved_by, "resolved_by", 200)
+
+
 def _validated_relative_path(value: str) -> str:
     if not isinstance(value, str):
         raise TypeError("relative_path debe ser texto.")

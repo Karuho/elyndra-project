@@ -32,6 +32,7 @@ class HumanGateKind(StrEnum):
     REVIEW = "review"
     EXTERNAL_SIDE_EFFECT = "external_side_effect"
     RETRY_REVIEW = "retry_review"
+    MUTATION_REVIEW = "mutation_review"
 
 
 class HumanGateStatus(StrEnum):

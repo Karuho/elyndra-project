@@ -2797,6 +2797,7 @@ class Database:
     def _migrate_autonomy_phase9a(connection: sqlite3.Connection) -> None:
         """Create the final immutable proposal portion of schema 60."""
 
+        Database._extend_human_gate_kinds_phase9a(connection)
         connection.executescript(
             """
             CREATE TABLE IF NOT EXISTS assistant_autonomy_mutation_proposals (
@@ -2886,8 +2887,189 @@ class Database:
             CREATE TRIGGER IF NOT EXISTS trg_autonomy_mutation_items_no_delete
             BEFORE DELETE ON assistant_autonomy_mutation_items
             BEGIN SELECT RAISE(ABORT, 'autonomy_mutation_items_append_only'); END;
+
+            CREATE TABLE IF NOT EXISTS assistant_autonomy_mutation_gate_bindings (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                proposal_id INTEGER NOT NULL UNIQUE,
+                proposal_public_id TEXT NOT NULL UNIQUE
+                    CHECK(length(proposal_public_id) BETWEEN 1 AND 128),
+                proposal_sha256 TEXT NOT NULL
+                    CHECK(length(proposal_sha256) = 64
+                          AND proposal_sha256 NOT GLOB '*[^0-9a-f]*'),
+                gate_id TEXT NOT NULL UNIQUE
+                    CHECK(length(gate_id) BETWEEN 1 AND 128),
+                run_id INTEGER NOT NULL,
+                step_id TEXT NOT NULL
+                    CHECK(length(step_id) BETWEEN 1 AND 64),
+                actor TEXT NOT NULL
+                    CHECK(length(actor) BETWEEN 1 AND 200),
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(proposal_id)
+                    REFERENCES assistant_autonomy_mutation_proposals(id)
+                    ON DELETE RESTRICT,
+                FOREIGN KEY(gate_id)
+                    REFERENCES assistant_autonomy_human_gates(public_id)
+                    ON DELETE RESTRICT,
+                FOREIGN KEY(run_id)
+                    REFERENCES assistant_autonomy_runs(id)
+                    ON DELETE RESTRICT
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_autonomy_mutation_bindings_run_step
+            ON assistant_autonomy_mutation_gate_bindings(run_id, step_id, id DESC);
+
+            CREATE TRIGGER IF NOT EXISTS trg_autonomy_mutation_bindings_integrity
+            BEFORE INSERT ON assistant_autonomy_mutation_gate_bindings
+            WHEN NOT EXISTS (
+                SELECT 1
+                FROM assistant_autonomy_mutation_proposals AS proposal
+                JOIN assistant_autonomy_runs AS run ON run.id = proposal.run_id
+                JOIN assistant_autonomy_human_gates AS gate
+                  ON gate.public_id = NEW.gate_id
+                WHERE proposal.id = NEW.proposal_id
+                  AND proposal.public_id = NEW.proposal_public_id
+                  AND proposal.proposal_sha256 = NEW.proposal_sha256
+                  AND proposal.run_id = NEW.run_id
+                  AND proposal.step_id = NEW.step_id
+                  AND proposal.actor = NEW.actor
+                  AND run.id = NEW.run_id
+                  AND run.actor = NEW.actor
+                  AND gate.run_id = NEW.run_id
+                  AND gate.kind = 'mutation_review'
+                  AND gate.status = 'pending'
+            )
+            BEGIN SELECT RAISE(ABORT, 'autonomy_mutation_binding_invalid'); END;
+
+            CREATE TRIGGER IF NOT EXISTS trg_autonomy_mutation_bindings_no_update
+            BEFORE UPDATE ON assistant_autonomy_mutation_gate_bindings
+            BEGIN SELECT RAISE(ABORT, 'autonomy_mutation_bindings_append_only'); END;
+
+            CREATE TRIGGER IF NOT EXISTS trg_autonomy_mutation_bindings_no_delete
+            BEFORE DELETE ON assistant_autonomy_mutation_gate_bindings
+            BEGIN SELECT RAISE(ABORT, 'autonomy_mutation_bindings_append_only'); END;
             """
         )
+
+    @staticmethod
+    def _extend_human_gate_kinds_phase9a(connection: sqlite3.Connection) -> None:
+        gate_sql = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' "
+            "AND name='assistant_autonomy_human_gates'"
+        ).fetchone()
+        if gate_sql is None or "'mutation_review'" in str(gate_sql[0]):
+            return
+
+        connection.commit()
+        connection.execute("PRAGMA foreign_keys = OFF")
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            dependent_triggers = connection.execute(
+                "SELECT name, sql FROM sqlite_master "
+                "WHERE type='trigger' "
+                "AND tbl_name != 'assistant_autonomy_human_gates' "
+                "AND sql LIKE '%assistant_autonomy_human_gates%'"
+            ).fetchall()
+            for trigger in dependent_triggers:
+                trigger_name = str(trigger[0])
+                if not trigger_name.replace("_", "").isalnum():
+                    raise RuntimeError("Nombre de trigger SQLite inválido.")
+                connection.execute(f'DROP TRIGGER "{trigger_name}"')
+            connection.execute(
+                """
+                CREATE TABLE assistant_autonomy_human_gates_phase9a (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    public_id TEXT NOT NULL UNIQUE
+                        CHECK(length(public_id) BETWEEN 1 AND 128),
+                    run_id INTEGER NOT NULL,
+                    kind TEXT NOT NULL CHECK(kind IN (
+                        'approval', 'review', 'external_side_effect',
+                        'retry_review', 'mutation_review'
+                    )),
+                    status TEXT NOT NULL CHECK(status IN (
+                        'pending', 'approved', 'rejected', 'cancelled'
+                    )),
+                    reason TEXT NOT NULL CHECK(length(reason) BETWEEN 1 AND 2000),
+                    created_at TEXT NOT NULL,
+                    resolved_at TEXT,
+                    resolved_by TEXT CHECK(
+                        resolved_by IS NULL OR length(resolved_by) BETWEEN 1 AND 200
+                    ),
+                    FOREIGN KEY(run_id) REFERENCES assistant_autonomy_runs(id)
+                        ON DELETE RESTRICT,
+                    CHECK((status = 'pending' AND resolved_at IS NULL
+                           AND resolved_by IS NULL)
+                       OR (status IN ('approved', 'rejected', 'cancelled')
+                           AND resolved_at IS NOT NULL AND resolved_by IS NOT NULL))
+                )
+                """
+            )
+            connection.execute(
+                """
+                INSERT INTO assistant_autonomy_human_gates_phase9a(
+                    id, public_id, run_id, kind, status, reason, created_at,
+                    resolved_at, resolved_by
+                )
+                SELECT id, public_id, run_id, kind, status, reason, created_at,
+                       resolved_at, resolved_by
+                FROM assistant_autonomy_human_gates
+                """
+            )
+            connection.execute("DROP TABLE assistant_autonomy_human_gates")
+            connection.execute(
+                "ALTER TABLE assistant_autonomy_human_gates_phase9a "
+                "RENAME TO assistant_autonomy_human_gates"
+            )
+            connection.execute(
+                "CREATE INDEX idx_autonomy_gates_run "
+                "ON assistant_autonomy_human_gates(run_id, id DESC)"
+            )
+            connection.execute(
+                "CREATE UNIQUE INDEX idx_autonomy_one_pending_gate "
+                "ON assistant_autonomy_human_gates(run_id) WHERE status = 'pending'"
+            )
+            connection.execute(
+                """
+                CREATE TRIGGER trg_autonomy_gate_identity_immutable
+                BEFORE UPDATE OF public_id, run_id, kind, reason, created_at
+                ON assistant_autonomy_human_gates
+                WHEN NEW.public_id != OLD.public_id OR NEW.run_id != OLD.run_id
+                  OR NEW.kind != OLD.kind OR NEW.reason != OLD.reason
+                  OR NEW.created_at != OLD.created_at
+                BEGIN SELECT RAISE(ABORT, 'autonomy_gate_identity_immutable'); END
+                """
+            )
+            connection.execute(
+                """
+                CREATE TRIGGER trg_autonomy_gate_resolved_immutable
+                BEFORE UPDATE ON assistant_autonomy_human_gates
+                WHEN OLD.status != 'pending'
+                BEGIN SELECT RAISE(ABORT, 'autonomy_gate_already_resolved'); END
+                """
+            )
+            connection.execute(
+                """
+                CREATE TRIGGER trg_autonomy_gate_resolution_status
+                BEFORE UPDATE OF status ON assistant_autonomy_human_gates
+                WHEN NEW.status NOT IN ('approved', 'rejected', 'cancelled')
+                BEGIN SELECT RAISE(ABORT, 'autonomy_gate_invalid_resolution'); END
+                """
+            )
+            for trigger in dependent_triggers:
+                trigger_sql = trigger[1]
+                if not isinstance(trigger_sql, str) or not trigger_sql.startswith(
+                    "CREATE TRIGGER"
+                ):
+                    raise RuntimeError("SQL de trigger SQLite inválido.")
+                connection.execute(trigger_sql)
+            violations = connection.execute("PRAGMA foreign_key_check").fetchall()
+            if violations:
+                raise RuntimeError("La migración mutation_review rompió foreign keys.")
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.execute("PRAGMA foreign_keys = ON")
 
     @staticmethod
     def _migrate_cognitive_loop_phase8a(connection: sqlite3.Connection) -> None:

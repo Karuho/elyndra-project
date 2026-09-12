@@ -32,6 +32,7 @@ from elyndra.autonomy.mutations import (
     MutationItem,
     MutationOperation,
     MutationProposal,
+    MutationReviewRecord,
     PersistedMutationProposal,
 )
 from elyndra.autonomy.scope import WorkspaceScope
@@ -354,9 +355,9 @@ class AutonomyRepository:
         if rebuilt.actor != clean_actor:
             raise PermissionError("El actor no coincide con la propuesta.")
 
-        now = _utcnow()
         with self.database.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
+            now = _utcnow()
             run = self._owned_run(connection, rebuilt.run_id, actor=clean_actor)
             plan = _plan_from_json(str(run["plan_json"]))
             step = next(
@@ -500,6 +501,377 @@ class AutonomyRepository:
             return [
                 self._mutation_proposal_from_row(connection, row) for row in rows
             ]
+
+    def request_mutation_review(
+        self,
+        proposal_id: str,
+        proposal_sha256: str,
+        *,
+        actor: str,
+    ) -> MutationReviewRecord:
+        """Bind one exact mutation proposal to a specialized owner review."""
+
+        clean_proposal_id = _required_exact(proposal_id, "proposal_id", 128)
+        clean_sha256 = _required_sha256(proposal_sha256, "proposal_sha256")
+        clean_actor = _required_exact(actor, "actor", 200)
+        with self.database.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            now = _utcnow()
+            now_text = now.isoformat()
+            proposal_row = connection.execute(
+                """
+                SELECT * FROM assistant_autonomy_mutation_proposals
+                WHERE public_id = ?
+                """,
+                (clean_proposal_id,),
+            ).fetchone()
+            if proposal_row is None:
+                raise ValueError("MutationProposal no encontrada.")
+            if str(proposal_row["actor"]) != clean_actor:
+                raise PermissionError("El actor no es propietario de la propuesta.")
+            proposal_record = self._mutation_proposal_from_row(
+                connection, proposal_row
+            )
+            if not hmac.compare_digest(
+                proposal_record.proposal.proposal_sha256,
+                clean_sha256,
+            ):
+                raise PermissionError("SHA-256 de propuesta incorrecto.")
+
+            binding = connection.execute(
+                """
+                SELECT * FROM assistant_autonomy_mutation_gate_bindings
+                WHERE proposal_id = ?
+                """,
+                (int(proposal_row["id"]),),
+            ).fetchone()
+            if binding is not None:
+                return self._mutation_review_from_row(connection, binding)
+
+            run = self._owned_run(
+                connection,
+                proposal_record.proposal.run_id,
+                actor=clean_actor,
+            )
+            if str(run["status"]) != AutonomyRunStatus.RUNNING.value:
+                raise PermissionError(
+                    "Solo un AutonomyRun running puede solicitar mutation review."
+                )
+            plan = _plan_from_json(str(run["plan_json"]))
+            step = self._first_incomplete_plan_step_connection(
+                connection,
+                run_db_id=int(run["id"]),
+                plan=plan,
+            )
+            if (
+                step is None
+                or step.step_id != proposal_record.proposal.step_id
+                or step.capability is not Capability.SELF_MODIFY
+            ):
+                raise PermissionError(
+                    "La propuesta no apunta al primer step incompleto self.modify."
+                )
+            grant = _grant_from_json(str(run["grant_json"]))
+            grant.require(Capability.SELF_MODIFY, at=now)
+            if proposal_record.proposal.expires_at <= now:
+                raise PermissionError("La propuesta de mutación expiró.")
+            if proposal_record.proposal.expires_at > grant.expires_at:
+                raise PermissionError("La propuesta excede la vigencia del grant.")
+            if proposal_record.proposal.workspace_root != str(run["workspace_root"]):
+                raise PermissionError("El workspace de la propuesta no coincide.")
+            self._require_no_execution_gap_connection(
+                connection,
+                proposal_record.proposal.run_id,
+                actor=clean_actor,
+            )
+            if connection.execute(
+                """
+                SELECT 1 FROM assistant_autonomy_human_gates
+                WHERE run_id = ? AND status = 'pending'
+                """,
+                (int(run["id"]),),
+            ).fetchone() is not None:
+                raise PermissionError("El run ya tiene un HumanGate pendiente.")
+
+            gate_id = uuid.uuid4().hex
+            reason = "Revisión exacta requerida para propuesta de mutación."
+            connection.execute(
+                """
+                INSERT INTO assistant_autonomy_human_gates(
+                    public_id, run_id, kind, status, reason, created_at,
+                    resolved_at, resolved_by
+                ) VALUES (?, ?, 'mutation_review', 'pending', ?, ?, NULL, NULL)
+                """,
+                (gate_id, int(run["id"]), reason, now_text),
+            )
+            connection.execute(
+                """
+                INSERT INTO assistant_autonomy_mutation_gate_bindings(
+                    proposal_id, proposal_public_id, proposal_sha256, gate_id,
+                    run_id, step_id, actor, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    int(proposal_row["id"]),
+                    clean_proposal_id,
+                    clean_sha256,
+                    gate_id,
+                    int(run["id"]),
+                    proposal_record.proposal.step_id,
+                    clean_actor,
+                    now_text,
+                ),
+            )
+            self._set_status(
+                connection,
+                run,
+                AutonomyRunStatus.WAITING_HUMAN,
+                now=now_text,
+            )
+            self._insert_event(
+                connection,
+                run_db_id=int(run["id"]),
+                event_type="mutation_review_requested",
+                from_status=AutonomyRunStatus.RUNNING,
+                to_status=AutonomyRunStatus.WAITING_HUMAN,
+                summary="Revisión owner de mutación solicitada.",
+                payload={
+                    "proposal_id": clean_proposal_id,
+                    "proposal_sha256": clean_sha256,
+                    "gate_id": gate_id,
+                    "step_id": proposal_record.proposal.step_id,
+                    "state": HumanGateStatus.PENDING.value,
+                },
+                created_at=now_text,
+                step_id=proposal_record.proposal.step_id,
+            )
+            binding = connection.execute(
+                """
+                SELECT * FROM assistant_autonomy_mutation_gate_bindings
+                WHERE proposal_id = ?
+                """,
+                (int(proposal_row["id"]),),
+            ).fetchone()
+            assert binding is not None
+            return self._mutation_review_from_row(connection, binding)
+
+    def resolve_mutation_review(
+        self,
+        proposal_id: str,
+        proposal_sha256: str,
+        gate_id: str,
+        *,
+        actor: str,
+        decision: HumanGateStatus | str,
+    ) -> MutationReviewRecord:
+        """Resolve one exact mutation review without generic approval semantics."""
+
+        try:
+            resolution = HumanGateStatus(decision)
+        except ValueError as exc:
+            raise ValueError("Resolución de mutation review inválida.") from exc
+        if resolution is HumanGateStatus.PENDING:
+            raise ValueError("pending no resuelve una mutation review.")
+        clean_proposal_id = _required_exact(proposal_id, "proposal_id", 128)
+        clean_sha256 = _required_sha256(proposal_sha256, "proposal_sha256")
+        clean_gate_id = _required_exact(gate_id, "gate_id", 128)
+        clean_actor = _required_exact(actor, "actor", 200)
+
+        with self.database.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            binding = connection.execute(
+                """
+                SELECT binding.*
+                FROM assistant_autonomy_mutation_gate_bindings AS binding
+                JOIN assistant_autonomy_mutation_proposals AS proposal
+                  ON proposal.id = binding.proposal_id
+                WHERE proposal.public_id = ?
+                """,
+                (clean_proposal_id,),
+            ).fetchone()
+            if binding is None:
+                raise ValueError("Mutation review no encontrada.")
+            review = self._mutation_review_from_row(connection, binding)
+            if review.actor != clean_actor:
+                raise PermissionError("El actor no es propietario de la review.")
+            if not hmac.compare_digest(review.proposal_sha256, clean_sha256):
+                raise PermissionError("SHA-256 de propuesta incorrecto.")
+            if review.gate_id != clean_gate_id:
+                raise PermissionError("HumanGate no coincide con la review exacta.")
+
+            current = HumanGateStatus(review.gate_status)
+            if current is not HumanGateStatus.PENDING:
+                if current is resolution:
+                    return review
+                raise PermissionError("Mutation review ya resuelta con otra decisión.")
+
+            run = self._owned_run(connection, review.run_id, actor=clean_actor)
+            if str(run["status"]) != AutonomyRunStatus.WAITING_HUMAN.value:
+                raise PermissionError("El run no está waiting_human para esta review.")
+
+            proposal_row = connection.execute(
+                """
+                SELECT * FROM assistant_autonomy_mutation_proposals
+                WHERE id = ?
+                """,
+                (int(binding["proposal_id"]),),
+            ).fetchone()
+            assert proposal_row is not None
+            proposal = self._mutation_proposal_from_row(
+                connection, proposal_row
+            ).proposal
+            now = _utcnow()
+            now_text = now.isoformat()
+            if resolution is HumanGateStatus.APPROVED:
+                grant = _grant_from_json(str(run["grant_json"]))
+                grant.require(Capability.SELF_MODIFY, at=now)
+                if proposal.expires_at <= now:
+                    raise PermissionError("La propuesta de mutación expiró.")
+                if proposal.expires_at > grant.expires_at:
+                    raise PermissionError("La propuesta excede la vigencia del grant.")
+
+            connection.execute(
+                """
+                UPDATE assistant_autonomy_human_gates
+                SET status = ?, resolved_at = ?, resolved_by = ?
+                WHERE public_id = ? AND status = 'pending'
+                """,
+                (resolution.value, now_text, clean_actor, clean_gate_id),
+            )
+            target = (
+                AutonomyRunStatus.WAITING_HUMAN
+                if resolution is HumanGateStatus.APPROVED
+                else AutonomyRunStatus.CANCELLED
+            )
+            if target is AutonomyRunStatus.CANCELLED:
+                self._set_status(connection, run, target, now=now_text)
+            self._insert_event(
+                connection,
+                run_db_id=int(run["id"]),
+                event_type=f"mutation_review_{resolution.value}",
+                from_status=AutonomyRunStatus.WAITING_HUMAN,
+                to_status=target,
+                summary=f"Mutation review {resolution.value} por el propietario.",
+                payload={
+                    "proposal_id": clean_proposal_id,
+                    "proposal_sha256": clean_sha256,
+                    "gate_id": clean_gate_id,
+                    "step_id": review.step_id,
+                    "decision": resolution.value,
+                },
+                created_at=now_text,
+                step_id=review.step_id,
+            )
+            refreshed = connection.execute(
+                """
+                SELECT * FROM assistant_autonomy_mutation_gate_bindings
+                WHERE id = ?
+                """,
+                (int(binding["id"]),),
+            ).fetchone()
+            assert refreshed is not None
+            return self._mutation_review_from_row(connection, refreshed)
+
+    @staticmethod
+    def _first_incomplete_plan_step_connection(
+        connection: sqlite3.Connection,
+        *,
+        run_db_id: int,
+        plan: RunPlan,
+    ) -> RunStep | None:
+        succeeded = {
+            str(row["step_id"])
+            for row in connection.execute(
+                "SELECT step_id FROM assistant_autonomy_execution_results "
+                "WHERE run_id = ? AND outcome = 'succeeded'",
+                (run_db_id,),
+            ).fetchall()
+        }
+        return next(
+            (step for step in plan.steps if step.step_id not in succeeded),
+            None,
+        )
+
+    @staticmethod
+    def _mutation_review_from_row(
+        connection: sqlite3.Connection,
+        binding: sqlite3.Row,
+    ) -> MutationReviewRecord:
+        try:
+            row = connection.execute(
+                """
+                SELECT proposal.public_id, proposal.proposal_sha256,
+                       proposal.run_id AS proposal_run_id,
+                       proposal.step_id AS proposal_step_id,
+                       proposal.actor AS proposal_actor,
+                       gate.public_id AS gate_public_id,
+                       gate.run_id AS gate_run_id, gate.kind, gate.status,
+                       gate.created_at AS gate_created_at,
+                       gate.resolved_at, gate.resolved_by,
+                       run.public_id AS run_public_id, run.actor AS run_actor
+                FROM assistant_autonomy_mutation_proposals AS proposal
+                JOIN assistant_autonomy_human_gates AS gate
+                  ON gate.public_id = ?
+                JOIN assistant_autonomy_runs AS run ON run.id = proposal.run_id
+                WHERE proposal.id = ?
+                """,
+                (str(binding["gate_id"]), int(binding["proposal_id"])),
+            ).fetchone()
+            if row is None:
+                raise ValueError("binding subject missing")
+            exact = (
+                str(binding["proposal_public_id"]) == str(row["public_id"])
+                and hmac.compare_digest(
+                    str(binding["proposal_sha256"]),
+                    str(row["proposal_sha256"]),
+                )
+                and int(binding["run_id"]) == int(row["proposal_run_id"])
+                and int(binding["run_id"]) == int(row["gate_run_id"])
+                and str(binding["step_id"]) == str(row["proposal_step_id"])
+                and str(binding["actor"]) == str(row["proposal_actor"])
+                and str(binding["actor"]) == str(row["run_actor"])
+                and str(row["kind"]) == HumanGateKind.MUTATION_REVIEW.value
+                and str(binding["created_at"]) == str(row["gate_created_at"])
+            )
+            if not exact:
+                raise ValueError("binding lineage mismatch")
+            proposal_row = connection.execute(
+                "SELECT * FROM assistant_autonomy_mutation_proposals WHERE id = ?",
+                (int(binding["proposal_id"]),),
+            ).fetchone()
+            assert proposal_row is not None
+            proposal = AutonomyRepository._mutation_proposal_from_row(
+                connection, proposal_row
+            ).proposal
+            if not hmac.compare_digest(
+                proposal.proposal_sha256,
+                str(binding["proposal_sha256"]),
+            ):
+                raise ValueError("binding proposal mismatch")
+            return MutationReviewRecord(
+                proposal_id=str(row["public_id"]),
+                proposal_sha256=str(row["proposal_sha256"]),
+                gate_id=str(row["gate_public_id"]),
+                run_id=str(row["run_public_id"]),
+                step_id=str(binding["step_id"]),
+                actor=str(binding["actor"]),
+                gate_status=str(row["status"]),
+                created_at=_parse_iso_datetime(
+                    row["gate_created_at"], "gate_created_at"
+                ),
+                resolved_at=(
+                    None
+                    if row["resolved_at"] is None
+                    else _parse_iso_datetime(row["resolved_at"], "resolved_at")
+                ),
+                resolved_by=(
+                    None if row["resolved_by"] is None else str(row["resolved_by"])
+                ),
+            )
+        except (IndexError, TypeError, ValueError) as exc:
+            raise PermissionError(
+                "Mutation review durable inconsistente; acceso denegado."
+            ) from exc
 
     @staticmethod
     def _mutation_proposal_from_row(
@@ -757,6 +1129,22 @@ class AutonomyRepository:
                 actor=actor,
                 summary=summary,
                 now=changed_at,
+            )
+        if connection.execute(
+            """
+            SELECT 1
+            FROM assistant_autonomy_mutation_gate_bindings AS binding
+            JOIN assistant_autonomy_human_gates AS gate
+              ON gate.public_id = binding.gate_id
+            WHERE binding.run_id = ?
+              AND gate.run_id = binding.run_id
+              AND gate.status IN ('pending', 'approved')
+            LIMIT 1
+            """,
+            (int(row["id"]),),
+        ).fetchone() is not None:
+            raise PermissionError(
+                "Mutation review requiere resolución especializada."
             )
         gates = connection.execute(
             "SELECT * FROM assistant_autonomy_human_gates "
@@ -1186,9 +1574,12 @@ class AutonomyRepository:
         except ValueError as exc:
             raise ValueError("Tipo de HumanGate inválido.") from exc
 
-        if clean_kind is HumanGateKind.RETRY_REVIEW:
+        if clean_kind in {
+            HumanGateKind.RETRY_REVIEW,
+            HumanGateKind.MUTATION_REVIEW,
+        }:
             raise PermissionError(
-                "retry_review solo puede crearse mediante request_retry_review."
+                "El HumanGate especializado requiere su operación dedicada."
             )
 
         clean_reason = _required(reason, "reason", 2_000)
@@ -1396,6 +1787,11 @@ class AutonomyRepository:
             if str(gate["run_actor"]) != clean_actor:
                 raise PermissionError(
                     "El actor no puede resolver un HumanGate de otro propietario."
+                )
+
+            if str(gate["kind"]) == HumanGateKind.MUTATION_REVIEW.value:
+                raise PermissionError(
+                    "mutation_review solo admite resolución especializada."
                 )
 
             if str(gate["status"]) != HumanGateStatus.PENDING.value:
@@ -2918,7 +3314,10 @@ class AutonomyRepository:
                     "Audit de solicitud de HumanGate con kind inválido."
                 ) from exc
 
-            if audited_kind is HumanGateKind.RETRY_REVIEW:
+            if audited_kind in {
+                HumanGateKind.RETRY_REVIEW,
+                HumanGateKind.MUTATION_REVIEW,
+            }:
                 continue
 
             gate = connection.execute(
@@ -3453,6 +3852,13 @@ def _required_exact(value: str, label: str, maximum: int) -> str:
     if len(value) > maximum:
         raise ValueError(f"{label} supera el máximo de {maximum} caracteres.")
     return value
+
+
+def _required_sha256(value: str, label: str) -> str:
+    clean = _required_exact(value, label, 64)
+    if len(clean) != 64 or any(character not in "0123456789abcdef" for character in clean):
+        raise ValueError(f"{label} debe ser SHA-256 hexadecimal minúsculo.")
+    return clean
 
 
 def _require_grant_active_json(encoded: str) -> None:

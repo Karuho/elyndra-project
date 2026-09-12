@@ -171,7 +171,7 @@ def test_schema_58_is_vault_only_idempotent_and_preserves_schema_57(tmp_path: Pa
     with database.connect() as connection:
         assert connection.execute(
             "SELECT value FROM schema_meta WHERE key='schema_version'"
-        ).fetchone()[0] == "59"
+        ).fetchone()[0] == "60"
 
 
 def test_schema_constraints_immutability_and_append_only(tmp_path: Path) -> None:

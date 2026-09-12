@@ -130,9 +130,18 @@ def test_schema_50_vault_upgrade_preserves_existing_data(tmp_path: Path) -> None
             """
         )
 
-        connection.execute("DROP TABLE assistant_autonomy_human_gates")
-        connection.execute("DROP TABLE assistant_autonomy_events")
-        connection.execute("DROP TABLE assistant_autonomy_runs")
+        connection.commit()
+        connection.execute("PRAGMA foreign_keys=OFF")
+        newer_tables = connection.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' "
+            "AND (name LIKE 'assistant_autonomy_%' "
+            "OR name LIKE 'assistant_cognitive_%')"
+        ).fetchall()
+        for table in newer_tables:
+            name = str(table[0])
+            assert name.replace("_", "").isalnum()
+            connection.execute(f'DROP TABLE "{name}"')
+        connection.execute("PRAGMA foreign_keys=ON")
         connection.execute(
             """
             UPDATE schema_meta

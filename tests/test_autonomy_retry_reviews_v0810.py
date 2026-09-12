@@ -595,6 +595,9 @@ def test_exact_schema_56_upgrade_preserves_data_without_fake_reviews(
         )
         connection.executescript(
             """
+            DROP TABLE assistant_autonomy_mutation_gate_bindings;
+            DROP TABLE assistant_autonomy_mutation_items;
+            DROP TABLE assistant_autonomy_mutation_proposals;
             DROP TABLE assistant_cognitive_successor_handoffs;
             DROP TABLE assistant_cognitive_owner_waits;
             DROP TABLE assistant_cognitive_cycle_events;
@@ -660,7 +663,7 @@ def test_exact_schema_56_upgrade_preserves_data_without_fake_reviews(
     with database.connect() as connection:
         assert connection.execute(
             "SELECT value FROM schema_meta WHERE key='schema_version'"
-        ).fetchone()[0] == "59"
+        ).fetchone()[0] == "60"
         assert connection.execute(
             "SELECT COUNT(*) FROM assistant_autonomy_retry_reviews"
         ).fetchone()[0] == 0
