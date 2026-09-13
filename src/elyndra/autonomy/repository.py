@@ -1198,144 +1198,118 @@ class AutonomyRepository:
         clean_actor = _required_exact(actor, "actor", 200)
         with self.database.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
-            now = _utcnow()
-            now_text = now.isoformat()
-            proposal_row = connection.execute(
-                """
-                SELECT * FROM assistant_autonomy_mutation_proposals
-                WHERE public_id = ?
-                """,
-                (clean_proposal_id,),
-            ).fetchone()
-            if proposal_row is None:
-                raise ValueError("MutationProposal no encontrada.")
-            if str(proposal_row["actor"]) != clean_actor:
-                raise PermissionError("El actor no es propietario de la propuesta.")
-            proposal_record = self._mutation_proposal_from_row(
-                connection, proposal_row
-            )
-            if not hmac.compare_digest(
-                proposal_record.proposal.proposal_sha256,
-                clean_sha256,
-            ):
-                raise PermissionError("SHA-256 de propuesta incorrecto.")
-
-            binding = connection.execute(
-                """
-                SELECT * FROM assistant_autonomy_mutation_gate_bindings
-                WHERE proposal_id = ?
-                """,
-                (int(proposal_row["id"]),),
-            ).fetchone()
-            if binding is not None:
-                return self._mutation_review_from_row(connection, binding)
-
-            run = self._owned_run(
+            return self._request_mutation_review_connection(
                 connection,
-                proposal_record.proposal.run_id,
+                proposal_id=clean_proposal_id,
+                proposal_sha256=clean_sha256,
                 actor=clean_actor,
+                now=_utcnow(),
             )
-            if str(run["status"]) != AutonomyRunStatus.RUNNING.value:
-                raise PermissionError(
-                    "Solo un AutonomyRun running puede solicitar mutation review."
-                )
-            plan = _plan_from_json(str(run["plan_json"]))
-            step = self._first_incomplete_plan_step_connection(
-                connection,
-                run_db_id=int(run["id"]),
-                plan=plan,
-            )
-            if (
-                step is None
-                or step.step_id != proposal_record.proposal.step_id
-                or step.capability is not Capability.SELF_MODIFY
-            ):
-                raise PermissionError(
-                    "La propuesta no apunta al primer step incompleto self.modify."
-                )
-            grant = _grant_from_json(str(run["grant_json"]))
-            grant.require(Capability.SELF_MODIFY, at=now)
-            if proposal_record.proposal.expires_at <= now:
-                raise PermissionError("La propuesta de mutación expiró.")
-            if proposal_record.proposal.expires_at > grant.expires_at:
-                raise PermissionError("La propuesta excede la vigencia del grant.")
-            if proposal_record.proposal.workspace_root != str(run["workspace_root"]):
-                raise PermissionError("El workspace de la propuesta no coincide.")
-            self._require_no_execution_gap_connection(
-                connection,
-                proposal_record.proposal.run_id,
-                actor=clean_actor,
-            )
-            if connection.execute(
-                """
-                SELECT 1 FROM assistant_autonomy_human_gates
-                WHERE run_id = ? AND status = 'pending'
-                """,
-                (int(run["id"]),),
-            ).fetchone() is not None:
-                raise PermissionError("El run ya tiene un HumanGate pendiente.")
 
-            gate_id = uuid.uuid4().hex
-            reason = "Revisión exacta requerida para propuesta de mutación."
-            connection.execute(
-                """
-                INSERT INTO assistant_autonomy_human_gates(
-                    public_id, run_id, kind, status, reason, created_at,
-                    resolved_at, resolved_by
-                ) VALUES (?, ?, 'mutation_review', 'pending', ?, ?, NULL, NULL)
-                """,
-                (gate_id, int(run["id"]), reason, now_text),
-            )
-            connection.execute(
-                """
-                INSERT INTO assistant_autonomy_mutation_gate_bindings(
-                    proposal_id, proposal_public_id, proposal_sha256, gate_id,
-                    run_id, step_id, actor, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    int(proposal_row["id"]),
-                    clean_proposal_id,
-                    clean_sha256,
-                    gate_id,
-                    int(run["id"]),
-                    proposal_record.proposal.step_id,
-                    clean_actor,
-                    now_text,
-                ),
-            )
-            self._set_status(
-                connection,
-                run,
-                AutonomyRunStatus.WAITING_HUMAN,
-                now=now_text,
-            )
-            self._insert_event(
-                connection,
-                run_db_id=int(run["id"]),
-                event_type="mutation_review_requested",
-                from_status=AutonomyRunStatus.RUNNING,
-                to_status=AutonomyRunStatus.WAITING_HUMAN,
-                summary="Revisión owner de mutación solicitada.",
-                payload={
-                    "proposal_id": clean_proposal_id,
-                    "proposal_sha256": clean_sha256,
-                    "gate_id": gate_id,
-                    "step_id": proposal_record.proposal.step_id,
-                    "state": HumanGateStatus.PENDING.value,
-                },
-                created_at=now_text,
-                step_id=proposal_record.proposal.step_id,
-            )
-            binding = connection.execute(
-                """
-                SELECT * FROM assistant_autonomy_mutation_gate_bindings
-                WHERE proposal_id = ?
-                """,
-                (int(proposal_row["id"]),),
-            ).fetchone()
-            assert binding is not None
+    def _request_mutation_review_connection(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        proposal_id: str,
+        proposal_sha256: str,
+        actor: str,
+        now: datetime,
+    ) -> MutationReviewRecord:
+        """Bind one exact proposal inside the caller-owned transaction."""
+
+        now_text = now.isoformat()
+        proposal_row = connection.execute(
+            "SELECT * FROM assistant_autonomy_mutation_proposals WHERE public_id=?",
+            (proposal_id,),
+        ).fetchone()
+        if proposal_row is None:
+            raise ValueError("MutationProposal no encontrada.")
+        proposal_record = self._mutation_proposal_from_row(connection, proposal_row)
+        proposal = proposal_record.proposal
+        if proposal.actor != actor:
+            raise PermissionError("El actor no es propietario de la propuesta.")
+        if not hmac.compare_digest(proposal.proposal_sha256, proposal_sha256):
+            raise PermissionError("SHA-256 de propuesta incorrecto.")
+        binding = connection.execute(
+            "SELECT * FROM assistant_autonomy_mutation_gate_bindings WHERE proposal_id=?",
+            (int(proposal_row["id"]),),
+        ).fetchone()
+        if binding is not None:
             return self._mutation_review_from_row(connection, binding)
+        run = self._owned_run(connection, proposal.run_id, actor=actor)
+        if str(run["status"]) != AutonomyRunStatus.RUNNING.value:
+            raise PermissionError("Solo un AutonomyRun running puede solicitar mutation review.")
+        plan = _plan_from_json(str(run["plan_json"]))
+        step = self._first_incomplete_plan_step_connection(
+            connection, run_db_id=int(run["id"]), plan=plan
+        )
+        if (
+            step is None
+            or step.step_id != proposal.step_id
+            or step.capability is not Capability.SELF_MODIFY
+        ):
+            raise PermissionError(
+                "La propuesta no apunta al primer step incompleto self.modify."
+            )
+        grant = _grant_from_json(str(run["grant_json"]))
+        grant.require(Capability.SELF_MODIFY, at=now)
+        if proposal.expires_at <= now:
+            raise PermissionError("La propuesta de mutación expiró.")
+        if proposal.expires_at > grant.expires_at:
+            raise PermissionError("La propuesta excede la vigencia del grant.")
+        if proposal.workspace_root != str(run["workspace_root"]):
+            raise PermissionError("El workspace de la propuesta no coincide.")
+        self._require_no_execution_gap_connection(connection, proposal.run_id, actor=actor)
+        if connection.execute(
+            "SELECT 1 FROM assistant_autonomy_human_gates "
+            "WHERE run_id=? AND status='pending'",
+            (int(run["id"]),),
+        ).fetchone() is not None:
+            raise PermissionError("El run ya tiene un HumanGate pendiente.")
+        gate_id = uuid.uuid4().hex
+        reason = "Revisión exacta requerida para propuesta de mutación."
+        connection.execute(
+            """INSERT INTO assistant_autonomy_human_gates(
+                   public_id,run_id,kind,status,reason,created_at,resolved_at,resolved_by)
+               VALUES (?,?,'mutation_review','pending',?,?,NULL,NULL)""",
+            (gate_id, int(run["id"]), reason, now_text),
+        )
+        connection.execute(
+            """INSERT INTO assistant_autonomy_mutation_gate_bindings(
+                   proposal_id,proposal_public_id,proposal_sha256,gate_id,
+                   run_id,step_id,actor,created_at)
+               VALUES (?,?,?,?,?,?,?,?)""",
+            (
+                int(proposal_row["id"]), proposal_id, proposal_sha256, gate_id,
+                int(run["id"]), proposal.step_id, actor, now_text,
+            ),
+        )
+        self._set_status(
+            connection, run, AutonomyRunStatus.WAITING_HUMAN, now=now_text
+        )
+        self._insert_event(
+            connection,
+            run_db_id=int(run["id"]),
+            event_type="mutation_review_requested",
+            from_status=AutonomyRunStatus.RUNNING,
+            to_status=AutonomyRunStatus.WAITING_HUMAN,
+            summary="Revisión owner de mutación solicitada.",
+            payload={
+                "proposal_id": proposal_id,
+                "proposal_sha256": proposal_sha256,
+                "gate_id": gate_id,
+                "step_id": proposal.step_id,
+                "state": HumanGateStatus.PENDING.value,
+            },
+            created_at=now_text,
+            step_id=proposal.step_id,
+        )
+        binding = connection.execute(
+            "SELECT * FROM assistant_autonomy_mutation_gate_bindings WHERE proposal_id=?",
+            (int(proposal_row["id"]),),
+        ).fetchone()
+        assert binding is not None
+        return self._mutation_review_from_row(connection, binding)
 
     def resolve_mutation_review(
         self,
@@ -1455,24 +1429,61 @@ class AutonomyRepository:
             return self._mutation_review_from_row(connection, refreshed)
 
     @staticmethod
+    def _plan_step_complete_connection(
+        connection: sqlite3.Connection,
+        *,
+        run_db_id: int,
+        step: RunStep,
+    ) -> bool:
+        if step.capability is Capability.PROCESS_EXEC:
+            return connection.execute(
+                "SELECT 1 FROM assistant_autonomy_execution_results "
+                "WHERE run_id=? AND step_id=? AND outcome='succeeded' LIMIT 1",
+                (run_db_id, step.step_id),
+            ).fetchone() is not None
+        if step.capability is Capability.SELF_MODIFY:
+            return connection.execute(
+                """SELECT 1
+                   FROM assistant_autonomy_mutation_attempts AS attempt
+                   JOIN assistant_autonomy_mutation_results AS result
+                     ON result.attempt_id=attempt.id
+                   WHERE attempt.run_id=? AND attempt.step_id=?
+                     AND attempt.state='succeeded' AND attempt.terminal_at IS NOT NULL
+                     AND result.outcome='filesystem_succeeded'
+                   LIMIT 1""",
+                (run_db_id, step.step_id),
+            ).fetchone() is not None
+        return False
+
+    @classmethod
     def _first_incomplete_plan_step_connection(
+        cls,
         connection: sqlite3.Connection,
         *,
         run_db_id: int,
         plan: RunPlan,
     ) -> RunStep | None:
-        succeeded = {
-            str(row["step_id"])
-            for row in connection.execute(
-                "SELECT step_id FROM assistant_autonomy_execution_results "
-                "WHERE run_id = ? AND outcome = 'succeeded'",
-                (run_db_id,),
-            ).fetchall()
-        }
         return next(
-            (step for step in plan.steps if step.step_id not in succeeded),
+            (
+                step
+                for step in plan.steps
+                if not cls._plan_step_complete_connection(
+                    connection, run_db_id=run_db_id, step=step
+                )
+            ),
             None,
         )
+
+    def first_incomplete_plan_step(self, run_id: str, *, actor: str) -> RunStep | None:
+        """Return the first incomplete frozen step using capability-aware evidence."""
+
+        with self.database.connect() as connection:
+            run = self._owned_run(connection, run_id, actor=actor)
+            return self._first_incomplete_plan_step_connection(
+                connection,
+                run_db_id=int(run["id"]),
+                plan=_plan_from_json(str(run["plan_json"])),
+            )
 
     @staticmethod
     def _mutation_review_from_row(
@@ -3420,29 +3431,11 @@ class AutonomyRepository:
             if unresolved is not None:
                 return False
 
-            successful_rows = connection.execute(
-                """
-                SELECT DISTINCT step_id
-                FROM assistant_autonomy_execution_results
-                WHERE
-                    run_id = ?
-                    AND outcome = ?
-                """,
-                (
-                    int(run_row["id"]),
-                    ExecutionOutcome.SUCCEEDED.value,
-                ),
-            ).fetchall()
-
-            succeeded = {
-                str(row["step_id"])
-                for row in successful_rows
-            }
-
-            if not all(
-                step.step_id in succeeded
-                for step in plan.steps
-            ):
+            if self._first_incomplete_plan_step_connection(
+                connection,
+                run_db_id=int(run_row["id"]),
+                plan=plan,
+            ) is not None:
                 return False
 
             now = _now()
@@ -3467,7 +3460,7 @@ class AutonomyRepository:
                 ),
                 payload={
                     "completion_basis": (
-                        "durable_execution_results"
+                        "durable_capability_results"
                     )
                 },
                 created_at=now,

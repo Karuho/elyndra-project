@@ -14,6 +14,11 @@ def _schema58(tmp_path: Path) -> Database:
     with database.connect() as connection:
         connection.executescript(
             """
+            DROP TRIGGER IF EXISTS trg_cognitive_mutation_evaluate_source;
+            DROP TRIGGER IF EXISTS trg_cognitive_mutation_handoff_integrity;
+            DROP TRIGGER IF EXISTS trg_cognitive_mutation_handoff_no_update;
+            DROP TRIGGER IF EXISTS trg_cognitive_mutation_handoff_no_delete;
+            DROP TABLE IF EXISTS assistant_cognitive_mutation_handoffs;
             DROP TABLE assistant_cognitive_successor_handoffs;
             DROP TABLE assistant_cognitive_owner_waits;
             UPDATE schema_meta SET value='58' WHERE key='schema_version';
@@ -27,6 +32,9 @@ def _schema58(tmp_path: Path) -> Database:
         )
         assert "'limit_exhausted'" in turn_sql
         historical_sql = turn_sql.replace(
+            ",\n                    'mutation_review_requested'",
+            "",
+        ).replace(
             ", 'limit_exhausted'\n                ))",
             "\n                ))",
         )
@@ -235,7 +243,7 @@ def test_schema59_is_vault_only_preserves_58_and_is_idempotent(tmp_path: Path) -
     with root.connect() as connection:
         assert connection.execute(
             "SELECT value FROM schema_meta WHERE key='schema_version'"
-        ).fetchone()[0] == "60"
+        ).fetchone()[0] == "61"
         assert connection.execute(
             "SELECT 1 FROM sqlite_master WHERE name='assistant_cognitive_owner_waits'"
         ).fetchone() is None
@@ -282,7 +290,7 @@ def test_schema59_is_vault_only_preserves_58_and_is_idempotent(tmp_path: Path) -
     with database.connect() as connection:
         assert connection.execute(
             "SELECT value FROM schema_meta WHERE key='schema_version'"
-        ).fetchone()[0] == "60"
+        ).fetchone()[0] == "61"
         assert connection.execute(
             "SELECT COUNT(*) FROM assistant_autonomy_runs"
         ).fetchone()[0] == 1

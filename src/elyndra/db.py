@@ -2382,8 +2382,9 @@ class Database:
                 self._migrate_autonomy_phase9a(connection)
                 self._migrate_cognitive_loop_phase8a(connection)
                 self._migrate_cognitive_handoff_phase8b1(connection)
+                self._migrate_cognitive_mutation_handoff_phase9a6(connection)
             connection.execute(
-                "INSERT OR REPLACE INTO schema_meta(key, value) VALUES('schema_version', '60')"
+                "INSERT OR REPLACE INTO schema_meta(key, value) VALUES('schema_version', '61')"
             )
         with suppress(PermissionError):
             self.path.chmod(0o600)
@@ -3614,7 +3615,8 @@ class Database:
                 disposition TEXT CHECK(disposition IS NULL OR disposition IN (
                     'model_unavailable', 'authority_blocked', 'incomplete_attempt',
                     'execution_observed', 'malformed_model_output', 'model_error',
-                    'durable_run_completed', 'limit_exhausted'
+                    'durable_run_completed', 'limit_exhausted',
+                    'mutation_review_requested'
                 )),
                 step_id TEXT CHECK(step_id IS NULL OR length(step_id) BETWEEN 1 AND 64),
                 source_request_id TEXT CHECK(source_request_id IS NULL OR
@@ -3644,7 +3646,7 @@ class Database:
                      AND completed_at IS NULL AND abandoned_at IS NOT NULL)
                 ),
                 CHECK((kind = 'reason' AND source_request_id IS NULL)
-                      OR (kind = 'evaluate' AND source_request_id IS NOT NULL)
+                      OR kind = 'evaluate'
                       OR kind = 'act'),
                 CHECK(disposition != 'execution_observed'
                       OR source_request_id IS NOT NULL)
@@ -3794,7 +3796,8 @@ class Database:
                     'retry_review_required', 'model_unavailable', 'model_error',
                     'malformed_model_output', 'abandoned_before_delegation',
                     'execution_linkage_unknown', 'incomplete_attempt',
-                    'recovery_required', 'limit_exhausted'
+                    'recovery_required', 'limit_exhausted',
+                    'mutation_review_required'
                 )),
                 gate_id TEXT CHECK(gate_id IS NULL OR
                     length(gate_id) BETWEEN 1 AND 128),
@@ -3805,7 +3808,8 @@ class Database:
                     'context_continued', 'reasoning_retried',
                     'ordinary_gate_continued', 'retry_review_continued',
                     'replan_declined', 'abandoned_action_continued',
-                    'successor_accepted', 'stopped', 'cancelled'
+                    'successor_accepted', 'mutation_handoff_continued',
+                    'stopped', 'cancelled'
                 )),
                 owner_context TEXT CHECK(owner_context IS NULL OR
                     length(CAST(owner_context AS BLOB)) BETWEEN 1 AND 2000),
@@ -3954,6 +3958,28 @@ class Database:
                               (SELECT max_replans FROM assistant_cognitive_cycles
                                WHERE id=NEW.cycle_id))))
                 OR
+                (NEW.reason='mutation_review_required'
+                 AND NEW.source_turn_id IS NOT NULL AND NEW.gate_id IS NOT NULL
+                 AND NEW.source_request_id IS NULL AND NEW.state='pending'
+                 AND EXISTS (SELECT 1
+                     FROM assistant_cognitive_turns t
+                     JOIN assistant_cognitive_cycles c ON c.id=t.cycle_id
+                     JOIN assistant_autonomy_human_gates g
+                       ON g.public_id=NEW.gate_id
+                     JOIN assistant_autonomy_mutation_gate_bindings b
+                       ON b.gate_id=g.public_id
+                     JOIN assistant_autonomy_mutation_proposals p
+                       ON p.id=b.proposal_id
+                     WHERE t.id=NEW.source_turn_id AND t.cycle_id=NEW.cycle_id
+                       AND t.kind='act' AND t.state='completed'
+                       AND t.disposition='mutation_review_requested'
+                       AND g.kind='mutation_review'
+                       AND g.run_id=c.autonomy_run_id
+                       AND b.run_id=c.autonomy_run_id AND b.actor=c.actor
+                       AND b.step_id=t.step_id
+                       AND p.run_id=c.autonomy_run_id AND p.actor=c.actor
+                       AND p.step_id=t.step_id))
+                OR
                 (NEW.reason='recovery_required' AND NEW.gate_id IS NULL
                  AND NEW.source_request_id IS NULL
                  AND (NEW.source_turn_id IS NULL OR EXISTS (
@@ -4001,6 +4027,8 @@ class Database:
                     AND OLD.reason='abandoned_before_delegation')
                 OR (NEW.resolution='successor_accepted'
                     AND OLD.reason='replan_requested')
+                OR (NEW.resolution='mutation_handoff_continued'
+                    AND OLD.reason='mutation_review_required')
                 OR NEW.resolution IN ('stopped','cancelled')
             )
             BEGIN SELECT RAISE(ABORT, 'cognitive_wait_resolution_reason_mismatch'); END;
@@ -4190,7 +4218,8 @@ class Database:
                 disposition TEXT CHECK(disposition IS NULL OR disposition IN (
                     'model_unavailable', 'authority_blocked', 'incomplete_attempt',
                     'execution_observed', 'malformed_model_output', 'model_error',
-                    'durable_run_completed', 'limit_exhausted'
+                    'durable_run_completed', 'limit_exhausted',
+                    'mutation_review_requested'
                 )),
                 step_id TEXT CHECK(step_id IS NULL OR length(step_id) BETWEEN 1 AND 64),
                 source_request_id TEXT CHECK(source_request_id IS NULL OR
@@ -4220,7 +4249,7 @@ class Database:
                      AND completed_at IS NULL AND abandoned_at IS NOT NULL)
                 ),
                 CHECK((kind = 'reason' AND source_request_id IS NULL)
-                      OR (kind = 'evaluate' AND source_request_id IS NOT NULL)
+                      OR kind = 'evaluate'
                       OR kind = 'act'),
                 CHECK(disposition != 'execution_observed'
                       OR source_request_id IS NOT NULL)
@@ -4267,6 +4296,293 @@ class Database:
             PRAGMA foreign_keys=ON;
             """
         )
+
+    @staticmethod
+    def _migrate_cognitive_mutation_handoff_phase9a6(
+        connection: sqlite3.Connection,
+    ) -> None:
+        """Install the schema-61 cognitive mutation handoff boundary."""
+
+        Database._rebuild_cognitive_check_table(
+            connection,
+            table="assistant_cognitive_turns",
+            marker="'mutation_review_requested'",
+            replacements=(
+                (
+                    "'durable_run_completed', 'limit_exhausted'",
+                    "'durable_run_completed', 'limit_exhausted', "
+                    "'mutation_review_requested'",
+                ),
+            ),
+        )
+        Database._rebuild_cognitive_check_table(
+            connection,
+            table="assistant_cognitive_turns",
+            marker="OR kind = 'evaluate'",
+            replacements=(
+                (
+                    "OR (kind = 'evaluate' AND source_request_id IS NOT NULL)",
+                    "OR kind = 'evaluate'",
+                ),
+            ),
+        )
+        Database._rebuild_cognitive_check_table(
+            connection,
+            table="assistant_cognitive_owner_waits",
+            marker="'mutation_handoff_continued'",
+            replacements=(
+                (
+                    "'recovery_required', 'limit_exhausted'",
+                    "'recovery_required', 'limit_exhausted', "
+                    "'mutation_review_required'",
+                ),
+                (
+                    "'successor_accepted', 'stopped', 'cancelled'",
+                    "'successor_accepted', 'mutation_handoff_continued', "
+                    "'stopped', 'cancelled'",
+                ),
+            ),
+        )
+        Database._extend_trigger_sql(
+            connection,
+            name="trg_cognitive_wait_provenance_insert",
+            marker="NEW.reason='mutation_review_required'",
+            needle="OR\n                (NEW.reason='recovery_required'",
+            replacement="""OR
+                (NEW.reason='mutation_review_required'
+                 AND NEW.source_turn_id IS NOT NULL AND NEW.gate_id IS NOT NULL
+                 AND NEW.source_request_id IS NULL AND NEW.state='pending'
+                 AND EXISTS (SELECT 1
+                     FROM assistant_cognitive_turns t
+                     JOIN assistant_cognitive_cycles c ON c.id=t.cycle_id
+                     JOIN assistant_autonomy_human_gates g ON g.public_id=NEW.gate_id
+                     JOIN assistant_autonomy_mutation_gate_bindings b
+                       ON b.gate_id=g.public_id
+                     JOIN assistant_autonomy_mutation_proposals p ON p.id=b.proposal_id
+                     WHERE t.id=NEW.source_turn_id AND t.cycle_id=NEW.cycle_id
+                       AND t.kind='act' AND t.state='completed'
+                       AND t.disposition='mutation_review_requested'
+                       AND g.kind='mutation_review' AND g.run_id=c.autonomy_run_id
+                       AND b.run_id=c.autonomy_run_id AND b.actor=c.actor
+                       AND b.step_id=t.step_id
+                       AND p.run_id=c.autonomy_run_id AND p.actor=c.actor
+                       AND p.step_id=t.step_id))
+                OR
+                (NEW.reason='recovery_required'""",
+        )
+        Database._extend_trigger_sql(
+            connection,
+            name="trg_cognitive_wait_resolution_reason",
+            marker="NEW.resolution='mutation_handoff_continued'",
+            needle="OR NEW.resolution IN ('stopped','cancelled')",
+            replacement="""OR (NEW.resolution='mutation_handoff_continued'
+                    AND OLD.reason='mutation_review_required')
+                OR NEW.resolution IN ('stopped','cancelled')""",
+        )
+        connection.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS assistant_cognitive_mutation_handoffs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                public_id TEXT NOT NULL UNIQUE
+                    CHECK(length(public_id) BETWEEN 1 AND 128),
+                request_key TEXT NOT NULL UNIQUE
+                    CHECK(length(request_key) BETWEEN 1 AND 128),
+                proposal_id INTEGER NOT NULL,
+                binding_id INTEGER NOT NULL UNIQUE,
+                gate_id TEXT NOT NULL UNIQUE
+                    CHECK(length(gate_id) BETWEEN 1 AND 128),
+                run_id INTEGER NOT NULL,
+                step_id TEXT NOT NULL CHECK(length(step_id) BETWEEN 1 AND 64),
+                attempt_id INTEGER NOT NULL UNIQUE,
+                result_id INTEGER NOT NULL UNIQUE,
+                cycle_id INTEGER NOT NULL,
+                wait_id INTEGER NOT NULL UNIQUE,
+                source_turn_id INTEGER NOT NULL UNIQUE,
+                actor TEXT NOT NULL CHECK(length(actor) BETWEEN 1 AND 200),
+                workspace_root TEXT NOT NULL
+                    CHECK(length(workspace_root) BETWEEN 1 AND 4096),
+                workspace_st_dev INTEGER NOT NULL CHECK(workspace_st_dev >= 0),
+                workspace_st_ino INTEGER NOT NULL CHECK(workspace_st_ino > 0),
+                workspace_mount_id INTEGER NOT NULL CHECK(workspace_mount_id > 0),
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(proposal_id)
+                    REFERENCES assistant_autonomy_mutation_proposals(id) ON DELETE RESTRICT,
+                FOREIGN KEY(binding_id)
+                    REFERENCES assistant_autonomy_mutation_gate_bindings(id) ON DELETE RESTRICT,
+                FOREIGN KEY(gate_id)
+                    REFERENCES assistant_autonomy_human_gates(public_id) ON DELETE RESTRICT,
+                FOREIGN KEY(run_id)
+                    REFERENCES assistant_autonomy_runs(id) ON DELETE RESTRICT,
+                FOREIGN KEY(attempt_id)
+                    REFERENCES assistant_autonomy_mutation_attempts(id) ON DELETE RESTRICT,
+                FOREIGN KEY(result_id)
+                    REFERENCES assistant_autonomy_mutation_results(id) ON DELETE RESTRICT,
+                FOREIGN KEY(cycle_id)
+                    REFERENCES assistant_cognitive_cycles(id) ON DELETE RESTRICT,
+                FOREIGN KEY(wait_id)
+                    REFERENCES assistant_cognitive_owner_waits(id) ON DELETE RESTRICT,
+                FOREIGN KEY(source_turn_id)
+                    REFERENCES assistant_cognitive_turns(id) ON DELETE RESTRICT
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_cognitive_mutation_handoffs_run_step
+            ON assistant_cognitive_mutation_handoffs(run_id, step_id, id DESC);
+
+            CREATE TRIGGER IF NOT EXISTS trg_cognitive_mutation_evaluate_source
+            BEFORE INSERT ON assistant_cognitive_turns
+            WHEN NEW.kind='evaluate' AND NEW.source_request_id IS NULL
+              AND NOT EXISTS (
+                SELECT 1 FROM assistant_cognitive_cycles c
+                JOIN assistant_cognitive_turns source
+                  ON source.cycle_id=c.id AND source.kind='act'
+                 AND source.state='completed'
+                 AND source.disposition='mutation_review_requested'
+                JOIN assistant_cognitive_mutation_handoffs h
+                  ON h.cycle_id=c.id AND h.source_turn_id=source.id
+                JOIN assistant_cognitive_owner_waits w
+                  ON w.id=h.wait_id AND w.state='resolved'
+                 AND w.resolution='mutation_handoff_continued'
+                WHERE c.id=NEW.cycle_id AND c.status='evaluation_ready'
+                  AND source.sequence=(SELECT MAX(prior.sequence)
+                      FROM assistant_cognitive_turns prior
+                      WHERE prior.cycle_id=NEW.cycle_id AND prior.kind='act')
+              )
+            BEGIN SELECT RAISE(ABORT, 'cognitive_evaluate_source_missing'); END;
+
+            CREATE TRIGGER IF NOT EXISTS trg_cognitive_mutation_handoff_integrity
+            BEFORE INSERT ON assistant_cognitive_mutation_handoffs
+            WHEN NOT EXISTS (
+                SELECT 1
+                FROM assistant_autonomy_mutation_proposals p
+                JOIN assistant_autonomy_mutation_gate_bindings b
+                  ON b.id=NEW.binding_id AND b.proposal_id=p.id
+                JOIN assistant_autonomy_human_gates g
+                  ON g.public_id=NEW.gate_id AND g.public_id=b.gate_id
+                JOIN assistant_autonomy_mutation_attempts a
+                  ON a.id=NEW.attempt_id AND a.binding_id=b.id
+                JOIN assistant_autonomy_mutation_results m
+                  ON m.id=NEW.result_id AND m.attempt_id=a.id
+                JOIN assistant_cognitive_cycles c ON c.id=NEW.cycle_id
+                JOIN assistant_cognitive_owner_waits w
+                  ON w.id=NEW.wait_id AND w.cycle_id=c.id
+                JOIN assistant_cognitive_turns t
+                  ON t.id=NEW.source_turn_id AND t.id=w.source_turn_id
+                JOIN assistant_autonomy_runs r
+                  ON r.id=NEW.run_id AND r.id=c.autonomy_run_id
+                WHERE p.id=NEW.proposal_id AND p.id=b.proposal_id
+                  AND b.gate_id=NEW.gate_id AND b.run_id=NEW.run_id
+                  AND b.step_id=NEW.step_id AND b.actor=NEW.actor
+                  AND g.run_id=NEW.run_id AND g.kind='mutation_review'
+                  AND g.status='approved'
+                  AND a.run_id=NEW.run_id AND a.step_id=NEW.step_id
+                  AND a.actor=NEW.actor AND a.state='succeeded'
+                  AND a.terminal_at IS NOT NULL
+                  AND m.outcome='filesystem_succeeded'
+                  AND c.actor=NEW.actor AND c.status='waiting_owner'
+                  AND w.reason='mutation_review_required' AND w.state='pending'
+                  AND w.gate_id=NEW.gate_id AND w.source_request_id IS NULL
+                  AND t.cycle_id=NEW.cycle_id AND t.kind='act'
+                  AND t.state='completed'
+                  AND t.disposition='mutation_review_requested'
+                  AND t.step_id=NEW.step_id
+                  AND r.actor=NEW.actor AND r.status='waiting_human'
+                  AND r.workspace_root=NEW.workspace_root
+                  AND p.workspace_root=NEW.workspace_root
+                  AND a.workspace_root=NEW.workspace_root
+                  AND a.workspace_st_dev=NEW.workspace_st_dev
+                  AND a.workspace_st_ino=NEW.workspace_st_ino
+                  AND a.workspace_mount_id=NEW.workspace_mount_id
+            )
+            BEGIN SELECT RAISE(ABORT, 'cognitive_mutation_handoff_invalid'); END;
+
+            CREATE TRIGGER IF NOT EXISTS trg_cognitive_mutation_handoff_no_update
+            BEFORE UPDATE ON assistant_cognitive_mutation_handoffs
+            BEGIN SELECT RAISE(ABORT, 'cognitive_mutation_handoff_immutable'); END;
+
+            CREATE TRIGGER IF NOT EXISTS trg_cognitive_mutation_handoff_no_delete
+            BEFORE DELETE ON assistant_cognitive_mutation_handoffs
+            BEGIN SELECT RAISE(ABORT, 'cognitive_mutation_handoff_immutable'); END;
+            """
+        )
+
+    @staticmethod
+    def _rebuild_cognitive_check_table(
+        connection: sqlite3.Connection,
+        *,
+        table: str,
+        marker: str,
+        replacements: tuple[tuple[str, str], ...],
+    ) -> None:
+        row = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name=?", (table,)
+        ).fetchone()
+        if row is None:
+            return
+        create_sql = str(row[0])
+        if marker in create_sql:
+            return
+        for needle, replacement in replacements:
+            if needle in create_sql:
+                create_sql = create_sql.replace(needle, replacement, 1)
+            elif replacement not in create_sql:
+                raise RuntimeError(f"No se pudo extender {table} a schema 61.")
+        objects = connection.execute(
+            "SELECT type,name,sql FROM sqlite_master "
+            "WHERE tbl_name=? AND type IN ('index','trigger') AND sql IS NOT NULL",
+            (table,),
+        ).fetchall()
+        columns = [
+            str(item[1]) for item in connection.execute(f"PRAGMA table_info({table})")
+        ]
+        old = table + "_phase9a6"
+        connection.commit()
+        connection.execute("PRAGMA foreign_keys=OFF")
+        connection.execute("PRAGMA legacy_alter_table=ON")
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            for item in objects:
+                connection.execute(f"DROP {str(item['type']).upper()} {item['name']}")
+            connection.execute(f"ALTER TABLE {table} RENAME TO {old}")
+            connection.execute(create_sql)
+            rendered = ",".join(columns)
+            connection.execute(
+                f"INSERT INTO {table} ({rendered}) SELECT {rendered} FROM {old}"
+            )
+            connection.execute(f"DROP TABLE {old}")
+            for item in objects:
+                connection.execute(str(item["sql"]))
+            violations = connection.execute("PRAGMA foreign_key_check").fetchall()
+            if violations:
+                raise RuntimeError("La extensión cognitiva rompió foreign keys.")
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.execute("PRAGMA legacy_alter_table=OFF")
+            connection.execute("PRAGMA foreign_keys=ON")
+
+    @staticmethod
+    def _extend_trigger_sql(
+        connection: sqlite3.Connection,
+        *,
+        name: str,
+        marker: str,
+        needle: str,
+        replacement: str,
+    ) -> None:
+        row = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?", (name,)
+        ).fetchone()
+        if row is None:
+            raise RuntimeError(f"Trigger cognitivo ausente: {name}.")
+        sql = str(row[0])
+        if marker in sql:
+            return
+        if needle not in sql:
+            raise RuntimeError(f"Trigger cognitivo no extensible: {name}.")
+        connection.execute(f"DROP TRIGGER {name}")
+        connection.execute(sql.replace(needle, replacement, 1))
 
     @staticmethod
     def _backfill_cognitive_owner_waits(connection: sqlite3.Connection) -> None:

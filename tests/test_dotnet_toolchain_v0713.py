@@ -386,7 +386,7 @@ def test_dotnet_control_center_schema_registry_and_security_contract(
         version = connection.execute(
             "SELECT value FROM schema_meta WHERE key = 'schema_version'"
         ).fetchone()[0]
-    assert version == "59"
+    assert version == "61"
 
 
 def test_dotnet_knowledge_package_manifest(isolated_home: ElyndraPaths) -> None:

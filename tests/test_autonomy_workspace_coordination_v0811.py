@@ -201,7 +201,9 @@ def test_openat2_rejects_nested_mount_crossing() -> None:
         os.close(root_fd)
 
 
-def test_schema60_foundation_is_vault_only_and_idempotent(tmp_path: Path) -> None:
+def test_schema61_target_keeps_mutation_foundation_vault_only_and_idempotent(
+    tmp_path: Path,
+) -> None:
     vault = Database(tmp_path / "vault.sqlite3", role="vault")
     root = Database(tmp_path / "root.sqlite3", role="root")
     vault.migrate()
@@ -238,7 +240,7 @@ def test_schema60_foundation_is_vault_only_and_idempotent(tmp_path: Path) -> Non
             connection.execute(
                 "SELECT value FROM schema_meta WHERE key='schema_version'"
             ).fetchone()[0]
-            == "60"
+            == "61"
         )
     assert not {
         "assistant_autonomy_mutation_attempts",
@@ -275,6 +277,11 @@ def test_existing_schema60_result_constraint_is_reconciled_idempotently(
         )
         connection.executescript(
             """
+            DROP TRIGGER IF EXISTS trg_cognitive_mutation_evaluate_source;
+            DROP TRIGGER IF EXISTS trg_cognitive_mutation_handoff_integrity;
+            DROP TRIGGER IF EXISTS trg_cognitive_mutation_handoff_no_update;
+            DROP TRIGGER IF EXISTS trg_cognitive_mutation_handoff_no_delete;
+            DROP TABLE IF EXISTS assistant_cognitive_mutation_handoffs;
             DROP TRIGGER trg_autonomy_mutation_results_integrity;
             DROP TRIGGER trg_autonomy_mutation_results_no_update;
             DROP TRIGGER trg_autonomy_mutation_results_no_delete;
@@ -286,6 +293,9 @@ def test_existing_schema60_result_constraint_is_reconciled_idempotently(
         )
         connection.execute(old_sql)
         connection.execute("DROP TABLE assistant_autonomy_mutation_results_current")
+        connection.execute(
+            "UPDATE schema_meta SET value='60' WHERE key='schema_version'"
+        )
 
     database.migrate()
     database.migrate()

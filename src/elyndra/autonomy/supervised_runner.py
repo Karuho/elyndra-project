@@ -96,19 +96,9 @@ class SupervisedAutonomyRunner:
             actor=self.actor,
             cancellation=token,
         )
-        results = self.repository.execution_results(
-            run_id,
-            actor=self.actor,
-        )
-        succeeded = {
-            str(result["step_id"])
-            for result in results
-            if result["outcome"] == ExecutionOutcome.SUCCEEDED.value
-        }
-
-        next_step = next(
-            (step for step in contract.plan.steps if step.step_id not in succeeded),
-            None,
+        results = self.repository.execution_results(run_id, actor=self.actor)
+        next_step = self.repository.first_incomplete_plan_step(
+            run_id, actor=self.actor
         )
         if next_step is None:
             if self.repository.finalize_execution_run_if_ready(

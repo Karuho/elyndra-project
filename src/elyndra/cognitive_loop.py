@@ -19,6 +19,18 @@ from elyndra.autonomy import (
     SupervisedAutonomyRunner,
     SupervisedTickOutcome,
 )
+from elyndra.autonomy.mutation_recovery import (
+    MutationBlockadeState,
+    MutationRecoveryDisposition,
+    MutationRecoveryInspector,
+)
+from elyndra.autonomy.repository import _grant_from_json, _plan_from_json
+from elyndra.autonomy.workspace_lease import (
+    WorkspaceIdentity,
+    WorkspaceLeaseCoordinator,
+    WorkspaceLeaseMode,
+    WorkspaceLeaseReceipt,
+)
 from elyndra.db import Database
 from elyndra.engines import LanguageEngine, NoModelEngine
 from elyndra.memory import TieredMemoryRepository
@@ -82,8 +94,7 @@ class LocalCognitiveActionLoop:
         )
         if not 1 <= len(contract.plan.steps) <= 4:
             raise PermissionError("Phase 8A requiere entre uno y cuatro steps.")
-        if any(step.capability is not Capability.PROCESS_EXEC for step in contract.plan.steps):
-            raise PermissionError("Phase 8A solo admite planes process.exec.")
+        self._require_cognitive_plan(contract.plan)
         if self.autonomy.execution_attempt_gaps(autonomy_run_id, actor=clean_actor):
             raise PermissionError("El AutonomyRun tiene un intento incompleto.")
 
@@ -106,11 +117,7 @@ class LocalCognitiveActionLoop:
             )
             if not 1 <= len(admitted_contract.plan.steps) <= 4:
                 raise PermissionError("Phase 8A requiere entre uno y cuatro steps.")
-            if any(
-                step.capability is not Capability.PROCESS_EXEC
-                for step in admitted_contract.plan.steps
-            ):
-                raise PermissionError("Phase 8A solo admite planes process.exec.")
+            self._require_cognitive_plan(admitted_contract.plan)
             if self.autonomy.execution_attempt_gaps(
                 autonomy_run_id, actor=clean_actor
             ):
@@ -260,6 +267,528 @@ class LocalCognitiveActionLoop:
         if status == "action_ready":
             return self._action_advance(cycle, cancellation=cancellation)
         raise PermissionError(f"El ciclo no puede avanzar desde {status}.")
+
+    def request_mutation_review(
+        self,
+        cycle_id: str,
+        proposal_id: str,
+        proposal_sha256: str,
+        *,
+        actor: str,
+    ) -> dict[str, Any]:
+        """Atomically bind the current self.modify act turn to owner review."""
+
+        clean_cycle = _required(cycle_id, "cycle_id", 128)
+        clean_proposal = _required(proposal_id, "proposal_id", 128)
+        clean_sha256 = _required(proposal_sha256, "proposal_sha256", 64)
+        clean_actor = _required(actor, "actor", 200)
+        now_dt = datetime.now(UTC)
+        now = now_dt.isoformat()
+        wait_public_id = uuid.uuid4().hex
+        turn_public_id = uuid.uuid4().hex
+        with self.database.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            cycle = connection.execute(
+                """SELECT c.*,r.id AS run_db_id,r.public_id AS run_public_id,
+                          r.actor AS run_actor,r.status AS run_status,
+                          r.plan_json,r.grant_json,r.workspace_root
+                   FROM assistant_cognitive_cycles AS c
+                   JOIN assistant_autonomy_runs AS r ON r.id=c.autonomy_run_id
+                   WHERE c.public_id=?""",
+                (clean_cycle,),
+            ).fetchone()
+            if (
+                cycle is None
+                or cycle["actor"] != clean_actor
+                or cycle["run_actor"] != clean_actor
+                or cycle["status"] != "action_ready"
+                or cycle["run_status"] != AutonomyRunStatus.RUNNING.value
+            ):
+                raise PermissionError("Cycle/run no admite mutation review.")
+            if connection.execute(
+                "SELECT 1 FROM assistant_cognitive_owner_waits "
+                "WHERE cycle_id=? AND state='pending'",
+                (int(cycle["id"]),),
+            ).fetchone() is not None:
+                raise PermissionError("El ciclo ya tiene una espera owner pendiente.")
+            self.autonomy._require_no_execution_gap_connection(
+                connection, str(cycle["run_public_id"]), actor=clean_actor
+            )
+            grant = _grant_from_json(str(cycle["grant_json"]))
+            plan = _plan_from_json(str(cycle["plan_json"]))
+            self._require_cognitive_plan(plan)
+            if len(plan.steps) > grant.max_steps or plan.required_capabilities - grant.capabilities:
+                raise PermissionError("Plan/grant congelado inconsistente.")
+            step = self.autonomy._first_incomplete_plan_step_connection(
+                connection, run_db_id=int(cycle["run_db_id"]), plan=plan
+            )
+            if step is None or step.capability is not Capability.SELF_MODIFY:
+                raise PermissionError("El primer step incompleto no es self.modify.")
+            if connection.execute(
+                """SELECT 1 FROM assistant_autonomy_mutation_gate_bindings AS b
+                   JOIN assistant_autonomy_mutation_proposals AS p ON p.id=b.proposal_id
+                   WHERE p.public_id=?""",
+                (clean_proposal,),
+            ).fetchone() is not None:
+                raise PermissionError("La propuesta ya tiene mutation review.")
+            usage = self._usage(connection, int(cycle["id"]))
+            if usage["advances"] >= int(cycle["max_advances"]):
+                raise PermissionError("Se agotó max_advances.")
+            sequence = usage["advances"] + 1
+            connection.execute(
+                """INSERT INTO assistant_cognitive_turns(
+                       public_id,cycle_id,sequence,kind,state,decision,disposition,
+                       step_id,source_request_id,created_at,completed_at,abandoned_at)
+                   VALUES (?, ?, ?, 'act', 'reserved', NULL, NULL, ?, NULL, ?, NULL, NULL)""",
+                (turn_public_id, int(cycle["id"]), sequence, step.step_id, now),
+            )
+            turn = connection.execute(
+                "SELECT * FROM assistant_cognitive_turns WHERE public_id=?",
+                (turn_public_id,),
+            ).fetchone()
+            assert turn is not None
+            self._set_cycle(
+                connection, int(cycle["id"]), "action_ready", "action_reserved", now
+            )
+            self._event(
+                connection,
+                cycle_id=int(cycle["id"]),
+                turn_id=int(turn["id"]),
+                event_type="turn_reserved",
+                from_status="action_ready",
+                to_status="action_reserved",
+                step_id=step.step_id,
+                summary_code="act_reserved",
+                created_at=now,
+            )
+            review = self.autonomy._request_mutation_review_connection(
+                connection,
+                proposal_id=clean_proposal,
+                proposal_sha256=clean_sha256,
+                actor=clean_actor,
+                now=now_dt,
+            )
+            if review.step_id != step.step_id:
+                raise PermissionError("Mutation review no coincide con el act turn.")
+            connection.execute(
+                """UPDATE assistant_cognitive_turns
+                   SET state='completed',disposition='mutation_review_requested',completed_at=?
+                   WHERE id=? AND state='reserved'""",
+                (now, int(turn["id"])),
+            )
+            self._set_cycle(
+                connection, int(cycle["id"]), "action_reserved", "waiting_owner", now
+            )
+            self._event(
+                connection,
+                cycle_id=int(cycle["id"]),
+                turn_id=int(turn["id"]),
+                event_type="action_blocked",
+                from_status="action_reserved",
+                to_status="waiting_owner",
+                step_id=step.step_id,
+                gate_id=review.gate_id,
+                summary_code="mutation_review_requested",
+                created_at=now,
+            )
+            connection.execute(
+                """INSERT INTO assistant_cognitive_owner_waits(
+                       public_id,cycle_id,sequence,source_turn_id,reason,gate_id,
+                       source_request_id,state,created_at)
+                   VALUES (?, ?, ?, ?, 'mutation_review_required', ?, NULL, 'pending', ?)""",
+                (
+                    wait_public_id,
+                    int(cycle["id"]),
+                    int(
+                        connection.execute(
+                            "SELECT COALESCE(MAX(sequence),0)+1 "
+                            "FROM assistant_cognitive_owner_waits WHERE cycle_id=?",
+                            (int(cycle["id"]),),
+                        ).fetchone()[0]
+                    ),
+                    int(turn["id"]),
+                    review.gate_id,
+                    now,
+                ),
+            )
+            self._owner_waiting_event(
+                connection,
+                cycle_id=int(cycle["id"]),
+                turn_id=int(turn["id"]),
+                now=now,
+                from_status="action_reserved",
+                gate_id=review.gate_id,
+            )
+        wait = self.owner_wait(wait_public_id, actor=clean_actor)
+        assert wait is not None
+        return wait
+
+    def handoff_mutation_success(
+        self,
+        cycle_id: str,
+        wait_id: str,
+        attempt_id: str,
+        *,
+        request_key: str,
+        workspace_identity: WorkspaceIdentity,
+        lease_receipt: WorkspaceLeaseReceipt,
+        actor: str,
+        workspace_lease_coordinator: WorkspaceLeaseCoordinator | None = None,
+    ) -> dict[str, Any]:
+        """Record one exact terminal mutation and resume only its autonomy run."""
+
+        clean_cycle = _required(cycle_id, "cycle_id", 128)
+        clean_wait = _required(wait_id, "wait_id", 128)
+        clean_attempt = _required(attempt_id, "attempt_id", 128)
+        clean_request_key = _required(request_key, "request_key", 128)
+        clean_actor = _required(actor, "actor", 200)
+        lease_receipt.require_live(
+            mode=WorkspaceLeaseMode.EXCLUSIVE, identity=workspace_identity
+        )
+        inspector = MutationRecoveryInspector(
+            self.autonomy,
+            workspace_lease_coordinator=workspace_lease_coordinator,
+        )
+        recovery = inspector._inspect_under_live_lease(
+            workspace_identity.canonical_root,
+            identity=workspace_identity,
+            lease_receipt=lease_receipt,
+            attempt_public_id=clean_attempt,
+        )
+        if (
+            recovery.disposition is not MutationRecoveryDisposition.ALREADY_TERMINAL
+            or recovery.attempt_public_id != clean_attempt
+            or recovery.attempt_state != "succeeded"
+            or recovery.result_outcome != "filesystem_succeeded"
+            or recovery.blockade_state is not MutationBlockadeState.ABSENT
+            or recovery.manifest is None
+            or recovery.manifest.record_states[-1:] != ("cleanup_ready",)
+        ):
+            raise PermissionError("Mutation recovery no prueba éxito terminal limpio.")
+        now = _now()
+        handoff_public_id = uuid.uuid4().hex
+        with self.database.connect_mutation_durable() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            lease_receipt.require_live(
+                mode=WorkspaceLeaseMode.EXCLUSIVE, identity=workspace_identity
+            )
+            row = connection.execute(
+                """SELECT w.*,c.public_id AS cycle_public_id,c.actor AS cycle_actor,
+                          c.status AS cycle_status,r.id AS run_db_id,
+                          r.public_id AS run_public_id,r.actor AS run_actor,
+                          r.status AS run_status,r.plan_json,r.grant_json,r.workspace_root,
+                          t.step_id AS turn_step,t.kind AS turn_kind,
+                          t.state AS turn_state,t.disposition AS turn_disposition,
+                          g.kind AS gate_kind,g.status AS gate_status,
+                          b.id AS binding_id,b.run_id AS binding_run,
+                          b.step_id AS binding_step,b.gate_id AS binding_gate,
+                          b.actor AS binding_actor,b.proposal_id,
+                          p.public_id AS proposal_public_id,p.proposal_sha256,
+                          p.run_id AS proposal_run,p.step_id AS proposal_step,
+                          p.actor AS proposal_actor,p.workspace_root AS proposal_workspace,
+                          a.id AS attempt_db_id,a.public_id AS attempt_public_id,
+                          a.binding_id AS attempt_binding,a.gate_id AS attempt_gate,
+                          a.proposal_id AS attempt_proposal,
+                          a.run_id AS attempt_run,a.step_id AS attempt_step,
+                          a.actor AS attempt_actor,a.state AS attempt_state,
+                          a.workspace_root AS attempt_workspace,
+                          a.terminal_at,a.workspace_st_dev,a.workspace_st_ino,
+                          a.workspace_mount_id,m.id AS result_db_id,
+                          m.attempt_id AS result_attempt,
+                          m.public_id AS result_public_id,
+                          m.outcome AS result_outcome
+                   FROM assistant_cognitive_owner_waits AS w
+                   JOIN assistant_cognitive_cycles AS c ON c.id=w.cycle_id
+                   JOIN assistant_autonomy_runs AS r ON r.id=c.autonomy_run_id
+                   JOIN assistant_cognitive_turns AS t ON t.id=w.source_turn_id
+                   JOIN assistant_autonomy_human_gates AS g ON g.public_id=w.gate_id
+                   JOIN assistant_autonomy_mutation_gate_bindings AS b
+                     ON b.gate_id=g.public_id
+                   JOIN assistant_autonomy_mutation_proposals AS p ON p.id=b.proposal_id
+                   JOIN assistant_autonomy_mutation_attempts AS a
+                     ON a.binding_id=b.id AND a.public_id=?
+                   JOIN assistant_autonomy_mutation_results AS m ON m.attempt_id=a.id
+                   WHERE w.public_id=? AND c.public_id=?""",
+                (clean_attempt, clean_wait, clean_cycle),
+            ).fetchone()
+            if row is None or row["cycle_actor"] != clean_actor or row["run_actor"] != clean_actor:
+                raise PermissionError("Mutation handoff identity no coincide.")
+            exact_identity = (
+                row["reason"] == "mutation_review_required"
+                and row["source_request_id"] is None
+                and row["turn_kind"] == "act"
+                and row["turn_state"] == "completed"
+                and row["turn_disposition"] == "mutation_review_requested"
+                and row["gate_kind"] == HumanGateKind.MUTATION_REVIEW.value
+                and row["gate_status"] == HumanGateStatus.APPROVED.value
+                and row["binding_gate"] == row["gate_id"]
+                and row["attempt_gate"] == row["gate_id"]
+                and int(row["attempt_binding"]) == int(row["binding_id"])
+                and int(row["attempt_proposal"]) == int(row["proposal_id"])
+                and int(row["result_attempt"]) == int(row["attempt_db_id"])
+                and int(row["binding_run"]) == int(row["run_db_id"])
+                and int(row["proposal_run"]) == int(row["run_db_id"])
+                and int(row["attempt_run"]) == int(row["run_db_id"])
+                and row["turn_step"] == row["binding_step"]
+                and row["turn_step"] == row["proposal_step"]
+                and row["turn_step"] == row["attempt_step"]
+                and row["binding_actor"] == clean_actor
+                and row["proposal_actor"] == clean_actor
+                and row["attempt_actor"] == clean_actor
+                and row["workspace_root"] == workspace_identity.canonical_root
+                and row["proposal_workspace"] == workspace_identity.canonical_root
+                and row["attempt_workspace"] == workspace_identity.canonical_root
+                and int(row["workspace_st_dev"]) == workspace_identity.st_dev
+                and int(row["workspace_st_ino"]) == workspace_identity.st_ino
+                and int(row["workspace_mount_id"]) == workspace_identity.mount_id
+                and row["attempt_state"] == "succeeded"
+                and row["terminal_at"] is not None
+                and row["result_outcome"] == "filesystem_succeeded"
+                and recovery.result_public_id == row["result_public_id"]
+            )
+            if not exact_identity:
+                raise PermissionError("Mutation handoff durable lineage no coincide.")
+            self.autonomy._require_no_execution_gap_connection(
+                connection, str(row["run_public_id"]), actor=clean_actor
+            )
+            grant = _grant_from_json(str(row["grant_json"]))
+            plan = _plan_from_json(str(row["plan_json"]))
+            self._require_cognitive_plan(plan)
+            if len(plan.steps) > grant.max_steps or plan.required_capabilities - grant.capabilities:
+                raise PermissionError("Plan/grant congelado inconsistente.")
+            mutation_step = next(
+                (step for step in plan.steps if step.step_id == row["attempt_step"]), None
+            )
+            if (
+                mutation_step is None
+                or mutation_step.capability is not Capability.SELF_MODIFY
+                or not self.autonomy._plan_step_complete_connection(
+                    connection, run_db_id=int(row["run_db_id"]), step=mutation_step
+                )
+            ):
+                raise PermissionError("Mutation step no tiene evidencia terminal exacta.")
+            existing = connection.execute(
+                "SELECT * FROM assistant_cognitive_mutation_handoffs WHERE request_key=?",
+                (clean_request_key,),
+            ).fetchone()
+            expected = {
+                "proposal_id": int(row["proposal_id"]),
+                "binding_id": int(row["binding_id"]),
+                "gate_id": str(row["gate_id"]),
+                "run_id": int(row["run_db_id"]),
+                "step_id": str(row["attempt_step"]),
+                "attempt_id": int(row["attempt_db_id"]),
+                "result_id": int(row["result_db_id"]),
+                "cycle_id": int(row["cycle_id"]),
+                "wait_id": int(row["id"]),
+                "source_turn_id": int(row["source_turn_id"]),
+                "actor": clean_actor,
+                "workspace_root": workspace_identity.canonical_root,
+                "workspace_st_dev": workspace_identity.st_dev,
+                "workspace_st_ino": workspace_identity.st_ino,
+                "workspace_mount_id": workspace_identity.mount_id,
+            }
+            if existing is not None:
+                if any(existing[key] != value for key, value in expected.items()):
+                    raise PermissionError("request_key reutilizada con otro linaje.")
+                return self._public_mutation_handoff_connection(connection, existing)
+            conflicting_lineage = connection.execute(
+                """SELECT 1 FROM assistant_cognitive_mutation_handoffs
+                   WHERE binding_id=? OR attempt_id=? OR result_id=?
+                     OR wait_id=? OR source_turn_id=?""",
+                (
+                    expected["binding_id"],
+                    expected["attempt_id"],
+                    expected["result_id"],
+                    expected["wait_id"],
+                    expected["source_turn_id"],
+                ),
+            ).fetchone()
+            if conflicting_lineage is not None:
+                raise PermissionError("Linaje de mutación ya entregado con otra request_key.")
+            if not (
+                row["state"] == "pending"
+                and row["cycle_status"] == "waiting_owner"
+                and row["run_status"] == AutonomyRunStatus.WAITING_HUMAN.value
+            ):
+                raise PermissionError("AutonomyRun no espera el handoff de mutación.")
+            connection.execute(
+                """INSERT INTO assistant_cognitive_mutation_handoffs(
+                       public_id,request_key,proposal_id,binding_id,gate_id,run_id,
+                       step_id,attempt_id,result_id,cycle_id,wait_id,source_turn_id,
+                       actor,workspace_root,workspace_st_dev,workspace_st_ino,
+                       workspace_mount_id,created_at)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    handoff_public_id,
+                    clean_request_key,
+                    *expected.values(),
+                    now,
+                ),
+            )
+            run_row = connection.execute(
+                "SELECT * FROM assistant_autonomy_runs WHERE id=?",
+                (int(row["run_db_id"]),),
+            ).fetchone()
+            assert run_row is not None
+            self.autonomy._set_status(
+                connection, run_row, AutonomyRunStatus.RUNNING, now=now
+            )
+            self.autonomy._insert_event(
+                connection,
+                run_db_id=int(row["run_db_id"]),
+                event_type="mutation_success_handoff",
+                from_status=AutonomyRunStatus.WAITING_HUMAN,
+                to_status=AutonomyRunStatus.RUNNING,
+                summary="Mutación terminal exitosa incorporada al plan congelado.",
+                payload={
+                    "attempt_id": clean_attempt,
+                    "result_id": str(row["result_public_id"]),
+                    "handoff_id": handoff_public_id,
+                    "step_id": str(row["attempt_step"]),
+                },
+                created_at=now,
+                step_id=str(row["attempt_step"]),
+            )
+            handoff = connection.execute(
+                "SELECT * FROM assistant_cognitive_mutation_handoffs WHERE public_id=?",
+                (handoff_public_id,),
+            ).fetchone()
+            assert handoff is not None
+            return self._public_mutation_handoff_connection(connection, handoff)
+
+    def continue_after_mutation_handoff(
+        self, handoff_id: str, *, actor: str
+    ) -> dict[str, Any]:
+        """Resolve the exact mutation wait without performing cognitive work."""
+
+        clean_handoff = _required(handoff_id, "handoff_id", 128)
+        clean_actor = _required(actor, "actor", 200)
+        with self.database.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """SELECT h.*,w.state AS wait_state,w.reason AS wait_reason,
+                          w.resolution AS wait_resolution,w.gate_id AS wait_gate,
+                          c.public_id AS cycle_public_id,c.status AS cycle_status,
+                          c.actor AS cycle_actor,r.status AS run_status,r.actor AS run_actor,
+                          g.kind AS gate_kind,g.status AS gate_status,
+                          a.state AS attempt_state,a.terminal_at,
+                          m.outcome AS result_outcome
+                   FROM assistant_cognitive_mutation_handoffs h
+                   JOIN assistant_cognitive_owner_waits w ON w.id=h.wait_id
+                   JOIN assistant_cognitive_cycles c ON c.id=h.cycle_id
+                     AND w.cycle_id=c.id
+                   JOIN assistant_autonomy_runs r ON r.id=h.run_id
+                     AND c.autonomy_run_id=r.id
+                   JOIN assistant_autonomy_human_gates g ON g.public_id=h.gate_id
+                   JOIN assistant_autonomy_mutation_attempts a ON a.id=h.attempt_id
+                   JOIN assistant_autonomy_mutation_results m ON m.id=h.result_id
+                     AND m.attempt_id=a.id
+                   WHERE h.public_id=?""",
+                (clean_handoff,),
+            ).fetchone()
+            if (
+                row is None
+                or row["actor"] != clean_actor
+                or row["cycle_actor"] != clean_actor
+                or row["run_actor"] != clean_actor
+            ):
+                raise PermissionError("Mutation handoff exacto no encontrado.")
+            if (
+                row["wait_state"] == "resolved"
+                and row["wait_resolution"] == "mutation_handoff_continued"
+                and row["cycle_status"] == "evaluation_ready"
+                and row["run_status"] in {
+                    AutonomyRunStatus.RUNNING.value,
+                    AutonomyRunStatus.COMPLETED.value,
+                }
+            ):
+                return self._required_cycle(str(row["cycle_public_id"]), actor=clean_actor)
+            if not (
+                row["wait_state"] == "pending"
+                and row["wait_reason"] == "mutation_review_required"
+                and row["wait_gate"] == row["gate_id"]
+                and row["cycle_status"] == "waiting_owner"
+                and row["run_status"] in {
+                    AutonomyRunStatus.RUNNING.value,
+                    AutonomyRunStatus.COMPLETED.value,
+                }
+                and row["gate_kind"] == HumanGateKind.MUTATION_REVIEW.value
+                and row["gate_status"] == HumanGateStatus.APPROVED.value
+                and row["attempt_state"] == "succeeded"
+                and row["terminal_at"] is not None
+                and row["result_outcome"] == "filesystem_succeeded"
+            ):
+                raise PermissionError("Mutation handoff no admite continuación cognitiva.")
+            now = _now()
+            connection.execute(
+                """UPDATE assistant_cognitive_owner_waits
+                   SET state='resolved',resolution='mutation_handoff_continued',
+                       resolved_at=?,resolved_by=? WHERE id=? AND state='pending'""",
+                (now, clean_actor, int(row["wait_id"])),
+            )
+            self._set_cycle(
+                connection, int(row["cycle_id"]), "waiting_owner", "evaluation_ready", now
+            )
+            self._event(
+                connection,
+                cycle_id=int(row["cycle_id"]),
+                turn_id=int(row["source_turn_id"]),
+                event_type="owner_resumed",
+                from_status="waiting_owner",
+                to_status="evaluation_ready",
+                step_id=str(row["step_id"]),
+                gate_id=str(row["gate_id"]),
+                summary_code="mutation_handoff_continued",
+                created_at=now,
+            )
+            cycle_public_id = str(row["cycle_public_id"])
+        return self._required_cycle(cycle_public_id, actor=clean_actor)
+
+    @staticmethod
+    def _public_mutation_handoff_connection(
+        connection: sqlite3.Connection, row: sqlite3.Row
+    ) -> dict[str, Any]:
+        lineage = connection.execute(
+            """SELECT h.*,p.public_id AS proposal_public_id,
+                      b.proposal_sha256,a.public_id AS attempt_public_id,
+                      m.public_id AS result_public_id,r.public_id AS run_public_id,
+                      c.public_id AS cycle_public_id,w.public_id AS wait_public_id,
+                      t.public_id AS source_turn_public_id
+               FROM assistant_cognitive_mutation_handoffs h
+               JOIN assistant_autonomy_mutation_proposals p ON p.id=h.proposal_id
+               JOIN assistant_autonomy_mutation_gate_bindings b ON b.id=h.binding_id
+               JOIN assistant_autonomy_mutation_attempts a ON a.id=h.attempt_id
+               JOIN assistant_autonomy_mutation_results m ON m.id=h.result_id
+               JOIN assistant_autonomy_runs r ON r.id=h.run_id
+               JOIN assistant_cognitive_cycles c ON c.id=h.cycle_id
+               JOIN assistant_cognitive_owner_waits w ON w.id=h.wait_id
+               JOIN assistant_cognitive_turns t ON t.id=h.source_turn_id
+               WHERE h.id=?""",
+            (int(row["id"]),),
+        ).fetchone()
+        assert lineage is not None
+        return {
+            "public_id": str(lineage["public_id"]),
+            "request_key": str(lineage["request_key"]),
+            "proposal_id": str(lineage["proposal_public_id"]),
+            "proposal_sha256": str(lineage["proposal_sha256"]),
+            "binding_id": int(lineage["binding_id"]),
+            "gate_id": str(lineage["gate_id"]),
+            "run_id": str(lineage["run_public_id"]),
+            "step_id": str(lineage["step_id"]),
+            "attempt_id": str(lineage["attempt_public_id"]),
+            "result_id": str(lineage["result_public_id"]),
+            "cycle_id": str(lineage["cycle_public_id"]),
+            "wait_id": str(lineage["wait_public_id"]),
+            "source_turn_id": str(lineage["source_turn_public_id"]),
+            "actor": str(lineage["actor"]),
+            "workspace_root": str(lineage["workspace_root"]),
+            "workspace_st_dev": int(lineage["workspace_st_dev"]),
+            "workspace_st_ino": int(lineage["workspace_st_ino"]),
+            "workspace_mount_id": int(lineage["workspace_mount_id"]),
+            "created_at": str(lineage["created_at"]),
+        }
 
     def abandon_turn(self, cycle_id: str, turn_id: str, *, actor: str) -> dict[str, Any]:
         cycle = self._cycle(cycle_id, actor=actor)
@@ -1319,27 +1848,47 @@ class LocalCognitiveActionLoop:
     def _model_advance(self, cycle: Any, *, kind: str) -> CognitiveAdvanceResult:
         run_id = str(cycle["autonomy_run_public_id"])
         durable_run_completed = False
+        mutation_observed = False
         if kind == "evaluate":
             with self.database.connect() as connection:
                 observed = connection.execute(
                     """
-                    SELECT source_request_id, step_id
+                    SELECT id, source_request_id, step_id, disposition
                     FROM assistant_cognitive_turns
                     WHERE cycle_id=? AND kind='act' AND state='completed'
-                      AND source_request_id IS NOT NULL
                     ORDER BY sequence DESC LIMIT 1
                     """,
                     (int(cycle["id"]),),
                 ).fetchone()
             if observed is None:
                 raise PermissionError("No existe una acción observada para evaluar.")
-            result = self.autonomy.execution_result(
-                run_id,
-                str(observed["source_request_id"]),
-                actor=str(cycle["actor"]),
-            )
-            if result is None:
-                raise PermissionError("La observación exacta ya no existe.")
+            if observed["source_request_id"] is not None:
+                result = self.autonomy.execution_result(
+                    run_id,
+                    str(observed["source_request_id"]),
+                    actor=str(cycle["actor"]),
+                )
+                if result is None:
+                    raise PermissionError("La observación exacta ya no existe.")
+            elif observed["disposition"] == "mutation_review_requested":
+                with self.database.connect() as connection:
+                    mutation = connection.execute(
+                        """SELECT 1 FROM assistant_cognitive_mutation_handoffs h
+                           JOIN assistant_cognitive_owner_waits w ON w.id=h.wait_id
+                           WHERE h.cycle_id=? AND h.source_turn_id=? AND h.actor=?
+                             AND w.state='resolved'
+                             AND w.resolution='mutation_handoff_continued'""",
+                        (int(cycle["id"]), int(observed["id"]), str(cycle["actor"])),
+                    ).fetchone()
+                if mutation is None:
+                    raise PermissionError("Mutation handoff continuado no existe.")
+                mutation_observed = True
+                result = None
+                self.autonomy.finalize_execution_run_if_ready(
+                    run_id, actor=str(cycle["actor"])
+                )
+            else:
+                raise PermissionError("La acción no tiene una observación durable evaluable.")
             step, _latest = self._first_incomplete(
                 run_id, actor=str(cycle["actor"]), allow_completed=True
             )
@@ -1380,6 +1929,7 @@ class LocalCognitiveActionLoop:
             result=result,
             kind=kind,
             owner_context=turn.get("owner_context"),
+            mutation_observed=mutation_observed,
         )
         try:
             reply = self.language_engine.reply(
@@ -1423,6 +1973,10 @@ class LocalCognitiveActionLoop:
         step, _latest = self._first_incomplete(run_id, actor=str(cycle["actor"]))
         if step is None:
             raise PermissionError("No existe un step incompleto ejecutable.")
+        if step.capability is Capability.SELF_MODIFY:
+            raise PermissionError(
+                "self.modify requiere request_mutation_review especializado."
+            )
         turn = self._reserve_turn(cycle, kind="act", step_id=step.step_id)
         retry_source = self._exact_retry_source(cycle, turn, step_id=step.step_id)
         run = self.autonomy.get(run_id)
@@ -1555,21 +2109,37 @@ class LocalCognitiveActionLoop:
         run = self.autonomy.get(run_id)
         if run is None or run.get("actor") != actor:
             raise PermissionError("AutonomyRun no encontrado para el propietario.")
-        if allow_completed and run["status"] == AutonomyRunStatus.COMPLETED.value:
-            plan_steps = run["plan"]["steps"]
-            results = self.autonomy.execution_results(run_id, actor=actor)
-            succeeded = {item["step_id"] for item in results if item["outcome"] == "succeeded"}
-            if all(str(item["step_id"]) in succeeded for item in plan_steps):
-                return None, None
-        contract = AutonomyExecutionBinding(self.autonomy).bind(run_id, actor=actor)
+        if (
+            allow_completed
+            and run["status"] == AutonomyRunStatus.COMPLETED.value
+            and self.autonomy.first_incomplete_plan_step(run_id, actor=actor) is None
+        ):
+            return None, None
+        AutonomyExecutionBinding(self.autonomy).bind(run_id, actor=actor)
         results = self.autonomy.execution_results(run_id, actor=actor)
-        succeeded = {item["step_id"] for item in results if item["outcome"] == "succeeded"}
-        step = next((item for item in contract.plan.steps if item.step_id not in succeeded), None)
+        step = self.autonomy.first_incomplete_plan_step(run_id, actor=actor)
         latest = next(
-            (item for item in reversed(results) if step and item["step_id"] == step.step_id),
+            (
+                item
+                for item in reversed(results)
+                if step
+                and step.capability is Capability.PROCESS_EXEC
+                and item["step_id"] == step.step_id
+            ),
             None,
         )
         return step, latest
+
+    @staticmethod
+    def _require_cognitive_plan(plan: RunPlan) -> None:
+        allowed = {Capability.PROCESS_EXEC, Capability.SELF_MODIFY}
+        if any(step.capability not in allowed for step in plan.steps):
+            raise PermissionError("El ciclo cognitivo solo admite process.exec y self.modify.")
+        if any(
+            step.capability is Capability.SELF_MODIFY and not step.requires_human_gate
+            for step in plan.steps
+        ):
+            raise PermissionError("Todo step self.modify requiere revisión humana especializada.")
 
     def _model_input(
         self,
@@ -1579,6 +2149,7 @@ class LocalCognitiveActionLoop:
         result: Any,
         kind: str,
         owner_context: str | None = None,
+        mutation_observed: bool = False,
     ) -> tuple[str, tuple[str, ...]]:
         objective = str(cycle["objective"])
         recalled = self.memory.recall(
@@ -1586,7 +2157,10 @@ class LocalCognitiveActionLoop:
             project=str(cycle["workspace_root"]),
             limit=_MAX_CONTEXT_ITEMS,
         )
-        reserved_items = (1 if result is not None else 0) + (1 if owner_context else 0)
+        reserved_items = (
+            (1 if result is not None or mutation_observed else 0)
+            + (1 if owner_context else 0)
+        )
         memory_limit = _MAX_CONTEXT_ITEMS - reserved_items
         blocks: list[str] = []
         if owner_context:
@@ -1602,6 +2176,11 @@ class LocalCognitiveActionLoop:
         if result is not None:
             observation = _observation_block(result)
             blocks.append(observation)
+        elif mutation_observed:
+            blocks.append(
+                "OBSERVACIÓN DURABLE: self.modify terminó succeeded con "
+                "MutationResult filesystem_succeeded y handoff owner explícito."
+            )
         context = _bounded_context(blocks)
         step_id = step.step_id if step is not None else ""
         prompt = (

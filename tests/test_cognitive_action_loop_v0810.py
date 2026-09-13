@@ -161,6 +161,11 @@ def test_schema_58_is_vault_only_idempotent_and_preserves_schema_57(tmp_path: Pa
     with database.connect() as connection:
         connection.executescript(
             """
+            DROP TRIGGER IF EXISTS trg_cognitive_mutation_evaluate_source;
+            DROP TRIGGER IF EXISTS trg_cognitive_mutation_handoff_integrity;
+            DROP TRIGGER IF EXISTS trg_cognitive_mutation_handoff_no_update;
+            DROP TRIGGER IF EXISTS trg_cognitive_mutation_handoff_no_delete;
+            DROP TABLE IF EXISTS assistant_cognitive_mutation_handoffs;
             DROP TABLE assistant_cognitive_cycle_events;
             DROP TABLE assistant_cognitive_turns;
             DROP TABLE assistant_cognitive_cycles;
@@ -173,7 +178,7 @@ def test_schema_58_is_vault_only_idempotent_and_preserves_schema_57(tmp_path: Pa
     with database.connect() as connection:
         assert connection.execute(
             "SELECT value FROM schema_meta WHERE key='schema_version'"
-        ).fetchone()[0] == "60"
+        ).fetchone()[0] == "61"
 
 
 def test_schema_constraints_immutability_and_append_only(tmp_path: Path) -> None:

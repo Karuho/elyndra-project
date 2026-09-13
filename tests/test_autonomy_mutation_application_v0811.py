@@ -303,7 +303,7 @@ def test_run_always_remains_waiting_human(tmp_path: Path) -> None:
         ).fetchone()[0] == "waiting_human"
 
 
-def test_schema_remains_60_and_no_generic_events_disclose_content(tmp_path: Path) -> None:
+def test_schema61_and_no_generic_events_disclose_content(tmp_path: Path) -> None:
     marker = b"private-marker\n"
     database, _repository, applicator, proposal, gate, _workspace = _approved(
         tmp_path, _create(content=marker)
@@ -312,7 +312,7 @@ def test_schema_remains_60_and_no_generic_events_disclose_content(tmp_path: Path
     with database.connect() as connection:
         assert connection.execute(
             "SELECT value FROM schema_meta WHERE key='schema_version'"
-        ).fetchone()[0] == "60"
+        ).fetchone()[0] == "61"
         payloads = "".join(
             str(row[0])
             for row in connection.execute("SELECT payload_json FROM assistant_autonomy_events")

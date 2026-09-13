@@ -113,7 +113,7 @@ def _table_names(database: Database) -> set[str]:
         }
 
 
-def test_fresh_vault_and_root_migrate_to_schema_60_with_vault_only_tables(
+def test_fresh_vault_and_root_migrate_to_schema_61_with_vault_only_tables(
     tmp_path: Path,
 ) -> None:
     root = _database(tmp_path / "root.sqlite3", role="root")
@@ -123,7 +123,7 @@ def test_fresh_vault_and_root_migrate_to_schema_60_with_vault_only_tables(
         with database.connect() as connection:
             assert connection.execute(
                 "SELECT value FROM schema_meta WHERE key='schema_version'"
-            ).fetchone()[0] == "60"
+            ).fetchone()[0] == "61"
 
     assert "assistant_autonomy_mutation_proposals" not in _table_names(root)
     assert "assistant_autonomy_mutation_items" not in _table_names(root)
@@ -131,12 +131,21 @@ def test_fresh_vault_and_root_migrate_to_schema_60_with_vault_only_tables(
     assert "assistant_autonomy_mutation_items" in _table_names(vault)
 
 
-def test_schema_59_to_60_preserves_autonomy_rows_and_is_idempotent(
+def test_schema_59_to_61_preserves_autonomy_rows_and_is_idempotent(
     tmp_path: Path,
 ) -> None:
     repository, run, database = _run(tmp_path)
     assert repository.get(run.run_id) is not None
     with database.connect() as connection:
+        connection.executescript(
+            """
+            DROP TRIGGER IF EXISTS trg_cognitive_mutation_evaluate_source;
+            DROP TRIGGER IF EXISTS trg_cognitive_mutation_handoff_integrity;
+            DROP TRIGGER IF EXISTS trg_cognitive_mutation_handoff_no_update;
+            DROP TRIGGER IF EXISTS trg_cognitive_mutation_handoff_no_delete;
+            DROP TABLE IF EXISTS assistant_cognitive_mutation_handoffs;
+            """
+        )
         connection.execute("DROP TABLE assistant_autonomy_mutation_items")
         connection.execute("DROP TABLE assistant_autonomy_mutation_proposals")
         connection.execute(
@@ -149,7 +158,7 @@ def test_schema_59_to_60_preserves_autonomy_rows_and_is_idempotent(
     with database.connect() as connection:
         assert connection.execute(
             "SELECT value FROM schema_meta WHERE key='schema_version'"
-        ).fetchone()[0] == "60"
+        ).fetchone()[0] == "61"
         assert connection.execute(
             "SELECT COUNT(*) FROM assistant_autonomy_runs WHERE public_id=?",
             (run.run_id,),

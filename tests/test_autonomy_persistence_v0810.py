@@ -84,7 +84,7 @@ def test_schema_58_is_vault_scoped_and_idempotent(tmp_path: Path) -> None:
     with root.connect() as connection:
         assert connection.execute(
             "SELECT value FROM schema_meta WHERE key='schema_version'"
-        ).fetchone()[0] == "60"
+        ).fetchone()[0] == "61"
 
         assert connection.execute(
             """
@@ -96,7 +96,7 @@ def test_schema_58_is_vault_scoped_and_idempotent(tmp_path: Path) -> None:
     with vault.connect() as connection:
         assert connection.execute(
             "SELECT value FROM schema_meta WHERE key='schema_version'"
-        ).fetchone()[0] == "60"
+        ).fetchone()[0] == "61"
 
         for table in (
             "assistant_autonomy_runs",
@@ -162,7 +162,7 @@ def test_schema_50_vault_upgrade_preserves_existing_data(tmp_path: Path) -> None
 
         assert connection.execute(
             "SELECT value FROM schema_meta WHERE key='schema_version'"
-        ).fetchone()[0] == "60"
+        ).fetchone()[0] == "61"
 
         assert connection.execute(
             """
@@ -668,7 +668,7 @@ def test_schema_52_upgrade_preserves_legacy_authority_json_without_rewrite(
         ).fetchone()
 
         assert schema is not None
-        assert schema[0] == "60"
+        assert schema[0] == "61"
 
         row = connection.execute(
             """
