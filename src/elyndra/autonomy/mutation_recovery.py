@@ -7,14 +7,20 @@ import hashlib
 import json
 import os
 import stat
+import uuid
+from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Any
 
 from elyndra.autonomy.linux_fs import (
+    RENAME_NOREPLACE,
     LinuxFilesystemError,
     LinuxStat,
+    fsync_fd,
     openat2,
+    renameat2,
     statx_fd,
     validate_metadata,
 )
@@ -25,6 +31,7 @@ from elyndra.autonomy.workspace_lease import (
     WorkspaceIdentity,
     WorkspaceLeaseCoordinator,
     WorkspaceLeaseMode,
+    WorkspaceLeaseReceipt,
 )
 
 _MANIFEST_DOMAIN_BYTES = b"elyndra.mutation-manifest.v1\0"
@@ -34,6 +41,7 @@ _EMERGENCY_BLOCKADE_DOMAIN = "elyndra.mutation-recovery-blockade.v1"
 _FORMAT_VERSION = "v1"
 _MAX_MANIFEST_BYTES = 262_144
 _MAX_BLOCKADE_BYTES = 16_384
+MAX_RECOVERY_RECONCILE_STEPS = 16
 _TERMINAL_STATES = frozenset(
     {"succeeded", "expired", "stale", "failed_before_publication", "rolled_back"}
 )
@@ -135,6 +143,18 @@ class MutationRecoveryPlan:
 
 
 @dataclass(frozen=True, slots=True)
+class MutationReconciliationResult:
+    """Bounded metadata from one internal recovery reconciliation."""
+
+    attempt_public_id: str | None
+    initial_disposition: MutationRecoveryDisposition
+    final_disposition: MutationRecoveryDisposition
+    steps_performed: int
+    deferred: bool
+    recovery_code: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class _ObjectObservation:
     metadata: LinuxStat
     size: int
@@ -171,58 +191,75 @@ class MutationRecoveryInspector:
         identity = self.coordinator.identity(workspace_root)
         lease = self.coordinator.acquire(identity, WorkspaceLeaseMode.EXCLUSIVE)
         try:
-            lease.receipt.require_live(mode=WorkspaceLeaseMode.EXCLUSIVE, identity=identity)
-            if self.coordinator.identity(workspace_root) != identity:
-                raise MutationRecoveryError("Workspace cambió tras adquirir recovery lease.")
-            root_fd = self._open_exact_root(identity)
-            try:
-                try:
-                    journal_fd = openat2(
-                        root_fd,
-                        JOURNAL_NAME,
-                        os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC,
-                    )
-                except LinuxFilesystemError as exc:
-                    blockade = _BlockadeObservation(MutationBlockadeState.ABSENT, None, None)
-                    return self._manual_plan(
-                        identity,
-                        blockade,
-                        "journal_missing" if _is_enoent(exc) else "journal_invalid",
-                        attempt_public_id,
-                    )
-                try:
-                    try:
-                        journal_metadata = validate_metadata(journal_fd, directory=True)
-                    except (LinuxFilesystemError, OSError):
-                        return self._manual_plan(
-                            identity,
-                            _BlockadeObservation(MutationBlockadeState.ABSENT, None, None),
-                            "journal_invalid",
-                            attempt_public_id,
-                        )
-                    if (
-                        journal_metadata.uid != os.geteuid()
-                        or stat.S_IMODE(journal_metadata.mode) != 0o700
-                        or journal_metadata.mount_id != identity.mount_id
-                    ):
-                        return self._manual_plan(
-                            identity,
-                            _BlockadeObservation(MutationBlockadeState.ABSENT, None, None),
-                            "journal_invalid",
-                            attempt_public_id,
-                        )
-                    return self._inspect_locked(
-                        identity,
-                        root_fd,
-                        journal_fd,
-                        attempt_public_id=attempt_public_id,
-                    )
-                finally:
-                    os.close(journal_fd)
-            finally:
-                os.close(root_fd)
+            return self._inspect_under_live_lease(
+                workspace_root,
+                identity=identity,
+                lease_receipt=lease.receipt,
+                attempt_public_id=attempt_public_id,
+            )
         finally:
             lease.close()
+
+    def _inspect_under_live_lease(
+        self,
+        workspace_root: str,
+        *,
+        identity: WorkspaceIdentity,
+        lease_receipt: WorkspaceLeaseReceipt,
+        attempt_public_id: str | None,
+    ) -> MutationRecoveryPlan:
+        """Inspect fresh evidence while the caller retains the exact live EX lease."""
+
+        lease_receipt.require_live(mode=WorkspaceLeaseMode.EXCLUSIVE, identity=identity)
+        if self.coordinator.identity(workspace_root) != identity:
+            raise MutationRecoveryError("Workspace cambió tras adquirir recovery lease.")
+        root_fd = self._open_exact_root(identity)
+        try:
+            try:
+                journal_fd = openat2(
+                    root_fd,
+                    JOURNAL_NAME,
+                    os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC,
+                )
+            except LinuxFilesystemError as exc:
+                blockade = _BlockadeObservation(MutationBlockadeState.ABSENT, None, None)
+                return self._manual_plan(
+                    identity,
+                    blockade,
+                    "journal_missing" if _is_enoent(exc) else "journal_invalid",
+                    attempt_public_id,
+                )
+            try:
+                try:
+                    journal_metadata = validate_metadata(journal_fd, directory=True)
+                except (LinuxFilesystemError, OSError):
+                    return self._manual_plan(
+                        identity,
+                        _BlockadeObservation(MutationBlockadeState.ABSENT, None, None),
+                        "journal_invalid",
+                        attempt_public_id,
+                    )
+                if (
+                    journal_metadata.uid != os.geteuid()
+                    or stat.S_IMODE(journal_metadata.mode) != 0o700
+                    or journal_metadata.mount_id != identity.mount_id
+                ):
+                    return self._manual_plan(
+                        identity,
+                        _BlockadeObservation(MutationBlockadeState.ABSENT, None, None),
+                        "journal_invalid",
+                        attempt_public_id,
+                    )
+                return self._inspect_locked(
+                    identity,
+                    root_fd,
+                    journal_fd,
+                    attempt_public_id=attempt_public_id,
+                )
+            finally:
+                os.close(journal_fd)
+        finally:
+            os.close(root_fd)
 
     @staticmethod
     def _open_exact_root(identity: WorkspaceIdentity) -> int:
@@ -620,6 +657,7 @@ class MutationRecoveryInspector:
                 MutationBlockadeState.MISMATCHED, value, blockade.raw_sha256
             )
         if blockade.state is MutationBlockadeState.EMERGENCY_RECOVERY:
+            emergency_sequence = value.get("manifest_sequence")
             emergency_exact = bool(
                 attempt is not None
                 and manifest is not None
@@ -627,8 +665,10 @@ class MutationRecoveryInspector:
                 == hashlib.sha256(identity.canonical_root.encode()).hexdigest()
                 and value.get("initial_blockade_sha256")
                 == attempt["initial_blockade_sha256"]
-                and value.get("manifest_sequence") == manifest.sequence
-                and value.get("manifest_tail_sha256") == manifest.tail_sha256
+                and type(emergency_sequence) is int
+                and 0 <= emergency_sequence <= manifest.sequence
+                and value.get("manifest_tail_sha256")
+                == manifest.record_hashes[emergency_sequence]
                 and value.get("run_public_id") == attempt["run_public_id"]
                 and value.get("step_id") == attempt["step_id"]
                 and _bounded_text(value.get("recovery_code"), 80)
@@ -991,6 +1031,408 @@ class MutationRecoveryInspector:
         )
 
 
+class MutationRecoveryReconciler:
+    """Advance only non-destructive durable recovery consistency state."""
+
+    def __init__(
+        self,
+        repository: AutonomyRepository,
+        *,
+        workspace_lease_coordinator: WorkspaceLeaseCoordinator | None = None,
+        crash_hook: Callable[[str], None] | None = None,
+    ) -> None:
+        self.repository = repository
+        self.coordinator = workspace_lease_coordinator or WorkspaceLeaseCoordinator()
+        self.inspector = MutationRecoveryInspector(
+            repository, workspace_lease_coordinator=self.coordinator
+        )
+        self._crash_hook = crash_hook or (lambda _point: None)
+
+    def reconcile(
+        self,
+        workspace_root: str,
+        *,
+        attempt_public_id: str | None = None,
+    ) -> MutationReconciliationResult:
+        """Perform bounded recovery steps under one continuously live EX lease."""
+
+        identity = self.coordinator.identity(workspace_root)
+        lease = self.coordinator.acquire(identity, WorkspaceLeaseMode.EXCLUSIVE)
+        try:
+            initial: MutationRecoveryDisposition | None = None
+            steps = 0
+            while steps < MAX_RECOVERY_RECONCILE_STEPS:
+                plan = self.inspector._inspect_under_live_lease(
+                    workspace_root,
+                    identity=identity,
+                    lease_receipt=lease.receipt,
+                    attempt_public_id=attempt_public_id,
+                )
+                if initial is None:
+                    initial = plan.disposition
+                if plan.disposition in {
+                    MutationRecoveryDisposition.PRECLAIM_ORPHAN_UNBLOCKED,
+                    MutationRecoveryDisposition.MANUAL_INTERVENTION_REQUIRED,
+                    MutationRecoveryDisposition.ALREADY_TERMINAL,
+                }:
+                    return self._result(plan, initial, steps, deferred=False)
+                if plan.disposition in {
+                    MutationRecoveryDisposition.BLOCKED_PRECLAIM_ORPHAN,
+                    MutationRecoveryDisposition.CLEANUP_REQUIRED,
+                    MutationRecoveryDisposition.ROLLBACK_REQUIRED,
+                }:
+                    return self._result(plan, initial, steps, deferred=True)
+                if plan.attempt_public_id is None:
+                    raise MutationRecoveryError("Recovery plan no identifica attempt.")
+                if plan.disposition is MutationRecoveryDisposition.EMERGENCY_BLOCKADE_REQUIRED:
+                    self._create_emergency_blockade(identity, lease.receipt, plan)
+                    steps += 1
+                    self._crash_hook("emergency_blockade_durable")
+                    continue
+                if plan.disposition in {
+                    MutationRecoveryDisposition.FAILED_BEFORE_PUBLICATION,
+                    MutationRecoveryDisposition.STALE,
+                }:
+                    state = plan.disposition.value
+                    appended = self._append_manifest_record(
+                        identity, lease.receipt, plan, state
+                    )
+                    if not appended:
+                        raise MutationRecoveryError("Recovery outcome no avanzó.")
+                    steps += 1
+                    self._crash_hook(f"recovery_manifest_durable:{state}")
+                    continue
+                if plan.disposition is MutationRecoveryDisposition.COMPLETE_FILESYSTEM_SUCCESS:
+                    if plan.attempt_state == "publishing":
+                        appended = self._append_manifest_record(
+                            identity, lease.receipt, plan, "filesystem_applied"
+                        )
+                        if appended:
+                            steps += 1
+                            self._crash_hook(
+                                "recovery_manifest_durable:filesystem_applied"
+                            )
+                            continue
+                        self._reconcile_filesystem_applied(plan, identity, lease.receipt)
+                        steps += 1
+                        continue
+                    if plan.attempt_state == "filesystem_applied":
+                        appended = self._append_manifest_record(
+                            identity, lease.receipt, plan, "filesystem_succeeded"
+                        )
+                        if not appended:
+                            raise MutationRecoveryError("Outcome filesystem ya era inesperado.")
+                        steps += 1
+                        self._crash_hook(
+                            "recovery_manifest_durable:filesystem_succeeded"
+                        )
+                        continue
+                    raise MutationRecoveryError("Estado filesystem success no reconciliable.")
+                if plan.disposition is MutationRecoveryDisposition.ADOPT_DURABLE_OUTCOME:
+                    self._adopt_result(plan, identity, lease.receipt)
+                    steps += 1
+                    self._crash_hook("recovery_result_durable")
+                    continue
+                if plan.disposition is MutationRecoveryDisposition.TERMINALIZATION_REQUIRED:
+                    if (
+                        plan.result_outcome is None
+                        or plan.result_public_id is None
+                        or plan.manifest is None
+                    ):
+                        raise MutationRecoveryError("Terminalización sin MutationResult.")
+                    self.repository._reconcile_mutation_terminal(
+                        attempt_public_id=plan.attempt_public_id,
+                        workspace_identity=identity,
+                        lease_receipt=lease.receipt,
+                        result_outcome=plan.result_outcome,
+                        result_public_id=str(plan.result_public_id),
+                        manifest_sequence=plan.manifest.sequence,
+                        manifest_sha256=plan.manifest.tail_sha256,
+                    )
+                    steps += 1
+                    self._crash_hook("recovery_terminal_state_durable")
+                    continue
+                raise MutationRecoveryError("Disposition recovery no implementada en 9A.5b1.")
+            raise MutationRecoveryError("Recovery excedió el límite de pasos.")
+        finally:
+            lease.close()
+
+    @staticmethod
+    def _result(
+        plan: MutationRecoveryPlan,
+        initial: MutationRecoveryDisposition,
+        steps: int,
+        *,
+        deferred: bool,
+    ) -> MutationReconciliationResult:
+        return MutationReconciliationResult(
+            attempt_public_id=plan.attempt_public_id,
+            initial_disposition=initial,
+            final_disposition=plan.disposition,
+            steps_performed=steps,
+            deferred=deferred,
+            recovery_code=plan.recovery_code,
+        )
+
+    def _open_journal(
+        self,
+        identity: WorkspaceIdentity,
+        lease_receipt: WorkspaceLeaseReceipt,
+    ) -> tuple[int, int]:
+        lease_receipt.require_live(mode=WorkspaceLeaseMode.EXCLUSIVE, identity=identity)
+        root_fd = self.inspector._open_exact_root(identity)
+        try:
+            journal_fd = openat2(
+                root_fd, JOURNAL_NAME, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC
+            )
+            metadata = validate_metadata(journal_fd, directory=True)
+            if (
+                metadata.uid != os.geteuid()
+                or stat.S_IMODE(metadata.mode) != 0o700
+                or metadata.mount_id != identity.mount_id
+            ):
+                raise MutationRecoveryError("Journal recovery no confiable.")
+            return root_fd, journal_fd
+        except BaseException:
+            os.close(root_fd)
+            raise
+
+    def _create_emergency_blockade(
+        self,
+        identity: WorkspaceIdentity,
+        lease_receipt: WorkspaceLeaseReceipt,
+        plan: MutationRecoveryPlan,
+    ) -> None:
+        if plan.manifest is None or plan.attempt_public_id is None:
+            raise MutationRecoveryError("Emergency blockade sin evidencia completa.")
+        attempt = self.inspector._attempt_row(plan.attempt_public_id)
+        if attempt is None or not _attempt_matches_workspace(attempt, identity):
+            raise MutationRecoveryError("Attempt emergency blockade cambió.")
+        payload = _canonical(
+            {
+                "domain": _EMERGENCY_BLOCKADE_DOMAIN,
+                "format_version": _FORMAT_VERSION,
+                "generation": "emergency",
+                "mutation_vault_id": self.inspector._mutation_vault_id(),
+                "attempt_public_id": plan.attempt_public_id,
+                "proposal_public_id": plan.proposal_public_id,
+                "proposal_sha256": plan.proposal_sha256,
+                "gate_id": plan.gate_id,
+                "run_public_id": plan.run_public_id,
+                "step_id": plan.step_id,
+                "workspace_st_dev": identity.st_dev,
+                "workspace_st_ino": identity.st_ino,
+                "workspace_mount_id": identity.mount_id,
+                "canonical_workspace_root_sha256": hashlib.sha256(
+                    identity.canonical_root.encode()
+                ).hexdigest(),
+                "initial_blockade_sha256": attempt["initial_blockade_sha256"],
+                "manifest_sequence": plan.manifest.sequence,
+                "manifest_tail_sha256": plan.manifest.tail_sha256,
+                "recovery_code": "missing_blockade",
+            }
+        )
+        root_fd, journal_fd = self._open_journal(identity, lease_receipt)
+        temp = ".blockade-recovery-" + uuid.uuid4().hex + ".tmp"
+        try:
+            if self.inspector._read_blockade(journal_fd) is not None:
+                raise MutationRecoveryError("Blockade apareció antes de recovery create.")
+            fd = os.open(
+                temp,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
+                0o600,
+                dir_fd=journal_fd,
+            )
+            try:
+                os.fchmod(fd, 0o600)
+                _write_all(fd, payload)
+                fsync_fd(fd)
+                metadata = validate_metadata(fd, directory=False)
+                if (
+                    metadata.uid != os.geteuid()
+                    or metadata.nlink != 1
+                    or stat.S_IMODE(metadata.mode) != 0o600
+                    or metadata.mount_id != identity.mount_id
+                ):
+                    raise MutationRecoveryError("Emergency blockade temp no confiable.")
+            finally:
+                os.close(fd)
+            renameat2(journal_fd, temp, journal_fd, BLOCKADE_NAME, RENAME_NOREPLACE)
+            fsync_fd(journal_fd)
+            observed = self.inspector._read_blockade(journal_fd)
+            if observed != payload or hashlib.sha256(observed).digest() != hashlib.sha256(
+                payload
+            ).digest():
+                raise MutationRecoveryError("Emergency blockade durable no coincide.")
+        finally:
+            os.close(journal_fd)
+            os.close(root_fd)
+
+    def _append_manifest_record(
+        self,
+        identity: WorkspaceIdentity,
+        lease_receipt: WorkspaceLeaseReceipt,
+        plan: MutationRecoveryPlan,
+        state: str,
+    ) -> bool:
+        if state not in {
+            "filesystem_applied",
+            "filesystem_succeeded",
+            "failed_before_publication",
+            "stale",
+        }:
+            raise MutationRecoveryError("Record recovery no permitido en 9A.5b1.")
+        if plan.manifest is None or plan.attempt_public_id is None:
+            raise MutationRecoveryError("Manifest recovery ausente.")
+        attempt = self.inspector._attempt_row(plan.attempt_public_id)
+        if attempt is None or not _attempt_matches_workspace(attempt, identity):
+            raise MutationRecoveryError("Attempt cambió antes de manifest append.")
+        root_fd, journal_fd = self._open_journal(identity, lease_receipt)
+        try:
+            attempt_fd = openat2(
+                journal_fd,
+                plan.attempt_public_id,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC,
+            )
+            try:
+                directory = validate_metadata(attempt_fd, directory=True)
+                if directory.mount_id != identity.mount_id:
+                    raise MutationRecoveryError("Attempt journal cambió de mount.")
+                read_fd = openat2(
+                    attempt_fd, "manifest.jsonl", os.O_RDONLY | os.O_CLOEXEC
+                )
+                try:
+                    before = validate_metadata(read_fd, directory=False)
+                    raw = _read_bounded(read_fd, _MAX_MANIFEST_BYTES)
+                finally:
+                    os.close(read_fd)
+                current = self.inspector._validate_manifest(
+                    raw, expected_identity=attempt, attempt=attempt
+                )
+                if (
+                    current.sequence != plan.manifest.sequence
+                    or current.tail_sha256 != plan.manifest.tail_sha256
+                    or current.record_hashes != plan.manifest.record_hashes
+                ):
+                    raise MutationRecoveryError("Manifest cambió tras recovery inspection.")
+                if current.record_states[-1] == state:
+                    if current.db_sequence not in {current.sequence, current.sequence - 1}:
+                        raise MutationRecoveryError("Replay manifest no es contiguo.")
+                    return False
+                identity_fields = {
+                    "attempt_public_id": attempt["public_id"],
+                    "proposal_public_id": attempt["proposal_public_id"],
+                    "proposal_sha256": attempt["proposal_sha256"],
+                    "gate_id": attempt["gate_id"],
+                    "run_public_id": attempt["run_public_id"],
+                    "step_id": attempt["step_id"],
+                    "workspace_st_dev": int(attempt["workspace_st_dev"]),
+                    "workspace_st_ino": int(attempt["workspace_st_ino"]),
+                    "workspace_mount_id": int(attempt["workspace_mount_id"]),
+                }
+                record: dict[str, Any] = {
+                    **identity_fields,
+                    "attempt_state": state,
+                    "files": [],
+                    "format_version": _FORMAT_VERSION,
+                    "manifest_domain": _MANIFEST_DOMAIN,
+                    "previous_record_sha256": current.tail_sha256,
+                    "sequence": current.sequence + 1,
+                    "timestamp": _time_text(),
+                }
+                digest = hashlib.sha256(
+                    _MANIFEST_DOMAIN_BYTES + _canonical(record)
+                ).hexdigest()
+                encoded = _canonical({**record, "record_sha256": digest}) + b"\n"
+                if len(raw) + len(encoded) > _MAX_MANIFEST_BYTES:
+                    raise MutationRecoveryError("Manifest recovery excede límite.")
+                append_fd = os.open(
+                    "manifest.jsonl",
+                    os.O_WRONLY | os.O_APPEND | os.O_CLOEXEC | os.O_NOFOLLOW,
+                    dir_fd=attempt_fd,
+                )
+                try:
+                    after = validate_metadata(append_fd, directory=False)
+                    if (
+                        (after.device, after.inode) != (before.device, before.inode)
+                        or after.mount_id != identity.mount_id
+                        or after.uid != os.geteuid()
+                        or after.nlink != 1
+                        or stat.S_IMODE(after.mode) != 0o600
+                    ):
+                        raise MutationRecoveryError("Manifest append fd no confiable.")
+                    _write_all(append_fd, encoded)
+                    fsync_fd(append_fd)
+                finally:
+                    os.close(append_fd)
+                return True
+            finally:
+                os.close(attempt_fd)
+        finally:
+            os.close(journal_fd)
+            os.close(root_fd)
+
+    def _reconcile_filesystem_applied(
+        self,
+        plan: MutationRecoveryPlan,
+        identity: WorkspaceIdentity,
+        lease_receipt: WorkspaceLeaseReceipt,
+    ) -> None:
+        assert plan.manifest is not None and plan.attempt_public_id is not None
+        if plan.manifest.record_states[-1] != "filesystem_applied":
+            raise MutationRecoveryError("Filesystem-applied record no es tail.")
+        self.repository._reconcile_mutation_filesystem_applied(
+            attempt_public_id=plan.attempt_public_id,
+            workspace_identity=identity,
+            lease_receipt=lease_receipt,
+            expected_manifest_sequence=int(plan.manifest.db_sequence),
+            expected_manifest_sha256=str(plan.manifest.db_sha256),
+            manifest_sequence=plan.manifest.sequence,
+            manifest_sha256=plan.manifest.tail_sha256,
+        )
+
+    def _adopt_result(
+        self,
+        plan: MutationRecoveryPlan,
+        identity: WorkspaceIdentity,
+        lease_receipt: WorkspaceLeaseReceipt,
+    ) -> None:
+        if (
+            plan.manifest is None
+            or plan.attempt_public_id is None
+            or plan.outcome_manifest_without_result is None
+            or plan.outcome_sequence is None
+            or plan.outcome_sha256 is None
+            or plan.manifest.db_sequence is None
+            or plan.manifest.db_sha256 is None
+        ):
+            raise MutationRecoveryError("Outcome adoptable incompleto.")
+        outcome = plan.outcome_manifest_without_result
+        if outcome == "filesystem_succeeded":
+            published = len(plan.files)
+            restored = 0
+        elif outcome == "rolled_back":
+            restored = sum(
+                item.physical_state is MutationRecoveryPhysicalState.EXACT_ROLLED_BACK
+                for item in plan.files
+            )
+            published = restored
+        else:
+            published = restored = 0
+        self.repository._reconcile_mutation_result(
+            attempt_public_id=plan.attempt_public_id,
+            workspace_identity=identity,
+            lease_receipt=lease_receipt,
+            expected_manifest_sequence=plan.manifest.db_sequence,
+            expected_manifest_sha256=plan.manifest.db_sha256,
+            outcome=outcome,
+            outcome_sequence=plan.outcome_sequence,
+            outcome_sha256=plan.outcome_sha256,
+            published_count=published,
+            restored_count=restored,
+        )
+
+
 def _classify_physical(
     row: dict[str, Any],
     *,
@@ -1322,6 +1764,19 @@ def _canonical(value: object) -> bytes:
         separators=(",", ":"),
         allow_nan=False,
     ).encode("utf-8")
+
+
+def _time_text() -> str:
+    return datetime.now(UTC).isoformat(timespec="microseconds").replace("+00:00", "Z")
+
+
+def _write_all(fd: int, value: bytes) -> None:
+    offset = 0
+    while offset < len(value):
+        written = os.write(fd, value[offset:])
+        if written <= 0:
+            raise MutationRecoveryError("Escritura recovery durable incompleta.")
+        offset += written
 
 
 def _read_bounded(fd: int, maximum: int) -> bytes:
