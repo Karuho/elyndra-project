@@ -15,6 +15,7 @@ from enum import StrEnum
 from typing import Any
 
 from elyndra.autonomy.linux_fs import (
+    RENAME_EXCHANGE,
     RENAME_NOREPLACE,
     LinuxFilesystemError,
     LinuxStat,
@@ -22,6 +23,7 @@ from elyndra.autonomy.linux_fs import (
     openat2,
     renameat2,
     statx_fd,
+    unlinkat,
     validate_metadata,
 )
 from elyndra.autonomy.repository import AutonomyRepository
@@ -41,7 +43,7 @@ _EMERGENCY_BLOCKADE_DOMAIN = "elyndra.mutation-recovery-blockade.v1"
 _FORMAT_VERSION = "v1"
 _MAX_MANIFEST_BYTES = 262_144
 _MAX_BLOCKADE_BYTES = 16_384
-MAX_RECOVERY_RECONCILE_STEPS = 16
+MAX_RECOVERY_RECONCILE_STEPS = 48
 _TERMINAL_STATES = frozenset(
     {"succeeded", "expired", "stale", "failed_before_publication", "rolled_back"}
 )
@@ -56,6 +58,18 @@ _EMERGENCY_BLOCKADE_KEYS = frozenset(
         "workspace_mount_id", "canonical_workspace_root_sha256",
         "initial_blockade_sha256", "manifest_sequence", "manifest_tail_sha256",
         "recovery_code",
+    }
+)
+_REMOVAL_READY_KEYS = frozenset(
+    {
+        "cleanup_manifest_sequence",
+        "cleanup_manifest_tail_sha256",
+        "removal_ready",
+        "result_final_manifest_sequence",
+        "result_final_manifest_sha256",
+        "result_outcome",
+        "result_public_id",
+        "updated_at",
     }
 )
 
@@ -462,12 +476,22 @@ class MutationRecoveryInspector:
             return _BlockadeObservation(MutationBlockadeState.FOREIGN_VAULT, value, digest)
         domain = value.get("domain")
         if domain == _EMERGENCY_BLOCKADE_DOMAIN:
-            if (
-                frozenset(value) != _EMERGENCY_BLOCKADE_KEYS
-                or value.get("generation") != "emergency"
+            keys = frozenset(value)
+            initial = keys == _EMERGENCY_BLOCKADE_KEYS
+            removal_ready = keys == _EMERGENCY_BLOCKADE_KEYS | _REMOVAL_READY_KEYS
+            if value.get("generation") != "emergency" or not (
+                initial or removal_ready
             ):
                 return _BlockadeObservation(
                     MutationBlockadeState.MALFORMED, value, digest
+                )
+            if removal_ready:
+                if value.get("removal_ready") is not True:
+                    return _BlockadeObservation(
+                        MutationBlockadeState.MALFORMED, value, digest
+                    )
+                return _BlockadeObservation(
+                    MutationBlockadeState.EXACT_REMOVAL_READY, value, digest
                 )
             return _BlockadeObservation(MutationBlockadeState.EMERGENCY_RECOVERY, value, digest)
         if domain != _BLOCKADE_DOMAIN:
@@ -656,7 +680,8 @@ class MutationRecoveryInspector:
             return _BlockadeObservation(
                 MutationBlockadeState.MISMATCHED, value, blockade.raw_sha256
             )
-        if blockade.state is MutationBlockadeState.EMERGENCY_RECOVERY:
+        emergency = value.get("domain") == _EMERGENCY_BLOCKADE_DOMAIN
+        if emergency:
             emergency_sequence = value.get("manifest_sequence")
             emergency_exact = bool(
                 attempt is not None
@@ -685,6 +710,18 @@ class MutationRecoveryInspector:
             return _BlockadeObservation(
                 MutationBlockadeState.MISMATCHED, value, blockade.raw_sha256
             )
+        if (
+            attempt is not None
+            and blockade.state is MutationBlockadeState.EXACT_REMOVAL_READY
+            and not emergency
+        ):
+            original = {key: item for key, item in value.items() if key not in _REMOVAL_READY_KEYS}
+            if hashlib.sha256(_canonical(original)).hexdigest() != attempt[
+                "initial_blockade_sha256"
+            ]:
+                return _BlockadeObservation(
+                    MutationBlockadeState.MISMATCHED, value, blockade.raw_sha256
+                )
         if attempt is None and (
             manifest is None
             or value.get("initial_manifest_sequence") != 0
@@ -890,6 +927,10 @@ class MutationRecoveryInspector:
                 invalid_blockade
                 or not result_evidence_valid
                 or (coverage_required and not complete_coverage)
+                or (
+                    blockade.state is MutationBlockadeState.EXACT_REMOVAL_READY
+                    and not cleanup_ready
+                )
             ):
                 disposition = MutationRecoveryDisposition.MANUAL_INTERVENTION_REQUIRED
             elif state in _TERMINAL_STATES:
@@ -950,7 +991,7 @@ class MutationRecoveryInspector:
                 else:
                     disposition = MutationRecoveryDisposition.MANUAL_INTERVENTION_REQUIRED
             elif state == "publishing":
-                if not complete_coverage:
+                if not complete_coverage or not _rollback_matrix_valid(state, files):
                     disposition = MutationRecoveryDisposition.MANUAL_INTERVENTION_REQUIRED
                 elif all_published:
                     disposition = MutationRecoveryDisposition.COMPLETE_FILESYSTEM_SUCCESS
@@ -968,7 +1009,9 @@ class MutationRecoveryInspector:
             elif state == "recovery_required":
                 disposition = (
                     MutationRecoveryDisposition.ROLLBACK_REQUIRED
-                    if complete_coverage and exact
+                    if complete_coverage
+                    and exact
+                    and _rollback_matrix_valid(state, files)
                     else MutationRecoveryDisposition.MANUAL_INTERVENTION_REQUIRED
                 )
             elif state == "filesystem_applied":
@@ -1032,7 +1075,7 @@ class MutationRecoveryInspector:
 
 
 class MutationRecoveryReconciler:
-    """Advance only non-destructive durable recovery consistency state."""
+    """Advance bounded durable recovery consistency state under one EX lease."""
 
     def __init__(
         self,
@@ -1076,18 +1119,25 @@ class MutationRecoveryReconciler:
                     MutationRecoveryDisposition.ALREADY_TERMINAL,
                 }:
                     return self._result(plan, initial, steps, deferred=False)
-                if plan.disposition in {
-                    MutationRecoveryDisposition.BLOCKED_PRECLAIM_ORPHAN,
-                    MutationRecoveryDisposition.CLEANUP_REQUIRED,
-                    MutationRecoveryDisposition.ROLLBACK_REQUIRED,
-                }:
-                    return self._result(plan, initial, steps, deferred=True)
                 if plan.attempt_public_id is None:
                     raise MutationRecoveryError("Recovery plan no identifica attempt.")
                 if plan.disposition is MutationRecoveryDisposition.EMERGENCY_BLOCKADE_REQUIRED:
                     self._create_emergency_blockade(identity, lease.receipt, plan)
                     steps += 1
                     self._crash_hook("emergency_blockade_durable")
+                    continue
+                if plan.disposition is MutationRecoveryDisposition.BLOCKED_PRECLAIM_ORPHAN:
+                    self._remove_preclaim_blockade(identity, lease.receipt, plan)
+                    steps += 1
+                    self._crash_hook("recovery_preclaim_blockade_removed")
+                    continue
+                if plan.disposition is MutationRecoveryDisposition.ROLLBACK_REQUIRED:
+                    self._reconcile_rollback(identity, lease.receipt, plan)
+                    steps += 1
+                    continue
+                if plan.disposition is MutationRecoveryDisposition.CLEANUP_REQUIRED:
+                    self._reconcile_cleanup(identity, lease.receipt, plan)
+                    steps += 1
                     continue
                 if plan.disposition in {
                     MutationRecoveryDisposition.FAILED_BEFORE_PUBLICATION,
@@ -1279,9 +1329,12 @@ class MutationRecoveryReconciler:
             "filesystem_applied",
             "filesystem_succeeded",
             "failed_before_publication",
+            "recovery_required",
+            "rolled_back",
+            "cleanup_ready",
             "stale",
         }:
-            raise MutationRecoveryError("Record recovery no permitido en 9A.5b1.")
+            raise MutationRecoveryError("Record recovery no permitido.")
         if plan.manifest is None or plan.attempt_public_id is None:
             raise MutationRecoveryError("Manifest recovery ausente.")
         attempt = self.inspector._attempt_row(plan.attempt_public_id)
@@ -1371,6 +1424,574 @@ class MutationRecoveryReconciler:
         finally:
             os.close(journal_fd)
             os.close(root_fd)
+
+    def _reconcile_rollback(
+        self,
+        identity: WorkspaceIdentity,
+        lease_receipt: WorkspaceLeaseReceipt,
+        plan: MutationRecoveryPlan,
+    ) -> None:
+        if plan.manifest is None or plan.attempt_public_id is None:
+            raise MutationRecoveryError("Rollback plan incompleto.")
+        if plan.attempt_state == "publishing":
+            appended = self._append_manifest_record(
+                identity, lease_receipt, plan, "recovery_required"
+            )
+            if appended:
+                self._crash_hook("recovery_required_manifest_durable")
+                return
+            self.repository._reconcile_mutation_recovery_required(
+                attempt_public_id=plan.attempt_public_id,
+                workspace_identity=identity,
+                lease_receipt=lease_receipt,
+                expected_manifest_sequence=int(plan.manifest.db_sequence),
+                expected_manifest_sha256=str(plan.manifest.db_sha256),
+                manifest_sequence=plan.manifest.sequence,
+                manifest_sha256=plan.manifest.tail_sha256,
+            )
+            return
+        if plan.attempt_state != "recovery_required":
+            raise MutationRecoveryError("Rollback attempt state inválido.")
+        for item in reversed(plan.files):
+            old = item.db_state
+            physical = item.physical_state
+            target: str | None = None
+            if old == "publication_intent":
+                target = (
+                    "discarded"
+                    if physical is MutationRecoveryPhysicalState.EXACT_UNPUBLISHED
+                    else "published"
+                )
+            elif old == "published":
+                target = "rollback_intent"
+            elif old == "rollback_intent":
+                if physical is MutationRecoveryPhysicalState.EXACT_PUBLISHED:
+                    self._rollback_syscall(identity, lease_receipt, plan, item.ordinal)
+                    self._crash_hook(
+                        f"recovery_rollback_syscall_durable:{item.ordinal}"
+                    )
+                    return
+                target = "rolled_back"
+            if target is not None:
+                self.repository._reconcile_mutation_rollback_file_state(
+                    attempt_public_id=plan.attempt_public_id,
+                    workspace_identity=identity,
+                    lease_receipt=lease_receipt,
+                    ordinal=item.ordinal,
+                    expected_state=old,
+                    target_state=target,
+                )
+                if target == "rollback_intent":
+                    self._crash_hook(
+                        f"recovery_rollback_intent_durable:{item.ordinal}"
+                    )
+                return
+        appended = self._append_manifest_record(
+            identity, lease_receipt, plan, "rolled_back"
+        )
+        if not appended:
+            raise MutationRecoveryError("rolled_back outcome no avanzó.")
+        self._crash_hook("recovery_manifest_durable:rolled_back")
+
+    def _rollback_syscall(
+        self,
+        identity: WorkspaceIdentity,
+        lease_receipt: WorkspaceLeaseReceipt,
+        plan: MutationRecoveryPlan,
+        ordinal: int,
+    ) -> None:
+        lease_receipt.require_live(mode=WorkspaceLeaseMode.EXCLUSIVE, identity=identity)
+        attempt = self.inspector._attempt_row(str(plan.attempt_public_id))
+        if attempt is None or attempt["state"] != "recovery_required":
+            raise MutationRecoveryError("Rollback syscall attempt cambió.")
+        _proposal, rows = self.inspector._file_rows(attempt)
+        matches = [row for row in rows if int(row["ordinal"]) == ordinal]
+        if len(matches) != 1 or matches[0]["state"] != "rollback_intent":
+            raise MutationRecoveryError("Rollback syscall file cambió.")
+        row = matches[0]
+        root_fd, journal_fd = self._open_journal(identity, lease_receipt)
+        try:
+            attempt_fd = openat2(
+                journal_fd,
+                str(attempt["public_id"]),
+                os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC,
+            )
+            try:
+                attempt_meta = validate_metadata(attempt_fd, directory=True)
+                if attempt_meta.mount_id != identity.mount_id:
+                    raise MutationRecoveryError("Rollback attempt mount cambió.")
+                parts = str(row["relative_path"]).split("/")
+                parent_path = "." if len(parts) == 1 else "/".join(parts[:-1])
+                parent_fd = openat2(
+                    root_fd,
+                    parent_path,
+                    os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC,
+                )
+                try:
+                    parent = validate_metadata(parent_fd, directory=True)
+                    if (
+                        parent.device != int(row["parent_st_dev"])
+                        or parent.inode != int(row["parent_st_ino"])
+                        or parent.mount_id != int(row["parent_mount_id"])
+                    ):
+                        raise MutationRecoveryError("Rollback parent cambió.")
+                    target = _observe_optional(parent_fd, parts[-1])
+                    artifact = _observe_optional(attempt_fd, str(row["artifact_name"]))
+                    witness = _observe_optional(attempt_fd, str(row["witness_name"]))
+                    if (
+                        _classify_physical(
+                            row, target=target, stage=artifact, witness=witness
+                        )
+                        is not MutationRecoveryPhysicalState.EXACT_PUBLISHED
+                    ):
+                        raise MutationRecoveryError("Rollback precondición física cambió.")
+                    _require_destructive_rollback_evidence(
+                        row,
+                        target=target,
+                        artifact=artifact,
+                        witness=witness,
+                        trusted_mount_id=identity.mount_id,
+                    )
+                    lease_receipt.require_live(
+                        mode=WorkspaceLeaseMode.EXCLUSIVE, identity=identity
+                    )
+                    if row["operation"] == "create":
+                        unlinkat(parent_fd, parts[-1])
+                        fsync_fd(parent_fd)
+                        if _observe_optional(parent_fd, parts[-1]) is not None:
+                            raise MutationRecoveryError("CREATE rollback postcondición falló.")
+                    else:
+                        renameat2(
+                            attempt_fd,
+                            str(row["artifact_name"]),
+                            parent_fd,
+                            parts[-1],
+                            RENAME_EXCHANGE,
+                        )
+                        fsync_fd(parent_fd)
+                        fsync_fd(attempt_fd)
+                        restored = _observe_optional(parent_fd, parts[-1])
+                        if not _matches_original(
+                            restored,
+                            row,
+                            _db_inode(row, "preimage"),
+                            int(row["expected_preimage_size"]),
+                            str(row["expected_preimage_sha256"]),
+                        ):
+                            raise MutationRecoveryError(
+                                "REPLACE rollback postcondición falló."
+                            )
+                finally:
+                    os.close(parent_fd)
+            finally:
+                os.close(attempt_fd)
+        finally:
+            os.close(journal_fd)
+            os.close(root_fd)
+
+    def _reconcile_cleanup(
+        self,
+        identity: WorkspaceIdentity,
+        lease_receipt: WorkspaceLeaseReceipt,
+        plan: MutationRecoveryPlan,
+    ) -> None:
+        if (
+            plan.attempt_public_id is None
+            or plan.result_outcome is None
+            or plan.manifest is None
+        ):
+            raise MutationRecoveryError("Cleanup plan incompleto.")
+        attempt = self.inspector._attempt_row(plan.attempt_public_id)
+        result = None if attempt is None else self.inspector._result_row(int(attempt["id"]))
+        if result is None:
+            raise MutationRecoveryError("Cleanup MutationResult desapareció.")
+        outcome_sequence = int(result["final_manifest_sequence"])
+        cleanup_sequences = tuple(
+            index
+            for index, state in enumerate(plan.manifest.record_states)
+            if state == "cleanup_ready"
+        )
+        if cleanup_sequences:
+            if cleanup_sequences != (outcome_sequence + 1,) or plan.manifest.sequence != (
+                outcome_sequence + 1
+            ):
+                raise MutationRecoveryError("cleanup_ready no sigue exactamente al outcome.")
+        elif plan.manifest.sequence != outcome_sequence:
+            raise MutationRecoveryError("Manifest contiene record entre outcome y cleanup_ready.")
+        if plan.blockade_state is MutationBlockadeState.EXACT_REMOVAL_READY:
+            self._remove_current_blockade(identity, lease_receipt, plan)
+            self._crash_hook("recovery_blockade_removed")
+            return
+        if attempt is None:
+            raise MutationRecoveryError("Cleanup attempt desapareció.")
+        if attempt["state"] != "cleanup_pending":
+            if plan.result_public_id is None or plan.attempt_state is None:
+                raise MutationRecoveryError("Cleanup result identity incompleta.")
+            self.repository._reconcile_mutation_cleanup_pending(
+                attempt_public_id=plan.attempt_public_id,
+                workspace_identity=identity,
+                lease_receipt=lease_receipt,
+                result_public_id=plan.result_public_id,
+                result_outcome=plan.result_outcome,
+                expected_attempt_state=plan.attempt_state,
+            )
+            return
+        _proposal, rows = self.inspector._file_rows(attempt)
+        observations = {item.ordinal: item for item in plan.files}
+        for row in reversed(rows):
+            if row["state"] == "publication_intent":
+                observed = observations.get(int(row["ordinal"]))
+                if (
+                    observed is None
+                    or observed.physical_state
+                    is not MutationRecoveryPhysicalState.EXACT_UNPUBLISHED
+                ):
+                    raise MutationRecoveryError(
+                        "Cleanup publication_intent no prueba no-publicación."
+                    )
+                self.repository._reconcile_mutation_cleanup_file_state(
+                    attempt_public_id=plan.attempt_public_id,
+                    workspace_identity=identity,
+                    lease_receipt=lease_receipt,
+                    ordinal=int(row["ordinal"]),
+                    expected_state="publication_intent",
+                )
+                return
+        root_fd, journal_fd = self._open_journal(identity, lease_receipt)
+        try:
+            attempt_fd = openat2(
+                journal_fd,
+                plan.attempt_public_id,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC,
+            )
+            try:
+                for row in reversed(rows):
+                    for name in (str(row["witness_name"]), str(row["artifact_name"])):
+                        observed = _observe_optional(attempt_fd, name)
+                        if observed is None:
+                            continue
+                        if not _cleanup_object_matches(
+                            row, name, observed, plan.result_outcome, identity.mount_id
+                        ):
+                            raise MutationRecoveryError("Cleanup artifact no coincide.")
+                        unlinkat(attempt_fd, name)
+                        fsync_fd(attempt_fd)
+                        return
+                for row in reversed(rows):
+                    if row["state"] in {"planned", "staged"}:
+                        self.repository._reconcile_mutation_cleanup_file_state(
+                            attempt_public_id=plan.attempt_public_id,
+                            workspace_identity=identity,
+                            lease_receipt=lease_receipt,
+                            ordinal=int(row["ordinal"]),
+                            expected_state=str(row["state"]),
+                        )
+                        return
+                entries = set(os.listdir(attempt_fd))
+                if entries != {"manifest.jsonl"}:
+                    raise MutationRecoveryError("Cleanup encontró artifacts desconocidos.")
+            finally:
+                os.close(attempt_fd)
+            cleanup_tail = plan.manifest.record_states[-1] == "cleanup_ready"
+            if cleanup_tail:
+                if plan.manifest.db_pointer == "valid_prefix":
+                    self.repository._reconcile_mutation_cleanup_manifest_pointer(
+                        attempt_public_id=plan.attempt_public_id,
+                        workspace_identity=identity,
+                        lease_receipt=lease_receipt,
+                        expected_manifest_sequence=int(plan.manifest.db_sequence),
+                        expected_manifest_sha256=str(plan.manifest.db_sha256),
+                        cleanup_sequence=plan.manifest.sequence,
+                        cleanup_sha256=plan.manifest.tail_sha256,
+                    )
+                    return
+                if plan.manifest.db_pointer != "exact_tail":
+                    raise MutationRecoveryError("cleanup_ready DB pointer inválido.")
+                self._replace_with_removal_ready(
+                    identity, lease_receipt, plan, journal_fd
+                )
+                self._crash_hook("recovery_removal_ready_durable")
+                return
+            appended = self._append_manifest_record(
+                identity, lease_receipt, plan, "cleanup_ready"
+            )
+            if not appended:
+                raise MutationRecoveryError("cleanup_ready no avanzó.")
+            self._crash_hook("recovery_cleanup_ready_durable")
+        finally:
+            os.close(journal_fd)
+            os.close(root_fd)
+
+    def _replace_with_removal_ready(
+        self,
+        identity: WorkspaceIdentity,
+        lease_receipt: WorkspaceLeaseReceipt,
+        plan: MutationRecoveryPlan,
+        journal_fd: int,
+    ) -> None:
+        lease_receipt.require_live(mode=WorkspaceLeaseMode.EXCLUSIVE, identity=identity)
+        current = self.inspector._read_blockade(journal_fd)
+        if current is None:
+            raise MutationRecoveryError("Blockade desapareció antes de removal_ready.")
+        vault_id = self.inspector._mutation_vault_id()
+        blockade = self.inspector._classify_blockade_shape(current, vault_id=vault_id)
+        attempt = self.inspector._attempt_row(str(plan.attempt_public_id))
+        result = None if attempt is None else self.inspector._result_row(int(attempt["id"]))
+        manifest = (
+            None
+            if attempt is None
+            else self.inspector._read_manifest(
+                journal_fd,
+                str(attempt["public_id"]),
+                expected_identity=attempt,
+                attempt=attempt,
+                trusted_mount_id=identity.mount_id,
+            )
+        )
+        blockade = self.inspector._correlate_blockade(
+            blockade,
+            identity=identity,
+            vault_id=vault_id,
+            attempt=attempt,
+            manifest=manifest,
+        )
+        if (
+            attempt is None
+            or result is None
+            or manifest is None
+            or plan.manifest is None
+            or attempt["state"] != "cleanup_pending"
+            or blockade.state
+            not in {
+                MutationBlockadeState.EXACT_INITIAL,
+                MutationBlockadeState.EMERGENCY_RECOVERY,
+            }
+            or manifest != plan.manifest
+            or not _result_evidence_matches(attempt, result, blockade, manifest)
+            or not _has_exact_cleanup_ready(manifest, result)
+            or int(attempt["manifest_sequence"]) != manifest.sequence
+            or attempt["manifest_tail_sha256"] != manifest.tail_sha256
+        ):
+            raise MutationRecoveryError("Removal-ready evidence incompleta.")
+        value = blockade.value
+        assert value is not None
+        replacement = _canonical(
+            {
+                **value,
+                "cleanup_manifest_sequence": manifest.sequence,
+                "cleanup_manifest_tail_sha256": manifest.tail_sha256,
+                "removal_ready": True,
+                "result_final_manifest_sequence": int(result["final_manifest_sequence"]),
+                "result_final_manifest_sha256": str(result["final_manifest_sha256"]),
+                "result_outcome": str(result["outcome"]),
+                "result_public_id": str(result["public_id"]),
+                "updated_at": _time_text(),
+            }
+        )
+        temp = ".blockade-ready-" + uuid.uuid4().hex + ".tmp"
+        fd = os.open(
+            temp,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
+            0o600,
+            dir_fd=journal_fd,
+        )
+        try:
+            os.fchmod(fd, 0o600)
+            _write_all(fd, replacement)
+            fsync_fd(fd)
+            own = validate_metadata(fd, directory=False)
+            if (
+                own.mount_id != identity.mount_id
+                or own.uid != os.geteuid()
+                or own.nlink != 1
+                or stat.S_IMODE(own.mode) != 0o600
+            ):
+                raise MutationRecoveryError("Removal-ready temp mount inválido.")
+        finally:
+            os.close(fd)
+        self._prove_owned_temp(
+            journal_fd,
+            temp,
+            replacement,
+            own,
+            trusted_mount_id=identity.mount_id,
+        )
+        if self.inspector._read_blockade(journal_fd) != current:
+            self._remove_owned_temp(
+                journal_fd,
+                temp,
+                replacement,
+                own,
+                trusted_mount_id=identity.mount_id,
+            )
+            raise MutationRecoveryError("Blockade cambió antes de exchange.")
+        self._prove_owned_temp(
+            journal_fd,
+            temp,
+            replacement,
+            own,
+            trusted_mount_id=identity.mount_id,
+        )
+        renameat2(journal_fd, temp, journal_fd, BLOCKADE_NAME, RENAME_EXCHANGE)
+        fsync_fd(journal_fd)
+        try:
+            if _read_named(
+                journal_fd, temp, trusted_mount_id=identity.mount_id
+            ) != current:
+                raise MutationRecoveryError("Blockade exchanged-out no coincide.")
+        except BaseException:
+            renameat2(journal_fd, temp, journal_fd, BLOCKADE_NAME, RENAME_EXCHANGE)
+            fsync_fd(journal_fd)
+            self._remove_owned_temp(
+                journal_fd,
+                temp,
+                replacement,
+                own,
+                trusted_mount_id=identity.mount_id,
+            )
+            raise
+        unlinkat(journal_fd, temp)
+        fsync_fd(journal_fd)
+
+    @staticmethod
+    def _prove_owned_temp(
+        journal_fd: int,
+        name: str,
+        expected: bytes,
+        expected_metadata: LinuxStat,
+        *,
+        trusted_mount_id: int,
+    ) -> None:
+        fd = openat2(journal_fd, name, os.O_RDONLY | os.O_CLOEXEC)
+        try:
+            metadata = validate_metadata(fd, directory=False)
+            raw = _read_bounded(fd, _MAX_BLOCKADE_BYTES)
+        finally:
+            os.close(fd)
+        if (
+            (metadata.device, metadata.inode)
+            != (expected_metadata.device, expected_metadata.inode)
+            or metadata.mount_id != trusted_mount_id
+            or metadata.uid != os.geteuid()
+            or metadata.nlink != 1
+            or stat.S_IMODE(metadata.mode) != 0o600
+            or raw != expected
+        ):
+            raise MutationRecoveryError("Temp recovery propio cambió.")
+
+    @staticmethod
+    def _remove_owned_temp(
+        journal_fd: int,
+        name: str,
+        expected: bytes,
+        expected_metadata: LinuxStat,
+        *,
+        trusted_mount_id: int,
+    ) -> None:
+        MutationRecoveryReconciler._prove_owned_temp(
+            journal_fd,
+            name,
+            expected,
+            expected_metadata,
+            trusted_mount_id=trusted_mount_id,
+        )
+        unlinkat(journal_fd, name)
+        fsync_fd(journal_fd)
+
+    def _remove_current_blockade(
+        self,
+        identity: WorkspaceIdentity,
+        lease_receipt: WorkspaceLeaseReceipt,
+        plan: MutationRecoveryPlan,
+        *,
+        preclaim: bool = False,
+    ) -> None:
+        root_fd, journal_fd = self._open_journal(identity, lease_receipt)
+        try:
+            expected = self.inspector._read_blockade(journal_fd)
+            if expected is None:
+                raise MutationRecoveryError("Blockade ya no existe.")
+            blockade = self.inspector._classify_blockade_shape(
+                expected, vault_id=self.inspector._mutation_vault_id()
+            )
+            if preclaim:
+                if (
+                    blockade.state is not MutationBlockadeState.EXACT_INITIAL
+                    or blockade.value is None
+                    or not self.inspector._preclaim_lineage_matches(
+                        blockade.value, identity
+                    )
+                ):
+                    raise MutationRecoveryError("Preclaim blockade ya no es exacto.")
+            else:
+                attempt = self.inspector._attempt_row(str(plan.attempt_public_id))
+                result = (
+                    None
+                    if attempt is None
+                    else self.inspector._result_row(int(attempt["id"]))
+                )
+                blockade = self.inspector._correlate_blockade(
+                    blockade,
+                    identity=identity,
+                    vault_id=self.inspector._mutation_vault_id(),
+                    attempt=attempt,
+                    manifest=plan.manifest,
+                )
+                if (
+                    attempt is None
+                    or result is None
+                    or blockade.state is not MutationBlockadeState.EXACT_REMOVAL_READY
+                    or not _result_evidence_matches(
+                        attempt, result, blockade, plan.manifest
+                    )
+                    or not _has_exact_cleanup_ready(plan.manifest, result)
+                ):
+                    raise MutationRecoveryError("Removal-ready blockade ya no es exacto.")
+            tombstone = ".blockade-remove-" + uuid.uuid4().hex + ".tmp"
+            renameat2(
+                journal_fd, BLOCKADE_NAME, journal_fd, tombstone, RENAME_NOREPLACE
+            )
+            fsync_fd(journal_fd)
+            try:
+                observed = _read_named(
+                    journal_fd, tombstone, trusted_mount_id=identity.mount_id
+                )
+                value = json.loads(observed.decode("utf-8", errors="strict"))
+                if (
+                    observed != expected
+                    or value.get("attempt_public_id") != plan.attempt_public_id
+                    or (not preclaim and value.get("removal_ready") is not True)
+                ):
+                    raise MutationRecoveryError("Tombstone blockade no coincide.")
+            except BaseException:
+                renameat2(
+                    journal_fd, tombstone, journal_fd, BLOCKADE_NAME, RENAME_NOREPLACE
+                )
+                fsync_fd(journal_fd)
+                raise
+            unlinkat(journal_fd, tombstone)
+            fsync_fd(journal_fd)
+        finally:
+            os.close(journal_fd)
+            os.close(root_fd)
+
+    def _remove_preclaim_blockade(
+        self,
+        identity: WorkspaceIdentity,
+        lease_receipt: WorkspaceLeaseReceipt,
+        plan: MutationRecoveryPlan,
+    ) -> None:
+        fresh = self.inspector._inspect_under_live_lease(
+            identity.canonical_root,
+            identity=identity,
+            lease_receipt=lease_receipt,
+            attempt_public_id=plan.attempt_public_id,
+        )
+        if fresh.disposition is not MutationRecoveryDisposition.BLOCKED_PRECLAIM_ORPHAN:
+            raise MutationRecoveryError("Preclaim blockade cambió.")
+        self._remove_current_blockade(
+            identity, lease_receipt, fresh, preclaim=True
+        )
 
     def _reconcile_filesystem_applied(
         self,
@@ -1477,6 +2098,71 @@ def _classify_physical(
     return MutationRecoveryPhysicalState.AMBIGUOUS
 
 
+def _require_destructive_rollback_evidence(
+    row: dict[str, Any],
+    *,
+    target: _ObjectObservation | None,
+    artifact: _ObjectObservation | None,
+    witness: _ObjectObservation | None,
+    trusted_mount_id: int,
+) -> None:
+    stage_inode = _db_inode(row, "stage")
+    post_size = int(row["expected_postimage_size"])
+    post_sha256 = str(row["expected_postimage_sha256"])
+    if (
+        target is None
+        or witness is None
+        or stage_inode is None
+        or not _matches(target, stage_inode, post_size, post_sha256)
+        or not _matches(witness, stage_inode, post_size, post_sha256)
+        or (target.metadata.device, target.metadata.inode)
+        != (witness.metadata.device, witness.metadata.inode)
+        or target.metadata.mount_id != trusted_mount_id
+        or witness.metadata.mount_id != trusted_mount_id
+        or target.metadata.nlink != 2
+        or witness.metadata.nlink != 2
+    ):
+        raise MutationRecoveryError("Rollback postimage/witness metadata no es exacta.")
+
+    if row["operation"] == "create":
+        if (
+            artifact is not None
+            or target.metadata.uid != os.geteuid()
+            or witness.metadata.uid != os.geteuid()
+            or stat.S_IMODE(target.metadata.mode) != 0o600
+            or stat.S_IMODE(witness.metadata.mode) != 0o600
+        ):
+            raise MutationRecoveryError("CREATE rollback metadata no es exacta.")
+        return
+
+    preimage_inode = _db_inode(row, "preimage")
+    if (
+        artifact is None
+        or preimage_inode is None
+        or not _matches_original(
+            artifact,
+            row,
+            preimage_inode,
+            int(row["expected_preimage_size"]),
+            str(row["expected_preimage_sha256"]),
+        )
+        or artifact.metadata.mount_id != trusted_mount_id
+        or int(row["preimage_nlink"]) != 1
+        or artifact.metadata.nlink != 1
+    ):
+        raise MutationRecoveryError("REPLACE rollback backup metadata no es exacta.")
+    frozen_uid = int(row["preimage_uid"])
+    frozen_gid = int(row["preimage_gid"])
+    frozen_mode = int(row["preimage_mode"])
+    if any(
+        value.metadata.uid != frozen_uid
+        or value.metadata.gid != frozen_gid
+        or value.metadata.mode != frozen_mode
+        for value in (target, witness)
+    ):
+        raise MutationRecoveryError("REPLACE rollback postimage metadata no es exacta.")
+
+
 def _attempt_matches_workspace(
     attempt: dict[str, Any], identity: WorkspaceIdentity
 ) -> bool:
@@ -1538,6 +2224,29 @@ def _has_complete_item_coverage(
         ):
             return False
     return True
+
+
+def _rollback_matrix_valid(
+    attempt_state: str,
+    files: tuple[MutationRecoveryFileObservation, ...],
+) -> bool:
+    publishing = {
+        ("staged", MutationRecoveryPhysicalState.EXACT_UNPUBLISHED),
+        ("publication_intent", MutationRecoveryPhysicalState.EXACT_UNPUBLISHED),
+        ("publication_intent", MutationRecoveryPhysicalState.EXACT_PUBLISHED),
+        ("published", MutationRecoveryPhysicalState.EXACT_PUBLISHED),
+    }
+    recovery_required = publishing | {
+        ("planned", MutationRecoveryPhysicalState.EXACT_UNPUBLISHED),
+        ("discarded", MutationRecoveryPhysicalState.EXACT_UNPUBLISHED),
+        ("rollback_intent", MutationRecoveryPhysicalState.EXACT_PUBLISHED),
+        ("rollback_intent", MutationRecoveryPhysicalState.EXACT_ROLLED_BACK),
+        ("rolled_back", MutationRecoveryPhysicalState.EXACT_ROLLED_BACK),
+    }
+    allowed = publishing if attempt_state == "publishing" else recovery_required
+    return bool(files) and all(
+        (item.db_state, item.physical_state) in allowed for item in files
+    )
 
 
 def _outcome_is_adoptable(
@@ -1672,6 +2381,63 @@ def _matches_original(
     )
 
 
+def _cleanup_object_matches(
+    row: dict[str, Any],
+    name: str,
+    value: _ObjectObservation,
+    outcome: str,
+    trusted_mount_id: int,
+) -> bool:
+    state = str(row["state"])
+    operation = str(row["operation"])
+    is_witness = name == row["witness_name"]
+    trusted = (
+        value.metadata.mount_id == trusted_mount_id
+        and value.metadata.uid == os.geteuid()
+        and value.metadata.nlink in {1, 2}
+    )
+    if not trusted:
+        return False
+    post = (
+        value.size == int(row["expected_postimage_size"])
+        and value.sha256 == row["expected_postimage_sha256"]
+    )
+    stage_inode = _db_inode(row, "stage")
+    exact_stage = stage_inode is None or (
+        value.metadata.device, value.metadata.inode
+    ) == stage_inode
+    post_mode = 0o600 if operation == "create" else stat.S_IMODE(int(row["preimage_mode"]))
+    post_metadata = (
+        stat.S_IMODE(value.metadata.mode) == post_mode
+        and (
+            operation == "create"
+            and value.metadata.gid == os.getegid()
+            or operation != "create"
+            and (
+                value.metadata.uid == int(row["preimage_uid"])
+                and value.metadata.gid == int(row["preimage_gid"])
+            )
+        )
+    )
+    if is_witness:
+        return post and exact_stage and post_metadata
+    if state in {"planned", "staged", "discarded"}:
+        return post and exact_stage and post_metadata
+    if state == "published" and outcome == "filesystem_succeeded":
+        if operation == "create":
+            return False
+        return _matches_original(
+            value,
+            row,
+            _db_inode(row, "preimage"),
+            int(row["expected_preimage_size"]),
+            str(row["expected_preimage_sha256"]),
+        )
+    if state == "rolled_back" and outcome == "rolled_back":
+        return operation == "replace" and post and exact_stage and post_metadata
+    return False
+
+
 def _db_inode(row: dict[str, Any], prefix: str) -> tuple[int, int] | None:
     device = row.get(f"{prefix}_st_dev")
     inode = row.get(f"{prefix}_st_ino")
@@ -1764,6 +2530,24 @@ def _canonical(value: object) -> bytes:
         separators=(",", ":"),
         allow_nan=False,
     ).encode("utf-8")
+
+
+def _read_named(
+    directory_fd: int, name: str, *, trusted_mount_id: int | None = None
+) -> bytes:
+    fd = openat2(directory_fd, name, os.O_RDONLY | os.O_CLOEXEC)
+    try:
+        metadata = validate_metadata(fd, directory=False)
+        if (
+            metadata.uid != os.geteuid()
+            or metadata.nlink != 1
+            or stat.S_IMODE(metadata.mode) != 0o600
+            or (trusted_mount_id is not None and metadata.mount_id != trusted_mount_id)
+        ):
+            raise MutationRecoveryError("Recovery namespace object no confiable.")
+        return _read_bounded(fd, _MAX_BLOCKADE_BYTES)
+    finally:
+        os.close(fd)
 
 
 def _time_text() -> str:

@@ -24,7 +24,6 @@ from elyndra.autonomy import (
 )
 from elyndra.autonomy.mutation_application import MutationApplicator
 from elyndra.autonomy.mutation_recovery import (
-    MutationBlockadeState,
     MutationRecoveryDisposition,
     MutationRecoveryInspector,
     MutationRecoveryReconciler,
@@ -213,14 +212,14 @@ def test_reconciler_reuses_one_live_ex_lease_without_nested_inspect(
         lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("nested inspect")),
     )
     result = reconciler.reconcile(str(workspace), attempt_public_id=attempt)
-    assert result.final_disposition is MutationRecoveryDisposition.CLEANUP_REQUIRED
+    assert result.final_disposition is MutationRecoveryDisposition.ALREADY_TERMINAL
     assert calls == 1
 
 
 @pytest.mark.parametrize(
     ("fixture", "expected", "deferred"),
     [
-        ("preclaim", MutationRecoveryDisposition.BLOCKED_PRECLAIM_ORPHAN, True),
+        ("preclaim", MutationRecoveryDisposition.PRECLAIM_ORPHAN_UNBLOCKED, False),
         ("manual", MutationRecoveryDisposition.MANUAL_INTERVENTION_REQUIRED, False),
         ("terminal", MutationRecoveryDisposition.ALREADY_TERMINAL, False),
     ],
@@ -252,7 +251,10 @@ def test_noop_and_deferred_dispositions(tmp_path: Path, fixture, expected, defer
     assert result.final_disposition is expected
     assert result.deferred is deferred
     blockade_after = blockade.read_bytes() if blockade.exists() else None
-    assert blockade_after == blockade_before
+    if fixture == "preclaim":
+        assert blockade_before is not None and blockade_after is None
+    else:
+        assert blockade_after == blockade_before
 
 
 def test_preclaim_orphan_unblocked_is_noop(tmp_path: Path) -> None:
@@ -275,24 +277,10 @@ def test_emergency_blockade_is_exact_deterministic_and_never_overwritten(
     blockade.unlink()
     original_target = workspace / "src/new.py"
     result = reconciler.reconcile(str(workspace), attempt_public_id=attempt)
-    assert result.final_disposition is MutationRecoveryDisposition.CLEANUP_REQUIRED
-    value = json.loads(blockade.read_text())
-    assert set(value) == {
-        "domain", "format_version", "generation", "mutation_vault_id",
-        "attempt_public_id", "proposal_public_id", "proposal_sha256", "gate_id",
-        "run_public_id", "step_id", "workspace_st_dev", "workspace_st_ino",
-        "workspace_mount_id", "canonical_workspace_root_sha256",
-        "initial_blockade_sha256", "manifest_sequence", "manifest_tail_sha256",
-        "recovery_code",
-    }
-    assert value["domain"] == "elyndra.mutation-recovery-blockade.v1"
-    assert value["recovery_code"] == "missing_blockade"
-    exact = blockade.read_bytes()
-    assert inspector.inspect(str(workspace), attempt_public_id=attempt).blockade_state is (
-        MutationBlockadeState.EMERGENCY_RECOVERY
-    )
+    assert result.final_disposition is MutationRecoveryDisposition.ALREADY_TERMINAL
+    assert not blockade.exists()
     replay = reconciler.reconcile(str(workspace), attempt_public_id=attempt)
-    assert replay.deferred and blockade.read_bytes() == exact
+    assert replay.final_disposition is MutationRecoveryDisposition.ALREADY_TERMINAL
     assert not original_target.exists()
     assert _run_status(database) == "waiting_human"
 
@@ -318,9 +306,34 @@ def test_emergency_blockade_crash_replays_exactly(tmp_path: Path) -> None:
     with pytest.raises(SystemExit):
         reconciler.reconcile(str(workspace), attempt_public_id=attempt)
     exact = blockade.read_bytes()
+    value = json.loads(exact)
+    assert set(value) == {
+        "domain",
+        "format_version",
+        "generation",
+        "mutation_vault_id",
+        "attempt_public_id",
+        "proposal_public_id",
+        "proposal_sha256",
+        "gate_id",
+        "run_public_id",
+        "step_id",
+        "workspace_st_dev",
+        "workspace_st_ino",
+        "workspace_mount_id",
+        "canonical_workspace_root_sha256",
+        "initial_blockade_sha256",
+        "manifest_sequence",
+        "manifest_tail_sha256",
+        "recovery_code",
+    }
+    assert value["domain"] == "elyndra.mutation-recovery-blockade.v1"
+    assert value["generation"] == "emergency"
+    assert value["recovery_code"] == "missing_blockade"
     fresh = MutationRecoveryReconciler(repository, workspace_lease_coordinator=coordinator)
-    assert fresh.reconcile(str(workspace), attempt_public_id=attempt).deferred
-    assert blockade.read_bytes() == exact and crashes == 1
+    replay = fresh.reconcile(str(workspace), attempt_public_id=attempt)
+    assert replay.final_disposition is MutationRecoveryDisposition.ALREADY_TERMINAL
+    assert not blockade.exists() and exact and crashes == 1
     assert _run_status(database) == "waiting_human"
 
 
@@ -332,7 +345,7 @@ def test_clean_outcome_append_and_adoption(tmp_path: Path, disposition: str) -> 
     if disposition == "stale":
         (workspace / "src/a.py").write_bytes(b"foreign")
     result = reconciler.reconcile(str(workspace), attempt_public_id=attempt)
-    assert result.final_disposition is MutationRecoveryDisposition.CLEANUP_REQUIRED
+    assert result.final_disposition is MutationRecoveryDisposition.ALREADY_TERMINAL
     records = _records(workspace, attempt)
     assert [record["attempt_state"] for record in records].count(disposition) == 1
     with database.connect() as connection:
@@ -368,9 +381,12 @@ def test_clean_manifest_crash_adopts_without_duplicate_with_partial_coverage(
             "DELETE FROM assistant_autonomy_mutation_attempt_files WHERE ordinal=1"
         )
     fresh = MutationRecoveryReconciler(repository, workspace_lease_coordinator=coordinator)
-    assert fresh.reconcile(str(workspace), attempt_public_id=attempt).deferred
+    assert fresh.reconcile(str(workspace), attempt_public_id=attempt).final_disposition is (
+        MutationRecoveryDisposition.ALREADY_TERMINAL
+    )
     after = _records(workspace, attempt)
-    assert before == after
+    assert after[:-1] == before
+    assert after[-1]["attempt_state"] == "cleanup_ready"
     assert sum(record["attempt_state"] == "failed_before_publication" for record in after) == 1
 
 
@@ -386,7 +402,7 @@ def test_complete_filesystem_success_reconciles_db_without_target_changes(
             "SET state='publication_intent'"
         )
     result = reconciler.reconcile(str(workspace), attempt_public_id=attempt)
-    assert result.final_disposition is MutationRecoveryDisposition.CLEANUP_REQUIRED
+    assert result.final_disposition is MutationRecoveryDisposition.ALREADY_TERMINAL
     with database.connect() as connection:
         states = {
             row[0]
@@ -401,7 +417,7 @@ def test_complete_filesystem_success_reconciles_db_without_target_changes(
             "SELECT outcome,published_count,restored_count "
             "FROM assistant_autonomy_mutation_results"
         ).fetchone()
-    assert states == {"published"} and attempt_state == "cleanup_pending"
+    assert states == {"published"} and attempt_state == "succeeded"
     assert tuple(observed) == ("filesystem_succeeded", 2, 0)
     assert {path.name: path.read_bytes() for path in (workspace / "src").iterdir()} == targets
     assert _run_status(database) == "waiting_human"
@@ -415,8 +431,8 @@ def test_invalid_file_db_state_blocks_success_reconciliation(tmp_path: Path) -> 
             "UPDATE assistant_autonomy_mutation_attempt_files SET state='staged' WHERE ordinal=0"
         )
     before = (workspace / "src/a.py").read_bytes()
-    with pytest.raises(PermissionError, match="Estado DB de publicación no reconciliable"):
-        reconciler.reconcile(str(workspace), attempt_public_id=attempt)
+    result = reconciler.reconcile(str(workspace), attempt_public_id=attempt)
+    assert result.final_disposition is MutationRecoveryDisposition.MANUAL_INTERVENTION_REQUIRED
     assert (workspace / "src/a.py").read_bytes() == before
 
 
@@ -445,7 +461,9 @@ def test_filesystem_success_crash_replay_is_idempotent(
     with pytest.raises(SystemExit):
         crashing.reconcile(str(workspace), attempt_public_id=attempt)
     fresh = MutationRecoveryReconciler(repository, workspace_lease_coordinator=coordinator)
-    assert fresh.reconcile(str(workspace), attempt_public_id=attempt).deferred
+    assert fresh.reconcile(str(workspace), attempt_public_id=attempt).final_disposition is (
+        MutationRecoveryDisposition.ALREADY_TERMINAL
+    )
     records = _records(workspace, attempt)
     assert sum(record["attempt_state"] == "filesystem_applied" for record in records) == 1
     assert sum(record["attempt_state"] == "filesystem_succeeded" for record in records) == 1
@@ -492,7 +510,7 @@ def test_terminalization_and_crash_replay_preserve_cleanup_evidence(tmp_path: Pa
     assert _run_status(database) == "waiting_human"
 
 
-def test_rollback_required_is_deferred_without_target_mutation(tmp_path: Path) -> None:
+def test_rollback_required_converges_without_unrelated_target_mutation(tmp_path: Path) -> None:
     values = _foundation(tmp_path, _create("src/a.py", b"a"), _create("src/b.py", b"b"))
     database, _repo, applicator, _inspector, reconciler, proposal, sha, gate, workspace = values
     original = applicator._publish
@@ -509,10 +527,11 @@ def test_rollback_required_is_deferred_without_target_mutation(tmp_path: Path) -
     blockade = workspace / ".elyndra-mutation-journal/blockade.json"
     blockade_bytes = blockade.read_bytes()
     result = reconciler.reconcile(str(workspace), attempt_public_id=attempt)
-    assert result.final_disposition is MutationRecoveryDisposition.ROLLBACK_REQUIRED
-    assert result.deferred
-    assert {path.name: path.read_bytes() for path in (workspace / "src").iterdir()} == before
-    assert blockade.read_bytes() == blockade_bytes
+    assert result.final_disposition is MutationRecoveryDisposition.ALREADY_TERMINAL
+    assert not result.deferred
+    assert before == {"a.py": b"a"}
+    assert not any((workspace / "src").iterdir())
+    assert blockade_bytes and not blockade.exists()
 
 
 def test_existing_durable_rolled_back_outcome_is_adopted(tmp_path: Path) -> None:
@@ -541,7 +560,7 @@ def test_existing_durable_rolled_back_outcome_is_adopted(tmp_path: Path) -> None
     attempt = _attempt(database)
     result = reconciler.reconcile(str(workspace), attempt_public_id=attempt)
     assert result.initial_disposition is MutationRecoveryDisposition.ADOPT_DURABLE_OUTCOME
-    assert result.final_disposition is MutationRecoveryDisposition.CLEANUP_REQUIRED
+    assert result.final_disposition is MutationRecoveryDisposition.ALREADY_TERMINAL
     with database.connect() as connection:
         observed = connection.execute(
             "SELECT outcome,published_count,restored_count "

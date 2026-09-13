@@ -206,6 +206,263 @@ class AutonomyRepository:
                 values,
             )
 
+    def _reconcile_mutation_recovery_required(
+        self,
+        *,
+        attempt_public_id: str,
+        workspace_identity: WorkspaceIdentity,
+        lease_receipt: WorkspaceLeaseReceipt,
+        expected_manifest_sequence: int,
+        expected_manifest_sha256: str,
+        manifest_sequence: int,
+        manifest_sha256: str,
+    ) -> None:
+        """Enter the exact durable rollback boundary without touching a target."""
+
+        lease_receipt.require_live(
+            mode=WorkspaceLeaseMode.EXCLUSIVE, identity=workspace_identity
+        )
+        with self.database.connect_mutation_durable() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            lease_receipt.require_live(
+                mode=WorkspaceLeaseMode.EXCLUSIVE, identity=workspace_identity
+            )
+            attempt = self._recovery_attempt(
+                connection, attempt_public_id, workspace_identity
+            )
+            result = connection.execute(
+                "SELECT 1 FROM assistant_autonomy_mutation_results WHERE attempt_id=?",
+                (int(attempt["id"]),),
+            ).fetchone()
+            if (
+                attempt["state"] not in {"publishing", "recovery_required"}
+                or result is not None
+                or int(attempt["manifest_sequence"]) != expected_manifest_sequence
+                or attempt["manifest_tail_sha256"] != expected_manifest_sha256
+            ):
+                raise PermissionError("Boundary recovery_required no coincide.")
+            now = _utcnow_text()
+            if attempt["state"] == "publishing":
+                connection.execute(
+                    "UPDATE assistant_autonomy_mutation_attempts SET "
+                    "state='recovery_required',recovery_code='recovery_reconciliation',"
+                    "manifest_sequence=?,manifest_tail_sha256=?,state_updated_at=? WHERE id=?",
+                    (manifest_sequence, manifest_sha256, now, int(attempt["id"])),
+                )
+            else:
+                connection.execute(
+                    "UPDATE assistant_autonomy_mutation_attempts SET "
+                    "manifest_sequence=?,manifest_tail_sha256=?,state_updated_at=? WHERE id=?",
+                    (manifest_sequence, manifest_sha256, now, int(attempt["id"])),
+                )
+
+    def _reconcile_mutation_rollback_file_state(
+        self,
+        *,
+        attempt_public_id: str,
+        workspace_identity: WorkspaceIdentity,
+        lease_receipt: WorkspaceLeaseReceipt,
+        ordinal: int,
+        expected_state: str,
+        target_state: str,
+    ) -> None:
+        """Advance one exact per-file rollback state and no other field."""
+
+        allowed = {
+            ("publication_intent", "discarded"),
+            ("publication_intent", "published"),
+            ("published", "rollback_intent"),
+            ("rollback_intent", "rolled_back"),
+        }
+        if (expected_state, target_state) not in allowed:
+            raise PermissionError("Transición file recovery no permitida.")
+        lease_receipt.require_live(
+            mode=WorkspaceLeaseMode.EXCLUSIVE, identity=workspace_identity
+        )
+        with self.database.connect_mutation_durable() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            lease_receipt.require_live(
+                mode=WorkspaceLeaseMode.EXCLUSIVE, identity=workspace_identity
+            )
+            attempt = self._recovery_attempt(
+                connection, attempt_public_id, workspace_identity
+            )
+            result = connection.execute(
+                "SELECT 1 FROM assistant_autonomy_mutation_results WHERE attempt_id=?",
+                (int(attempt["id"]),),
+            ).fetchone()
+            row = connection.execute(
+                "SELECT state FROM assistant_autonomy_mutation_attempt_files "
+                "WHERE attempt_id=? AND ordinal=?",
+                (int(attempt["id"]), ordinal),
+            ).fetchone()
+            if (
+                attempt["state"] != "recovery_required"
+                or result is not None
+                or row is None
+                or row["state"] != expected_state
+            ):
+                raise PermissionError("File recovery snapshot cambió.")
+            now = _utcnow_text()
+            published = (
+                ",published_at=COALESCE(published_at,?)"
+                if target_state == "published"
+                else ""
+            )
+            values: list[Any] = [target_state, now]
+            if target_state == "published":
+                values.append(now)
+            values.extend((int(attempt["id"]), ordinal, expected_state))
+            connection.execute(
+                "UPDATE assistant_autonomy_mutation_attempt_files "
+                f"SET state=?,state_updated_at=?{published} "
+                "WHERE attempt_id=? AND ordinal=? AND state=?",
+                values,
+            )
+
+    def _reconcile_mutation_cleanup_file_state(
+        self,
+        *,
+        attempt_public_id: str,
+        workspace_identity: WorkspaceIdentity,
+        lease_receipt: WorkspaceLeaseReceipt,
+        ordinal: int,
+        expected_state: str,
+    ) -> None:
+        """Discard one exactly cleaned never-published preparation row."""
+
+        if expected_state not in {"planned", "staged", "publication_intent"}:
+            raise PermissionError("Estado cleanup file no permitido.")
+        lease_receipt.require_live(
+            mode=WorkspaceLeaseMode.EXCLUSIVE, identity=workspace_identity
+        )
+        with self.database.connect_mutation_durable() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            lease_receipt.require_live(
+                mode=WorkspaceLeaseMode.EXCLUSIVE, identity=workspace_identity
+            )
+            attempt = self._recovery_attempt(
+                connection, attempt_public_id, workspace_identity
+            )
+            result = connection.execute(
+                "SELECT 1 FROM assistant_autonomy_mutation_results WHERE attempt_id=?",
+                (int(attempt["id"]),),
+            ).fetchone()
+            row = connection.execute(
+                "SELECT state FROM assistant_autonomy_mutation_attempt_files "
+                "WHERE attempt_id=? AND ordinal=?",
+                (int(attempt["id"]), ordinal),
+            ).fetchone()
+            if (
+                attempt["state"] != "cleanup_pending"
+                or result is None
+                or row is None
+                or row["state"] != expected_state
+            ):
+                raise PermissionError("Cleanup file snapshot cambió.")
+            connection.execute(
+                "UPDATE assistant_autonomy_mutation_attempt_files "
+                "SET state='discarded',state_updated_at=? "
+                "WHERE attempt_id=? AND ordinal=? AND state=?",
+                (_utcnow_text(), int(attempt["id"]), ordinal, expected_state),
+            )
+
+    def _reconcile_mutation_cleanup_pending(
+        self,
+        *,
+        attempt_public_id: str,
+        workspace_identity: WorkspaceIdentity,
+        lease_receipt: WorkspaceLeaseReceipt,
+        result_public_id: str,
+        result_outcome: str,
+        expected_attempt_state: str,
+    ) -> None:
+        """Close the exact result-durable/cleanup-pending DB crash window."""
+
+        required_source = {
+            "filesystem_succeeded": "filesystem_applied",
+            "rolled_back": "recovery_required",
+            "failed_before_publication": expected_attempt_state,
+            "stale": expected_attempt_state,
+            "expired": expected_attempt_state,
+        }.get(result_outcome)
+        if (
+            required_source != expected_attempt_state
+            or result_outcome in {"failed_before_publication", "stale", "expired"}
+            and expected_attempt_state not in {"claimed", "preparing", "prepared"}
+        ):
+            raise PermissionError("Source state cleanup_pending no coincide.")
+        lease_receipt.require_live(
+            mode=WorkspaceLeaseMode.EXCLUSIVE, identity=workspace_identity
+        )
+        with self.database.connect_mutation_durable() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            lease_receipt.require_live(
+                mode=WorkspaceLeaseMode.EXCLUSIVE, identity=workspace_identity
+            )
+            attempt = self._recovery_attempt(
+                connection, attempt_public_id, workspace_identity
+            )
+            result = connection.execute(
+                "SELECT public_id,outcome FROM assistant_autonomy_mutation_results "
+                "WHERE attempt_id=?",
+                (int(attempt["id"]),),
+            ).fetchone()
+            if (
+                attempt["state"] != expected_attempt_state
+                or result is None
+                or result["public_id"] != result_public_id
+                or result["outcome"] != result_outcome
+            ):
+                raise PermissionError("cleanup_pending recovery snapshot cambió.")
+            connection.execute(
+                "UPDATE assistant_autonomy_mutation_attempts "
+                "SET state='cleanup_pending',state_updated_at=? WHERE id=?",
+                (_utcnow_text(), int(attempt["id"])),
+            )
+
+    def _reconcile_mutation_cleanup_manifest_pointer(
+        self,
+        *,
+        attempt_public_id: str,
+        workspace_identity: WorkspaceIdentity,
+        lease_receipt: WorkspaceLeaseReceipt,
+        expected_manifest_sequence: int,
+        expected_manifest_sha256: str,
+        cleanup_sequence: int,
+        cleanup_sha256: str,
+    ) -> None:
+        """Synchronize only an exact cleanup_ready record into SQLite."""
+
+        lease_receipt.require_live(
+            mode=WorkspaceLeaseMode.EXCLUSIVE, identity=workspace_identity
+        )
+        with self.database.connect_mutation_durable() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            lease_receipt.require_live(
+                mode=WorkspaceLeaseMode.EXCLUSIVE, identity=workspace_identity
+            )
+            attempt = self._recovery_attempt(
+                connection, attempt_public_id, workspace_identity
+            )
+            result = connection.execute(
+                "SELECT 1 FROM assistant_autonomy_mutation_results WHERE attempt_id=?",
+                (int(attempt["id"]),),
+            ).fetchone()
+            if (
+                attempt["state"] != "cleanup_pending"
+                or result is None
+                or int(attempt["manifest_sequence"]) != expected_manifest_sequence
+                or attempt["manifest_tail_sha256"] != expected_manifest_sha256
+                or cleanup_sequence != expected_manifest_sequence + 1
+            ):
+                raise PermissionError("cleanup_ready pointer no coincide.")
+            connection.execute(
+                "UPDATE assistant_autonomy_mutation_attempts SET "
+                "manifest_sequence=?,manifest_tail_sha256=?,state_updated_at=? WHERE id=?",
+                (cleanup_sequence, cleanup_sha256, _utcnow_text(), int(attempt["id"])),
+            )
+
     def _reconcile_mutation_result(
         self,
         *,

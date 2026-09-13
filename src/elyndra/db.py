@@ -2985,6 +2985,7 @@ class Database:
             DROP TRIGGER IF EXISTS trg_autonomy_mutation_attempt_file_stage_write_once;
             DROP TRIGGER IF EXISTS trg_autonomy_mutation_attempt_file_stage_required;
             DROP TRIGGER IF EXISTS trg_autonomy_mutation_attempt_file_initial_stage;
+            DROP TRIGGER IF EXISTS trg_autonomy_mutation_attempt_file_transition;
 
             CREATE TABLE IF NOT EXISTS assistant_autonomy_mutation_attempts (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -3333,7 +3334,7 @@ class Database:
                 (OLD.state='staged' AND NEW.state IN (
                     'publication_intent','discarded','manual_intervention_required')) OR
                 (OLD.state='publication_intent' AND NEW.state IN (
-                    'published','manual_intervention_required')) OR
+                    'published','discarded','manual_intervention_required')) OR
                 (OLD.state='published' AND NEW.state IN (
                     'rollback_intent','manual_intervention_required')) OR
                 (OLD.state='rollback_intent' AND NEW.state IN (
