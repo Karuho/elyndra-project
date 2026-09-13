@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import secrets
 import sqlite3
 from contextlib import suppress
 from pathlib import Path
@@ -21,6 +22,23 @@ class Database:
         connection.execute("PRAGMA journal_mode = WAL")
         connection.execute("PRAGMA synchronous = NORMAL")
         return connection
+
+    def connect_mutation_durable(self) -> sqlite3.Connection:
+        """Open a vault connection with FULL durability before any transaction."""
+        if self.role != "vault":
+            raise RuntimeError("Durabilidad de mutación requiere una vault explícita.")
+        connection = self.connect()
+        try:
+            connection.execute("PRAGMA synchronous = FULL")
+            effective = connection.execute("PRAGMA synchronous").fetchone()
+            if effective is None or int(effective[0]) != 2:
+                raise RuntimeError("SQLite no confirmó synchronous=FULL.")
+            if connection.in_transaction:
+                raise RuntimeError("Conexión durable inició una transacción prematura.")
+            return connection
+        except BaseException:
+            connection.close()
+            raise
 
     def migrate(self) -> None:
         with self.connect() as connection:
@@ -2371,9 +2389,7 @@ class Database:
             self.path.chmod(0o600)
 
     @staticmethod
-    def _migrate_gateway_phase3(
-        connection: sqlite3.Connection, effective_role: str
-    ) -> None:
+    def _migrate_gateway_phase3(connection: sqlite3.Connection, effective_role: str) -> None:
         if effective_role != "root":
             return
         cache_columns = {
@@ -2949,6 +2965,444 @@ class Database:
             BEGIN SELECT RAISE(ABORT, 'autonomy_mutation_bindings_append_only'); END;
             """
         )
+        connection.execute(
+            "INSERT OR IGNORE INTO schema_meta(key, value) VALUES('mutation_vault_id', ?)",
+            (secrets.token_hex(32),),
+        )
+        Database._migrate_autonomy_mutation_attempt_foundation(connection)
+
+    @staticmethod
+    def _migrate_autonomy_mutation_attempt_foundation(
+        connection: sqlite3.Connection,
+    ) -> None:
+        """Install vault-only 9A.4 state/journal schema without an apply API."""
+        Database._rebuild_mutation_results_count_constraint(connection)
+        connection.executescript(
+            """
+            DROP TRIGGER IF EXISTS trg_autonomy_mutation_attempt_transition;
+            DROP TRIGGER IF EXISTS trg_autonomy_mutation_cleanup_requires_result;
+            DROP TRIGGER IF EXISTS trg_autonomy_mutation_attempt_files_identity_no_update;
+            DROP TRIGGER IF EXISTS trg_autonomy_mutation_attempt_file_stage_write_once;
+            DROP TRIGGER IF EXISTS trg_autonomy_mutation_attempt_file_stage_required;
+            DROP TRIGGER IF EXISTS trg_autonomy_mutation_attempt_file_initial_stage;
+
+            CREATE TABLE IF NOT EXISTS assistant_autonomy_mutation_attempts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                public_id TEXT NOT NULL UNIQUE CHECK(length(public_id) BETWEEN 1 AND 128),
+                request_key TEXT NOT NULL UNIQUE CHECK(length(request_key) BETWEEN 1 AND 128),
+                proposal_id INTEGER NOT NULL UNIQUE,
+                binding_id INTEGER NOT NULL UNIQUE,
+                gate_id TEXT NOT NULL UNIQUE CHECK(length(gate_id) BETWEEN 1 AND 128),
+                proposal_public_id TEXT NOT NULL
+                    CHECK(length(proposal_public_id) BETWEEN 1 AND 128),
+                proposal_sha256 TEXT NOT NULL CHECK(
+                    length(proposal_sha256)=64 AND proposal_sha256 NOT GLOB '*[^0-9a-f]*'
+                ),
+                run_id INTEGER NOT NULL,
+                step_id TEXT NOT NULL CHECK(length(step_id) BETWEEN 1 AND 64),
+                actor TEXT NOT NULL CHECK(length(actor) BETWEEN 1 AND 200),
+                workspace_root TEXT NOT NULL CHECK(length(workspace_root) BETWEEN 1 AND 4096),
+                workspace_st_dev INTEGER NOT NULL CHECK(workspace_st_dev >= 0),
+                workspace_st_ino INTEGER NOT NULL CHECK(workspace_st_ino > 0),
+                workspace_mount_id INTEGER NOT NULL CHECK(workspace_mount_id > 0),
+                state TEXT NOT NULL CHECK(state IN (
+                    'claimed','preparing','prepared','publishing','filesystem_applied',
+                    'cleanup_pending','recovery_required','manual_intervention_required',
+                    'expired','stale','failed_before_publication','rolled_back','succeeded'
+                )),
+                claimed_at TEXT NOT NULL,
+                state_updated_at TEXT NOT NULL,
+                publication_started_at TEXT,
+                filesystem_applied_at TEXT,
+                terminal_at TEXT,
+                recovery_code TEXT CHECK(recovery_code IS NULL OR length(recovery_code) <= 80),
+                initial_blockade_sha256 TEXT NOT NULL CHECK(
+                    length(initial_blockade_sha256)=64
+                    AND initial_blockade_sha256 NOT GLOB '*[^0-9a-f]*'
+                ),
+                initial_manifest_sha256 TEXT NOT NULL CHECK(
+                    length(initial_manifest_sha256)=64
+                    AND initial_manifest_sha256 NOT GLOB '*[^0-9a-f]*'
+                ),
+                manifest_sequence INTEGER NOT NULL CHECK(manifest_sequence >= 0),
+                manifest_tail_sha256 TEXT NOT NULL CHECK(
+                    length(manifest_tail_sha256)=64
+                    AND manifest_tail_sha256 NOT GLOB '*[^0-9a-f]*'
+                ),
+                FOREIGN KEY(proposal_id) REFERENCES assistant_autonomy_mutation_proposals(id)
+                    ON DELETE RESTRICT,
+                FOREIGN KEY(binding_id) REFERENCES assistant_autonomy_mutation_gate_bindings(id)
+                    ON DELETE RESTRICT,
+                FOREIGN KEY(gate_id) REFERENCES assistant_autonomy_human_gates(public_id)
+                    ON DELETE RESTRICT,
+                FOREIGN KEY(run_id) REFERENCES assistant_autonomy_runs(id) ON DELETE RESTRICT
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_autonomy_mutation_attempts_run_state
+            ON assistant_autonomy_mutation_attempts(run_id, state, id DESC);
+
+            CREATE TRIGGER IF NOT EXISTS trg_autonomy_mutation_attempts_integrity
+            BEFORE INSERT ON assistant_autonomy_mutation_attempts
+            WHEN NOT EXISTS (
+                SELECT 1
+                FROM assistant_autonomy_mutation_proposals proposal
+                JOIN assistant_autonomy_mutation_gate_bindings binding
+                  ON binding.id=NEW.binding_id
+                JOIN assistant_autonomy_human_gates gate
+                  ON gate.public_id=NEW.gate_id
+                WHERE proposal.id=NEW.proposal_id
+                  AND binding.proposal_id=proposal.id
+                  AND binding.gate_id=NEW.gate_id
+                  AND gate.status='approved'
+                  AND proposal.public_id=NEW.proposal_public_id
+                  AND proposal.proposal_sha256=NEW.proposal_sha256
+                  AND proposal.run_id=NEW.run_id
+                  AND proposal.step_id=NEW.step_id
+                  AND proposal.actor=NEW.actor
+                  AND proposal.workspace_root=NEW.workspace_root
+            )
+            BEGIN SELECT RAISE(ABORT, 'autonomy_mutation_attempt_invalid'); END;
+
+            CREATE TABLE IF NOT EXISTS assistant_autonomy_mutation_attempt_files (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                attempt_id INTEGER NOT NULL,
+                proposal_item_id INTEGER NOT NULL UNIQUE,
+                ordinal INTEGER NOT NULL CHECK(ordinal BETWEEN 0 AND 2),
+                relative_path TEXT NOT NULL CHECK(length(relative_path) BETWEEN 1 AND 512),
+                operation TEXT NOT NULL CHECK(operation IN ('create','replace')),
+                expected_preimage_sha256 TEXT CHECK(
+                    expected_preimage_sha256 IS NULL OR
+                    (length(expected_preimage_sha256)=64
+                     AND expected_preimage_sha256 NOT GLOB '*[^0-9a-f]*')
+                ),
+                expected_preimage_size INTEGER CHECK(
+                    expected_preimage_size IS NULL OR expected_preimage_size >= 0
+                ),
+                expected_postimage_sha256 TEXT NOT NULL CHECK(
+                    length(expected_postimage_sha256)=64
+                    AND expected_postimage_sha256 NOT GLOB '*[^0-9a-f]*'
+                ),
+                expected_postimage_size INTEGER NOT NULL CHECK(expected_postimage_size >= 0),
+                parent_st_dev INTEGER NOT NULL CHECK(parent_st_dev >= 0),
+                parent_st_ino INTEGER NOT NULL CHECK(parent_st_ino > 0),
+                parent_mount_id INTEGER NOT NULL CHECK(parent_mount_id > 0),
+                preimage_st_dev INTEGER,
+                preimage_st_ino INTEGER,
+                preimage_uid INTEGER,
+                preimage_gid INTEGER,
+                preimage_mode INTEGER,
+                preimage_nlink INTEGER,
+                stage_st_dev INTEGER,
+                stage_st_ino INTEGER,
+                artifact_name TEXT NOT NULL CHECK(length(artifact_name) BETWEEN 1 AND 128),
+                witness_name TEXT NOT NULL CHECK(length(witness_name) BETWEEN 1 AND 128),
+                state TEXT NOT NULL CHECK(state IN (
+                    'planned','staged','publication_intent','published','rollback_intent',
+                    'rolled_back','discarded','manual_intervention_required'
+                )),
+                state_updated_at TEXT NOT NULL,
+                published_at TEXT,
+                error_code TEXT CHECK(error_code IS NULL OR length(error_code) <= 80),
+                FOREIGN KEY(attempt_id) REFERENCES assistant_autonomy_mutation_attempts(id)
+                    ON DELETE RESTRICT,
+                FOREIGN KEY(proposal_item_id) REFERENCES assistant_autonomy_mutation_items(id)
+                    ON DELETE RESTRICT,
+                UNIQUE(attempt_id, ordinal),
+                UNIQUE(attempt_id, relative_path),
+                CHECK(
+                    (operation='create' AND expected_preimage_sha256 IS NULL
+                     AND expected_preimage_size IS NULL AND preimage_st_dev IS NULL
+                     AND preimage_st_ino IS NULL AND preimage_uid IS NULL
+                     AND preimage_gid IS NULL AND preimage_mode IS NULL
+                     AND preimage_nlink IS NULL)
+                    OR
+                    (operation='replace' AND expected_preimage_sha256 IS NOT NULL
+                     AND expected_preimage_size IS NOT NULL AND preimage_st_dev IS NOT NULL
+                     AND preimage_st_ino IS NOT NULL AND preimage_uid IS NOT NULL
+                     AND preimage_gid IS NOT NULL AND preimage_mode IS NOT NULL
+                     AND preimage_nlink = 1)
+                )
+            );
+
+            CREATE TABLE IF NOT EXISTS assistant_autonomy_mutation_results (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                public_id TEXT NOT NULL UNIQUE CHECK(length(public_id) BETWEEN 1 AND 128),
+                attempt_id INTEGER NOT NULL UNIQUE,
+                outcome TEXT NOT NULL CHECK(outcome IN (
+                    'filesystem_succeeded','expired','stale',
+                    'failed_before_publication','rolled_back'
+                )),
+                published_count INTEGER NOT NULL CHECK(published_count BETWEEN 0 AND 3),
+                restored_count INTEGER NOT NULL CHECK(restored_count BETWEEN 0 AND 3),
+                final_manifest_sequence INTEGER NOT NULL CHECK(final_manifest_sequence >= 0),
+                final_manifest_sha256 TEXT NOT NULL CHECK(
+                    length(final_manifest_sha256)=64
+                    AND final_manifest_sha256 NOT GLOB '*[^0-9a-f]*'
+                ),
+                observation_code TEXT CHECK(
+                    observation_code IS NULL OR length(observation_code) <= 80
+                ),
+                summary TEXT NOT NULL CHECK(length(summary) BETWEEN 1 AND 2000),
+                observed_at TEXT NOT NULL,
+                FOREIGN KEY(attempt_id) REFERENCES assistant_autonomy_mutation_attempts(id)
+                    ON DELETE RESTRICT,
+                CHECK(restored_count <= published_count),
+                CHECK(outcome != 'filesystem_succeeded' OR restored_count = 0)
+            );
+
+            CREATE TRIGGER IF NOT EXISTS trg_autonomy_mutation_results_integrity
+            BEFORE INSERT ON assistant_autonomy_mutation_results
+            WHEN NOT EXISTS (
+                SELECT 1 FROM assistant_autonomy_mutation_attempts attempt
+                WHERE attempt.id=NEW.attempt_id AND (
+                    (NEW.outcome='filesystem_succeeded'
+                     AND attempt.state='filesystem_applied') OR
+                    (NEW.outcome IN ('expired','stale','failed_before_publication')
+                     AND attempt.state IN ('claimed','preparing','prepared')
+                     AND attempt.publication_started_at IS NULL) OR
+                    (NEW.outcome='rolled_back'
+                     AND attempt.state='recovery_required')
+                )
+            )
+            BEGIN SELECT RAISE(ABORT, 'autonomy_mutation_result_invalid'); END;
+
+            CREATE TRIGGER IF NOT EXISTS trg_autonomy_mutation_attempt_files_integrity
+            BEFORE INSERT ON assistant_autonomy_mutation_attempt_files
+            WHEN NOT EXISTS (
+                SELECT 1
+                FROM assistant_autonomy_mutation_attempts attempt
+                JOIN assistant_autonomy_mutation_proposals proposal
+                  ON proposal.id=attempt.proposal_id
+                JOIN assistant_autonomy_mutation_items item
+                  ON item.id=NEW.proposal_item_id
+                WHERE attempt.id=NEW.attempt_id
+                  AND item.proposal_id=proposal.id
+                  AND item.ordinal=NEW.ordinal
+                  AND item.relative_path=NEW.relative_path
+                  AND item.operation=NEW.operation
+                  AND item.proposed_sha256=NEW.expected_postimage_sha256
+                  AND item.proposed_size=NEW.expected_postimage_size
+                  AND (
+                    (item.operation='create' AND NEW.expected_preimage_sha256 IS NULL
+                     AND NEW.expected_preimage_size IS NULL)
+                    OR
+                    (item.operation='replace'
+                     AND item.original_sha256=NEW.expected_preimage_sha256
+                     AND item.original_size=NEW.expected_preimage_size)
+                  )
+            )
+            BEGIN SELECT RAISE(ABORT, 'autonomy_mutation_attempt_file_invalid'); END;
+
+            CREATE TRIGGER IF NOT EXISTS trg_autonomy_mutation_attempt_identity_no_update
+            BEFORE UPDATE OF public_id,request_key,proposal_id,binding_id,gate_id,
+                proposal_public_id,proposal_sha256,run_id,step_id,actor,workspace_root,
+                workspace_st_dev,workspace_st_ino,workspace_mount_id,claimed_at,
+                initial_blockade_sha256,initial_manifest_sha256
+            ON assistant_autonomy_mutation_attempts
+            BEGIN SELECT RAISE(ABORT, 'autonomy_mutation_attempt_identity_immutable'); END;
+
+            CREATE TRIGGER IF NOT EXISTS trg_autonomy_mutation_attempts_no_delete
+            BEFORE DELETE ON assistant_autonomy_mutation_attempts
+            BEGIN SELECT RAISE(ABORT, 'autonomy_mutation_attempts_append_only'); END;
+
+            CREATE TRIGGER IF NOT EXISTS trg_autonomy_mutation_attempt_terminal_no_update
+            BEFORE UPDATE ON assistant_autonomy_mutation_attempts
+            WHEN OLD.state IN (
+                'succeeded','expired','stale','failed_before_publication','rolled_back'
+            )
+            BEGIN SELECT RAISE(ABORT, 'autonomy_mutation_attempt_terminal'); END;
+
+            CREATE TRIGGER IF NOT EXISTS trg_autonomy_mutation_attempt_transition
+            BEFORE UPDATE OF state ON assistant_autonomy_mutation_attempts
+            WHEN NOT (
+                (OLD.state='claimed' AND NEW.state IN (
+                    'preparing','cleanup_pending','recovery_required')) OR
+                (OLD.state='preparing' AND NEW.state IN (
+                    'prepared','cleanup_pending','recovery_required')) OR
+                (OLD.state='prepared' AND NEW.state IN (
+                    'publishing','cleanup_pending','recovery_required')) OR
+                (OLD.state='publishing' AND NEW.state IN (
+                    'filesystem_applied','recovery_required')) OR
+                (OLD.state='filesystem_applied' AND NEW.state IN (
+                    'cleanup_pending','recovery_required')) OR
+                (OLD.state='recovery_required' AND NEW.state IN (
+                    'filesystem_applied','cleanup_pending',
+                    'manual_intervention_required')) OR
+                (OLD.state='manual_intervention_required' AND NEW.state='recovery_required') OR
+                (OLD.state='cleanup_pending' AND NEW.state IN (
+                    'succeeded','expired','stale','failed_before_publication',
+                    'rolled_back'))
+            )
+            BEGIN SELECT RAISE(ABORT, 'autonomy_mutation_attempt_transition_invalid'); END;
+
+            CREATE TRIGGER IF NOT EXISTS trg_autonomy_mutation_attempt_transition_timestamps
+            BEFORE UPDATE OF state ON assistant_autonomy_mutation_attempts
+            WHEN (NEW.state='publishing' AND NEW.publication_started_at IS NULL)
+              OR (NEW.state='filesystem_applied' AND NEW.filesystem_applied_at IS NULL)
+              OR (NEW.state IN (
+                    'succeeded','expired','stale','failed_before_publication','rolled_back'
+                  ) AND NEW.terminal_at IS NULL)
+            BEGIN SELECT RAISE(ABORT, 'autonomy_mutation_attempt_timestamp_required'); END;
+
+            CREATE TRIGGER IF NOT EXISTS
+                trg_autonomy_mutation_attempt_no_clean_failure_after_publish
+            BEFORE UPDATE OF state ON assistant_autonomy_mutation_attempts
+            WHEN NEW.state IN ('expired','stale','failed_before_publication')
+                 AND NEW.publication_started_at IS NOT NULL
+            BEGIN SELECT RAISE(ABORT, 'autonomy_mutation_clean_failure_after_publish'); END;
+
+            CREATE TRIGGER IF NOT EXISTS trg_autonomy_mutation_cleanup_requires_result
+            BEFORE UPDATE OF state ON assistant_autonomy_mutation_attempts
+            WHEN NEW.state='cleanup_pending' AND NOT EXISTS (
+                SELECT 1 FROM assistant_autonomy_mutation_results result
+                WHERE result.attempt_id=NEW.id AND (
+                    (OLD.state='filesystem_applied'
+                     AND result.outcome='filesystem_succeeded') OR
+                    (OLD.state IN ('claimed','preparing','prepared')
+                     AND result.outcome IN (
+                        'expired','stale','failed_before_publication'
+                     )) OR
+                    (OLD.state='recovery_required' AND result.outcome='rolled_back')
+                )
+            )
+            BEGIN SELECT RAISE(ABORT, 'autonomy_mutation_cleanup_requires_result'); END;
+
+            CREATE TRIGGER IF NOT EXISTS trg_autonomy_mutation_terminal_requires_result
+            BEFORE UPDATE OF state ON assistant_autonomy_mutation_attempts
+            WHEN NEW.state IN (
+                'succeeded','expired','stale','failed_before_publication','rolled_back'
+            )
+                 AND NOT EXISTS (
+                    SELECT 1 FROM assistant_autonomy_mutation_results result
+                    WHERE result.attempt_id=NEW.id AND result.outcome = CASE NEW.state
+                        WHEN 'succeeded' THEN 'filesystem_succeeded'
+                        ELSE NEW.state END
+                 )
+            BEGIN SELECT RAISE(ABORT, 'autonomy_mutation_terminal_requires_result'); END;
+
+            CREATE TRIGGER IF NOT EXISTS trg_autonomy_mutation_attempt_files_identity_no_update
+            BEFORE UPDATE OF attempt_id,proposal_item_id,ordinal,relative_path,operation,
+                expected_preimage_sha256,expected_preimage_size,expected_postimage_sha256,
+                expected_postimage_size,parent_st_dev,parent_st_ino,parent_mount_id,
+                preimage_st_dev,preimage_st_ino,preimage_uid,preimage_gid,preimage_mode,
+                preimage_nlink,artifact_name,witness_name
+            ON assistant_autonomy_mutation_attempt_files
+            BEGIN SELECT RAISE(ABORT, 'autonomy_mutation_attempt_file_identity_immutable'); END;
+
+            CREATE TRIGGER IF NOT EXISTS
+                trg_autonomy_mutation_attempt_file_initial_stage
+            BEFORE INSERT ON assistant_autonomy_mutation_attempt_files
+            WHEN NEW.state != 'planned'
+                 OR NEW.stage_st_dev IS NOT NULL OR NEW.stage_st_ino IS NOT NULL
+            BEGIN SELECT RAISE(
+                ABORT, 'autonomy_mutation_attempt_file_stage_invalid'
+            ); END;
+
+            CREATE TRIGGER IF NOT EXISTS
+                trg_autonomy_mutation_attempt_file_stage_write_once
+            BEFORE UPDATE OF stage_st_dev,stage_st_ino
+            ON assistant_autonomy_mutation_attempt_files
+            WHEN NOT (
+                OLD.state='planned' AND NEW.state='staged'
+                AND OLD.stage_st_dev IS NULL AND OLD.stage_st_ino IS NULL
+                AND NEW.stage_st_dev IS NOT NULL AND NEW.stage_st_dev >= 0
+                AND NEW.stage_st_ino IS NOT NULL AND NEW.stage_st_ino > 0
+            )
+            BEGIN SELECT RAISE(
+                ABORT, 'autonomy_mutation_attempt_file_stage_immutable'
+            ); END;
+
+            CREATE TRIGGER IF NOT EXISTS
+                trg_autonomy_mutation_attempt_file_stage_required
+            BEFORE UPDATE OF state ON assistant_autonomy_mutation_attempt_files
+            WHEN NEW.state='staged'
+                 AND (NEW.stage_st_dev IS NULL OR NEW.stage_st_ino IS NULL)
+            BEGIN SELECT RAISE(
+                ABORT, 'autonomy_mutation_attempt_file_stage_required'
+            ); END;
+
+            CREATE TRIGGER IF NOT EXISTS trg_autonomy_mutation_attempt_files_no_delete
+            BEFORE DELETE ON assistant_autonomy_mutation_attempt_files
+            BEGIN SELECT RAISE(ABORT, 'autonomy_mutation_attempt_files_append_only'); END;
+
+            CREATE TRIGGER IF NOT EXISTS trg_autonomy_mutation_attempt_file_transition
+            BEFORE UPDATE OF state ON assistant_autonomy_mutation_attempt_files
+            WHEN NOT (
+                (OLD.state='planned' AND NEW.state IN (
+                    'staged','discarded','manual_intervention_required')) OR
+                (OLD.state='staged' AND NEW.state IN (
+                    'publication_intent','discarded','manual_intervention_required')) OR
+                (OLD.state='publication_intent' AND NEW.state IN (
+                    'published','manual_intervention_required')) OR
+                (OLD.state='published' AND NEW.state IN (
+                    'rollback_intent','manual_intervention_required')) OR
+                (OLD.state='rollback_intent' AND NEW.state IN (
+                    'rolled_back','manual_intervention_required'))
+            )
+            BEGIN SELECT RAISE(
+                ABORT, 'autonomy_mutation_attempt_file_transition_invalid'
+            ); END;
+
+            CREATE TRIGGER IF NOT EXISTS trg_autonomy_mutation_results_no_update
+            BEFORE UPDATE ON assistant_autonomy_mutation_results
+            BEGIN SELECT RAISE(ABORT, 'autonomy_mutation_results_append_only'); END;
+
+            CREATE TRIGGER IF NOT EXISTS trg_autonomy_mutation_results_no_delete
+            BEFORE DELETE ON assistant_autonomy_mutation_results
+            BEGIN SELECT RAISE(ABORT, 'autonomy_mutation_results_append_only'); END;
+            """
+        )
+
+    @staticmethod
+    def _rebuild_mutation_results_count_constraint(
+        connection: sqlite3.Connection,
+    ) -> None:
+        """Replace the pre-review result-count constraint in schema-60 vaults."""
+        row = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' "
+            "AND name='assistant_autonomy_mutation_results'"
+        ).fetchone()
+        if row is None or "published_count + restored_count <= 3" not in row[0]:
+            return
+        connection.executescript(
+            """
+            DROP TRIGGER IF EXISTS trg_autonomy_mutation_results_integrity;
+            DROP TRIGGER IF EXISTS trg_autonomy_mutation_results_no_update;
+            DROP TRIGGER IF EXISTS trg_autonomy_mutation_results_no_delete;
+            DROP TRIGGER IF EXISTS trg_autonomy_mutation_cleanup_requires_result;
+            DROP TRIGGER IF EXISTS trg_autonomy_mutation_terminal_requires_result;
+            ALTER TABLE assistant_autonomy_mutation_results
+                RENAME TO assistant_autonomy_mutation_results_phase9a4a_old;
+            CREATE TABLE assistant_autonomy_mutation_results (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                public_id TEXT NOT NULL UNIQUE CHECK(length(public_id) BETWEEN 1 AND 128),
+                attempt_id INTEGER NOT NULL UNIQUE,
+                outcome TEXT NOT NULL CHECK(outcome IN (
+                    'filesystem_succeeded','expired','stale',
+                    'failed_before_publication','rolled_back'
+                )),
+                published_count INTEGER NOT NULL CHECK(published_count BETWEEN 0 AND 3),
+                restored_count INTEGER NOT NULL CHECK(restored_count BETWEEN 0 AND 3),
+                final_manifest_sequence INTEGER NOT NULL CHECK(final_manifest_sequence >= 0),
+                final_manifest_sha256 TEXT NOT NULL CHECK(
+                    length(final_manifest_sha256)=64
+                    AND final_manifest_sha256 NOT GLOB '*[^0-9a-f]*'
+                ),
+                observation_code TEXT CHECK(
+                    observation_code IS NULL OR length(observation_code) <= 80
+                ),
+                summary TEXT NOT NULL CHECK(length(summary) BETWEEN 1 AND 2000),
+                observed_at TEXT NOT NULL,
+                FOREIGN KEY(attempt_id) REFERENCES assistant_autonomy_mutation_attempts(id)
+                    ON DELETE RESTRICT,
+                CHECK(restored_count <= published_count),
+                CHECK(outcome != 'filesystem_succeeded' OR restored_count = 0)
+            );
+            INSERT INTO assistant_autonomy_mutation_results
+            SELECT * FROM assistant_autonomy_mutation_results_phase9a4a_old;
+            DROP TABLE assistant_autonomy_mutation_results_phase9a4a_old;
+            """
+        )
 
     @staticmethod
     def _extend_human_gate_kinds_phase9a(connection: sqlite3.Connection) -> None:
@@ -3056,9 +3510,7 @@ class Database:
             )
             for trigger in dependent_triggers:
                 trigger_sql = trigger[1]
-                if not isinstance(trigger_sql, str) or not trigger_sql.startswith(
-                    "CREATE TRIGGER"
-                ):
+                if not isinstance(trigger_sql, str) or not trigger_sql.startswith("CREATE TRIGGER"):
                     raise RuntimeError("SQL de trigger SQLite inválido.")
                 connection.execute(trigger_sql)
             violations = connection.execute("PRAGMA foreign_key_check").fetchall()
@@ -3711,8 +4163,7 @@ class Database:
         connection: sqlite3.Connection,
     ) -> None:
         table_sql_row = connection.execute(
-            "SELECT sql FROM sqlite_master WHERE type='table' "
-            "AND name='assistant_cognitive_turns'"
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='assistant_cognitive_turns'"
         ).fetchone()
         if table_sql_row is None or "'limit_exhausted'" in str(table_sql_row[0]):
             return
@@ -3895,15 +4346,16 @@ class Database:
                         (int(cycle["id"]), source_turn_id),
                     ).fetchall()
                     candidate_gate = (
-                        str(blocked_events[0]["gate_id"] or "")
-                        if len(blocked_events) == 1
-                        else ""
+                        str(blocked_events[0]["gate_id"] or "") if len(blocked_events) == 1 else ""
                     )
-                    exact_gate = bool(candidate_gate) and connection.execute(
-                        "SELECT 1 FROM assistant_autonomy_human_gates "
-                        "WHERE public_id=? AND run_id=? AND kind!='retry_review'",
-                        (candidate_gate, int(cycle["run_db_id"])),
-                    ).fetchone()
+                    exact_gate = (
+                        bool(candidate_gate)
+                        and connection.execute(
+                            "SELECT 1 FROM assistant_autonomy_human_gates "
+                            "WHERE public_id=? AND run_id=? AND kind!='retry_review'",
+                            (candidate_gate, int(cycle["run_db_id"])),
+                        ).fetchone()
+                    )
                     if exact_gate:
                         reason = "ordinary_gate_required"
                         gate_id = candidate_gate

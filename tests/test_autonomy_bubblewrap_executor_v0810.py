@@ -29,6 +29,7 @@ from elyndra.autonomy import (
     PreparedExecution,
     RunPlan,
     RunStep,
+    WorkspaceLeaseCoordinator,
     WorkspaceScope,
 )
 from elyndra.autonomy.bubblewrap_executor import _TailCollector
@@ -200,8 +201,11 @@ def _prepare(
     repository: AutonomyRepository,
     run: AutonomyRun,
 ) -> PreparedExecution:
+    runtime_root = repository.database.path.parent / "runtime"
+    runtime_root.mkdir(mode=0o700, exist_ok=True)
     contract = AutonomyExecutionBinding(
-        repository
+        repository,
+        workspace_lease_coordinator=WorkspaceLeaseCoordinator._for_test(runtime_root),
     ).bind(
         run.run_id,
         actor="owner",
@@ -513,6 +517,11 @@ def test_bubblewrap_executor_rejects_unreserved_request(
         requires_human_gate=False,
         command_sha256=snapshot.command_sha256,
     )
+    runtime_root = repository.database.path.parent / "runtime"
+    runtime_root.mkdir(mode=0o700, exist_ok=True)
+    session = WorkspaceLeaseCoordinator._for_test(runtime_root).execution_session(
+        run.workspace.root
+    )
 
     prepared = PreparedExecution(
         request=request,
@@ -527,6 +536,7 @@ def test_bubblewrap_executor_rejects_unreserved_request(
             command.timeout_seconds
         ),
         retry=False,
+        _workspace_session=session,
     )
 
     executor = BubblewrapExecutor(
@@ -627,7 +637,7 @@ def test_bubblewrap_executor_rejects_replay(
 
     with pytest.raises(
         PermissionError,
-        match="ya fue consumido para launch",
+        match="no está vivo",
     ):
         executor.execute(
             prepared,
@@ -741,6 +751,7 @@ def test_execution_observation_rejects_duplicate_record(
         actor="owner",
         runtime_seconds=prepared.reserved_runtime_seconds,
         retry=prepared.retry,
+        workspace_lease_receipt=prepared.workspace_session.receipt,
     )
     result = ExecutionResult(
         request_id=prepared.request.request_id,
@@ -828,6 +839,7 @@ def test_execution_observation_requires_executor_receipt(
         actor="owner",
         runtime_seconds=prepared.reserved_runtime_seconds,
         retry=prepared.retry,
+        workspace_lease_receipt=prepared.workspace_session.receipt,
     )
 
     forged = ExecutionResult(
@@ -893,6 +905,7 @@ def test_execution_observation_enforces_command_output_bound(
             prepared.reserved_runtime_seconds
         ),
         retry=prepared.retry,
+        workspace_lease_receipt=prepared.workspace_session.receipt,
     )
 
     forged = ExecutionResult(
@@ -933,6 +946,7 @@ def test_execution_observation_gap_is_explicit_until_result(
         actor="owner",
         runtime_seconds=prepared.reserved_runtime_seconds,
         retry=prepared.retry,
+        workspace_lease_receipt=prepared.workspace_session.receipt,
     )
 
     gaps = repository.execution_observation_gaps(
@@ -1010,6 +1024,7 @@ def test_execution_observation_rejects_impossible_result_semantics(
         actor="owner",
         runtime_seconds=prepared.reserved_runtime_seconds,
         retry=prepared.retry,
+        workspace_lease_receipt=prepared.workspace_session.receipt,
     )
     result = ExecutionResult(
         request_id=prepared.request.request_id,
@@ -1047,6 +1062,7 @@ def test_execution_observation_accepts_cancellation_before_or_after_popen(
         actor="owner",
         runtime_seconds=prepared.reserved_runtime_seconds,
         retry=prepared.retry,
+        workspace_lease_receipt=prepared.workspace_session.receipt,
     )
     result = ExecutionResult(
         request_id=prepared.request.request_id,
@@ -1081,6 +1097,7 @@ def test_execution_observed_audit_excludes_caller_controlled_secrets(
         actor="owner",
         runtime_seconds=prepared.reserved_runtime_seconds,
         retry=prepared.retry,
+        workspace_lease_receipt=prepared.workspace_session.receipt,
     )
     distinctive = "AUDIT_SECRET_DO_NOT_COPY_7B1"
     result = ExecutionResult(
@@ -1119,3 +1136,26 @@ def test_execution_observed_audit_excludes_caller_controlled_secrets(
     assert raw_receipt not in str(
         repository.execution_results(run.run_id, actor="owner")
     )
+
+
+def test_bubblewrap_masks_trusted_mutation_journal_read_only(tmp_path: Path) -> None:
+    _require_runtime()
+    code = (
+        "import json, pathlib\n"
+        "p=pathlib.Path('.elyndra-mutation-journal')\n"
+        "blocked=False\n"
+        "try:\n p.joinpath('forged').write_text('x')\n"
+        "except OSError:\n blocked=True\n"
+        "print(json.dumps({'exists':p.is_dir(),'entries':list(p.iterdir()),"
+        "'blocked':blocked}, default=str))\n"
+    )
+    _database, repository, run = _state(tmp_path, code=code)
+    result = _execute(repository, _prepare(repository, run))
+    assert json.loads(result.stdout) == {
+        "exists": True,
+        "entries": [],
+        "blocked": True,
+    }
+    assert not (
+        run.workspace.root / ".elyndra-mutation-journal" / "forged"
+    ).exists()

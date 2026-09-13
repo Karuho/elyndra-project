@@ -31,6 +31,7 @@ from elyndra.autonomy.execution import (
 )
 from elyndra.autonomy.repository import AutonomyRepository
 from elyndra.autonomy.scope import WorkspaceScope
+from elyndra.autonomy.workspace_lease import WorkspaceLeaseMode
 
 _SANDBOX_EXECUTABLE = "/run/elyndra/executable"
 _ANSI_ESCAPE = re.compile(
@@ -150,6 +151,21 @@ class BubblewrapExecutor:
         *,
         cancellation: CancellationToken,
     ) -> ExecutionResult:
+        if not isinstance(prepared, PreparedExecution):
+            raise TypeError("prepared debe ser PreparedExecution.")
+        session = prepared.workspace_session
+        try:
+            session.require_live()
+            return self._execute_with_session(prepared, cancellation=cancellation)
+        finally:
+            session.close()
+
+    def _execute_with_session(
+        self,
+        prepared: PreparedExecution,
+        *,
+        cancellation: CancellationToken,
+    ) -> ExecutionResult:
         if not isinstance(
             prepared,
             PreparedExecution,
@@ -167,6 +183,8 @@ class BubblewrapExecutor:
             )
 
         cancellation.require_active()
+        lease_receipt = prepared.workspace_session.receipt
+        lease_receipt.require_live(mode=WorkspaceLeaseMode.SHARED)
 
         request = prepared.request
 
@@ -248,6 +266,7 @@ class BubblewrapExecutor:
             workspace = WorkspaceScope.from_root(
                 str(item["workspace_root"])
             )
+            lease_receipt.require_workspace(workspace.root)
             current_cwd = workspace.resolve(
                 spec.cwd,
                 must_exist=True,
@@ -288,6 +307,7 @@ class BubblewrapExecutor:
                 snapshot=snapshot,
                 workspace=workspace,
                 executable_fd=executable_fd,
+                journal_mask=lease_receipt.journal_mask_path,
             )
 
             cancellation.require_active()
@@ -299,6 +319,7 @@ class BubblewrapExecutor:
                 actor=self.actor,
                 runtime_seconds=prepared.reserved_runtime_seconds,
                 retry=prepared.retry,
+                workspace_lease_receipt=lease_receipt,
             )
 
             if cancellation.cancelled:
@@ -336,6 +357,7 @@ class BubblewrapExecutor:
         snapshot: CommandSnapshot,
         workspace: WorkspaceScope,
         executable_fd: int,
+        journal_mask: Path,
     ) -> tuple[str, ...]:
         spec = snapshot.spec
 
@@ -385,6 +407,9 @@ class BubblewrapExecutor:
                 "--bind",
                 str(workspace.root),
                 str(workspace.root),
+                "--ro-bind",
+                str(journal_mask),
+                str(workspace.root / ".elyndra-mutation-journal"),
             )
         )
 

@@ -60,6 +60,14 @@ from elyndra.autonomy.supervised_runner import (
     SupervisedTickOutcome,
     SupervisedTickResult,
 )
+from elyndra.autonomy.workspace_lease import (
+    WorkspaceExecutionSession,
+    WorkspaceIdentity,
+    WorkspaceLease,
+    WorkspaceLeaseCoordinator,
+    WorkspaceLeaseMode,
+    WorkspaceLeaseReceipt,
+)
 
 __all__ = [
     "AutonomyExecutionBinding",
@@ -102,6 +110,12 @@ __all__ = [
     "RunPlan",
     "RunStep",
     "WorkspaceScope",
+    "WorkspaceExecutionSession",
+    "WorkspaceIdentity",
+    "WorkspaceLease",
+    "WorkspaceLeaseCoordinator",
+    "WorkspaceLeaseMode",
+    "WorkspaceLeaseReceipt",
     "SupervisedAutonomyRunner",
     "SupervisedTickOutcome",
     "SupervisedTickResult",

@@ -4,7 +4,7 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import StrEnum
-from typing import Protocol
+from typing import TYPE_CHECKING, Protocol
 
 from elyndra.autonomy.capabilities import Capability, CapabilityGrant
 from elyndra.autonomy.commands import (
@@ -13,6 +13,12 @@ from elyndra.autonomy.commands import (
 )
 from elyndra.autonomy.models import RunPlan, RunStep
 from elyndra.autonomy.scope import WorkspaceScope
+
+if TYPE_CHECKING:
+    from elyndra.autonomy.workspace_lease import (
+        WorkspaceExecutionSession,
+        WorkspaceLeaseCoordinator,
+    )
 
 _PATH_CAPABILITIES = frozenset(
     {
@@ -315,6 +321,9 @@ class PreparedExecution:
     reserved_runtime_seconds: int = 0
     retry: bool = False
     prepared_at: datetime = field(default_factory=lambda: datetime.now(UTC))
+    _workspace_session: WorkspaceExecutionSession | None = field(
+        default=None, repr=False, compare=False
+    )
 
     def __post_init__(self) -> None:
         if self.prepared_at.tzinfo is None or self.prepared_at.utcoffset() is None:
@@ -337,6 +346,9 @@ class PreparedExecution:
             raise TypeError("retry debe ser booleano.")
 
         if self.request.capability is Capability.PROCESS_EXEC:
+            if self._workspace_session is None:
+                raise ValueError("process.exec requiere workspace lease vivo.")
+            self._workspace_session.require_live()
             if not isinstance(self.command_snapshot, CommandSnapshot):
                 raise ValueError(
                     "process.exec requiere CommandSnapshot preparado."
@@ -371,6 +383,17 @@ class PreparedExecution:
             raise ValueError(
                 "Solo process.exec puede llevar CommandSnapshot."
             )
+
+    @property
+    def workspace_session(self) -> WorkspaceExecutionSession:
+        if self._workspace_session is None:
+            raise ExecutionDenied("La ejecución no tiene workspace session.")
+        self._workspace_session.require_live()
+        return self._workspace_session
+
+    def close_workspace_session(self) -> None:
+        if self._workspace_session is not None:
+            self._workspace_session.close()
 
 
 @dataclass(frozen=True, slots=True)
@@ -450,6 +473,7 @@ class ExecutionContract:
         budget: ExecutionBudget | None = None,
         cancellation: CancellationToken | None = None,
         reservation_backend: ExecutionReservationBackend | None = None,
+        workspace_lease_coordinator: WorkspaceLeaseCoordinator | None = None,
     ) -> None:
         self.run_id = _required(run_id, "run_id", 128)
         self.plan = plan
@@ -458,6 +482,7 @@ class ExecutionContract:
         self.budget = budget or ExecutionBudget.from_grant(grant)
         self.cancellation = cancellation or CancellationToken()
         self.reservation_backend = reservation_backend
+        self.workspace_lease_coordinator = workspace_lease_coordinator
 
         self.budget.require_within(grant)
 
@@ -490,8 +515,6 @@ class ExecutionContract:
                 f"El step no pertenece al plan congelado: {clean_step_id}"
             )
 
-        self.grant.require(step.capability, at=_utcnow())
-
         if (
             step.requires_human_gate
             and step.step_id not in self._approved_step_ids
@@ -501,6 +524,7 @@ class ExecutionContract:
             )
 
         command_snapshot: CommandSnapshot | None = None
+        workspace_session: WorkspaceExecutionSession | None = None
         reservation_runtime = runtime_seconds
 
         if step.capability is Capability.PROCESS_EXEC:
@@ -529,22 +553,69 @@ class ExecutionContract:
 
             reservation_runtime = command.timeout_seconds
 
+            if self.workspace_lease_coordinator is None:
+                from elyndra.autonomy.workspace_lease import WorkspaceLeaseCoordinator
+
+                self.workspace_lease_coordinator = WorkspaceLeaseCoordinator()
             try:
-                resolved_cwd = self.workspace.resolve(
-                    command.cwd,
-                    must_exist=True,
+                workspace_session = self.workspace_lease_coordinator.execution_session(
+                    self.workspace.root,
+                    cancellation=self.cancellation,
                 )
-                command_snapshot = CommandSnapshot.capture(
-                    command,
-                    resolved_cwd=resolved_cwd,
-                )
-            except (OSError, PermissionError, ValueError) as exc:
+            except (OSError, PermissionError, RuntimeError) as exc:
                 raise ExecutionDenied(
-                    "No se pudo congelar CommandSnapshot para process.exec."
+                    "No se pudo adquirir la coordinación shared del workspace."
                 ) from exc
 
-            resolved_target = str(resolved_cwd)
+            try:
+                self.cancellation.require_active()
+                self.grant.require(step.capability, at=_utcnow())
+                try:
+                    resolved_cwd = self.workspace.resolve(
+                        command.cwd,
+                        must_exist=True,
+                    )
+                    command_snapshot = CommandSnapshot.capture(
+                        command,
+                        resolved_cwd=resolved_cwd,
+                    )
+                except (OSError, PermissionError, ValueError) as exc:
+                    raise ExecutionDenied(
+                        "No se pudo congelar CommandSnapshot para process.exec."
+                    ) from exc
+
+                resolved_target = str(resolved_cwd)
+                request = ExecutionRequest(
+                    run_id=self.run_id,
+                    step_id=step.step_id,
+                    capability=step.capability,
+                    action=step.action,
+                    target=step.target,
+                    requires_human_gate=step.requires_human_gate,
+                    command_sha256=command_snapshot.command_sha256,
+                )
+                reserved = self.reservation_backend.reserve(
+                    request,
+                    runtime_seconds=reservation_runtime,
+                    retry=retry,
+                )
+                budget = self._accept_reserved_snapshot(reserved)
+                prepared = PreparedExecution(
+                    request=request,
+                    resolved_target=resolved_target,
+                    budget=budget,
+                    command_snapshot=command_snapshot,
+                    reserved_runtime_seconds=reservation_runtime,
+                    retry=retry,
+                    prepared_at=_utcnow(),
+                    _workspace_session=workspace_session,
+                )
+            except BaseException:
+                workspace_session.close()
+                raise
+            return prepared
         else:
+            self.grant.require(step.capability, at=_utcnow())
             resolved_target = self._resolve_target(step)
 
         request = ExecutionRequest(
@@ -554,11 +625,7 @@ class ExecutionContract:
             action=step.action,
             target=step.target,
             requires_human_gate=step.requires_human_gate,
-            command_sha256=(
-                command_snapshot.command_sha256
-                if command_snapshot is not None
-                else ""
-            ),
+            command_sha256="",
         )
 
         if self.reservation_backend is None:
@@ -582,6 +649,7 @@ class ExecutionContract:
             reserved_runtime_seconds=reservation_runtime,
             retry=retry,
             prepared_at=_utcnow(),
+            _workspace_session=workspace_session,
         )
 
     def _accept_reserved_snapshot(

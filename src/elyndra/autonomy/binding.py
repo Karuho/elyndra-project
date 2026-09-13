@@ -21,6 +21,7 @@ from elyndra.autonomy.models import (
 )
 from elyndra.autonomy.repository import AutonomyRepository
 from elyndra.autonomy.scope import WorkspaceScope
+from elyndra.autonomy.workspace_lease import WorkspaceLeaseCoordinator
 
 _GRANT_KEYS_V1 = frozenset(
     {
@@ -92,8 +93,14 @@ class AutonomyExecutionBinding:
     anything.
     """
 
-    def __init__(self, repository: AutonomyRepository) -> None:
+    def __init__(
+        self,
+        repository: AutonomyRepository,
+        *,
+        workspace_lease_coordinator: WorkspaceLeaseCoordinator | None = None,
+    ) -> None:
         self.repository = repository
+        self.workspace_lease_coordinator = workspace_lease_coordinator
 
     def bind(
         self,
@@ -212,6 +219,7 @@ class AutonomyExecutionBinding:
             budget=budget,
             cancellation=cancellation,
             reservation_backend=reservation_backend,
+            workspace_lease_coordinator=self.workspace_lease_coordinator,
         )
 
 

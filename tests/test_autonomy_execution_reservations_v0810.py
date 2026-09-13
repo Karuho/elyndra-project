@@ -25,6 +25,7 @@ from elyndra.autonomy import (
     HumanGateStatus,
     RunPlan,
     RunStep,
+    WorkspaceLeaseCoordinator,
     WorkspaceScope,
 )
 from elyndra.db import Database
@@ -747,7 +748,12 @@ def test_bound_process_exec_reserves_exact_command_snapshot(
     database, repository, run = _process_state(tmp_path)
     _start(repository, run)
 
-    contract = AutonomyExecutionBinding(repository).bind(
+    runtime_root = tmp_path / "runtime"
+    runtime_root.mkdir(mode=0o700)
+    contract = AutonomyExecutionBinding(
+        repository,
+        workspace_lease_coordinator=WorkspaceLeaseCoordinator._for_test(runtime_root),
+    ).bind(
         run.run_id,
         actor="owner",
     )
@@ -762,6 +768,7 @@ def test_bound_process_exec_reserves_exact_command_snapshot(
     assert prepared.resolved_target == str(run.workspace.root)
     assert prepared.budget.commands_reserved == 1
     assert prepared.budget.runtime_seconds_reserved == 7
+    prepared.close_workspace_session()
 
     with database.connect() as connection:
         row = connection.execute(
@@ -983,12 +990,18 @@ def test_schema_55_upgrade_creates_execution_results_ledger(
         runtime_seconds=command.timeout_seconds,
     )
 
+    runtime_root = tmp_path / "runtime"
+    runtime_root.mkdir(mode=0o700)
+    coordinator = WorkspaceLeaseCoordinator._for_test(runtime_root)
+    session = coordinator.execution_session(run.workspace.root)
     repository._claim_execution_launch(
         request,
         actor="owner",
         runtime_seconds=command.timeout_seconds,
         retry=False,
+        workspace_lease_receipt=session.receipt,
     )
+    session.close()
 
     with database.connect() as connection:
         result_trigger_names = [

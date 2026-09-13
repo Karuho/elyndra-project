@@ -1012,15 +1012,23 @@ class AutonomyRepository:
         _json_dump(payload_data, maximum=16_384)
 
         with self.database.connect() as connection:
-            self._transition_connection(
-                connection,
-                run_id,
-                target,
-                actor=actor,
-                summary=clean_summary,
-                step_id=clean_step,
-                payload=payload_data,
-            )
+            if target is AutonomyRunStatus.CANCELLED:
+                self._cancel_run_connection(
+                    connection,
+                    run_id,
+                    actor=actor,
+                    summary=clean_summary,
+                )
+            else:
+                self._transition_connection(
+                    connection,
+                    run_id,
+                    target,
+                    actor=actor,
+                    summary=clean_summary,
+                    step_id=clean_step,
+                    payload=payload_data,
+                )
 
         item = self.get(run_id)
         if item is None:
@@ -1119,6 +1127,14 @@ class AutonomyRepository:
         row = self._owned_run(connection, run_id, actor=actor)
         current = AutonomyRunStatus(str(row["status"]))
         changed_at = now or _now()
+        if connection.execute(
+            "SELECT 1 FROM assistant_autonomy_mutation_attempts "
+            "WHERE run_id=? LIMIT 1",
+            (int(row["id"]),),
+        ).fetchone() is not None:
+            raise PermissionError(
+                "Mutation attempt requiere liberación especializada."
+            )
         if current is not AutonomyRunStatus.WAITING_HUMAN:
             if current not in {AutonomyRunStatus.PLANNED, AutonomyRunStatus.RUNNING}:
                 raise PermissionError("El AutonomyRun ya es terminal o no cancelable.")
@@ -2362,7 +2378,16 @@ class AutonomyRepository:
         actor: str,
         runtime_seconds: int,
         retry: bool,
+        workspace_lease_receipt: object,
     ) -> _ExecutionObservationReceipt:
+        from elyndra.autonomy.workspace_lease import (
+            WorkspaceLeaseMode,
+            WorkspaceLeaseReceipt,
+        )
+
+        if not isinstance(workspace_lease_receipt, WorkspaceLeaseReceipt):
+            raise PermissionError("Launch requiere workspace lease receipt.")
+        workspace_lease_receipt.require_live(mode=WorkspaceLeaseMode.SHARED)
         if not isinstance(request, ExecutionRequest):
             raise TypeError(
                 "request debe ser un ExecutionRequest."
@@ -2409,6 +2434,9 @@ class AutonomyRepository:
                 connection,
                 request.run_id,
                 actor=actor,
+            )
+            workspace_lease_receipt.require_workspace(
+                str(run_row["workspace_root"])
             )
 
             if (

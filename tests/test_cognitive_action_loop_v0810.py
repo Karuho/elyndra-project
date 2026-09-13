@@ -125,6 +125,7 @@ def _fake_execution(repository: AutonomyRepository, outcome: ExecutionOutcome):
             actor="owner",
             runtime_seconds=prepared.reserved_runtime_seconds,
             retry=prepared.retry,
+            workspace_lease_receipt=prepared.workspace_session.receipt,
         )
         result = ExecutionResult(
             request_id=prepared.request.request_id,
@@ -142,6 +143,7 @@ def _fake_execution(repository: AutonomyRepository, outcome: ExecutionOutcome):
         repository._record_execution_result(
             prepared.request, result, actor="owner", receipt=receipt
         )
+        prepared.close_workspace_session()
         return result
 
     return execute

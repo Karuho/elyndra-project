@@ -277,6 +277,7 @@ def test_launch_without_result_blocks_fail_closed(tmp_path: Path) -> None:
         actor="owner",
         runtime_seconds=prepared.reserved_runtime_seconds,
         retry=False,
+        workspace_lease_receipt=prepared.workspace_session.receipt,
     )
 
     gaps = repository.execution_attempt_gaps(run.run_id, actor="owner")

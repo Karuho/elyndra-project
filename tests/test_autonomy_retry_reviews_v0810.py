@@ -104,6 +104,7 @@ def _failed_attempt(
         actor="owner",
         runtime_seconds=prepared.reserved_runtime_seconds,
         retry=False,
+        workspace_lease_receipt=prepared.workspace_session.receipt,
     )
     repository._record_execution_result(
         prepared.request,
@@ -271,6 +272,7 @@ def test_succeeded_source_and_unlaunched_reservation_are_denied(tmp_path: Path) 
         actor="owner",
         runtime_seconds=prepared.reserved_runtime_seconds,
         retry=False,
+        workspace_lease_receipt=prepared.workspace_session.receipt,
     )
     repository._record_execution_result(
         prepared.request,
@@ -410,6 +412,7 @@ def test_two_concurrent_runner_ticks_launch_one_approved_retry(
             actor="owner",
             runtime_seconds=prepared.reserved_runtime_seconds,
             retry=True,
+            workspace_lease_receipt=prepared.workspace_session.receipt,
         )
         result = _result(prepared.request.request_id, ExecutionOutcome.FAILED)
         repository._record_execution_result(
@@ -466,6 +469,7 @@ def test_consumed_review_cannot_authorize_new_failed_or_cancelled_result(
         actor="owner",
         runtime_seconds=retry.reserved_runtime_seconds,
         retry=True,
+        workspace_lease_receipt=retry.workspace_session.receipt,
     )
     repository._record_execution_result(
         retry.request,
@@ -545,6 +549,7 @@ def test_runner_executes_only_one_approved_retry_then_blocks_or_completes(
             actor="owner",
             runtime_seconds=prepared.reserved_runtime_seconds,
             retry=True,
+            workspace_lease_receipt=prepared.workspace_session.receipt,
         )
         result = _result(prepared.request.request_id, retry_outcome)
         repository._record_execution_result(
@@ -595,6 +600,9 @@ def test_exact_schema_56_upgrade_preserves_data_without_fake_reviews(
         )
         connection.executescript(
             """
+            DROP TABLE assistant_autonomy_mutation_results;
+            DROP TABLE assistant_autonomy_mutation_attempt_files;
+            DROP TABLE assistant_autonomy_mutation_attempts;
             DROP TABLE assistant_autonomy_mutation_gate_bindings;
             DROP TABLE assistant_autonomy_mutation_items;
             DROP TABLE assistant_autonomy_mutation_proposals;
@@ -766,6 +774,7 @@ def test_observation_unresolved_denies_review(tmp_path: Path) -> None:
         actor="owner",
         runtime_seconds=prepared.reserved_runtime_seconds,
         retry=False,
+        workspace_lease_receipt=prepared.workspace_session.receipt,
     )
     assert repository.execution_attempt_gaps(run.run_id, actor="owner")[0][
         "state"

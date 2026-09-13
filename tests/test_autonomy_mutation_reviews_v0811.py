@@ -29,6 +29,7 @@ from elyndra.autonomy import (
     RunStep,
     SupervisedAutonomyRunner,
     SupervisedTickOutcome,
+    WorkspaceLeaseCoordinator,
     WorkspaceScope,
 )
 from elyndra.cognitive_loop import LocalCognitiveActionLoop
@@ -213,9 +214,8 @@ def test_request_is_atomic_exact_bounded_and_idempotent(tmp_path: Path) -> None:
             "SELECT COUNT(*) FROM assistant_autonomy_execution_results"
         ).fetchone()[0] == 0
         assert connection.execute(
-            "SELECT 1 FROM sqlite_master "
-            "WHERE name='assistant_autonomy_mutation_attempts'"
-        ).fetchone() is None
+            "SELECT COUNT(*) FROM assistant_autonomy_mutation_attempts"
+        ).fetchone()[0] == 0
 
 
 def test_review_authority_time_is_captured_after_write_lock(
@@ -382,7 +382,12 @@ def test_review_requires_exact_first_incomplete_plan_step(tmp_path: Path) -> Non
         ).fetchone()[0] == 0
     assert repository.get(run.run_id)["status"] == "running"  # type: ignore[index]
 
-    prepared = AutonomyExecutionBinding(repository).bind(
+    runtime_root = tmp_path / "runtime"
+    runtime_root.mkdir(mode=0o700)
+    prepared = AutonomyExecutionBinding(
+        repository,
+        workspace_lease_coordinator=WorkspaceLeaseCoordinator._for_test(runtime_root),
+    ).bind(
         run.run_id,
         actor="owner",
     ).prepare("inspect")
@@ -391,6 +396,7 @@ def test_review_requires_exact_first_incomplete_plan_step(tmp_path: Path) -> Non
         actor="owner",
         runtime_seconds=prepared.reserved_runtime_seconds,
         retry=False,
+        workspace_lease_receipt=prepared.workspace_session.receipt,
     )
     repository._record_execution_result(
         prepared.request,
@@ -403,6 +409,7 @@ def test_review_requires_exact_first_incomplete_plan_step(tmp_path: Path) -> Non
         actor="owner",
         receipt=receipt,
     )
+    prepared.close_workspace_session()
     assert _request(repository, persisted).gate_status == "pending"
 
 
@@ -779,3 +786,192 @@ def test_proposal_commitment_is_unchanged_by_review(tmp_path: Path) -> None:
     assert loaded is not None
     assert loaded.proposal == proposal
     assert loaded.proposal.proposal_sha256 == before
+
+
+def test_attempt_foundation_blocks_illegal_transition_and_cancellation(
+    tmp_path: Path,
+) -> None:
+    database, repository, run, _proposal, persisted = _state(tmp_path)
+    review = _request(repository, persisted)
+    _resolve(repository, persisted, review.gate_id, "approved")
+    with database.connect() as connection:
+        proposal_id = connection.execute(
+            "SELECT id FROM assistant_autonomy_mutation_proposals WHERE public_id=?",
+            (persisted.public_id,),
+        ).fetchone()[0]
+        binding_id = connection.execute(
+            "SELECT id FROM assistant_autonomy_mutation_gate_bindings WHERE gate_id=?",
+            (review.gate_id,),
+        ).fetchone()[0]
+        run_id = connection.execute(
+            "SELECT id FROM assistant_autonomy_runs WHERE public_id=?",
+            (run.run_id,),
+        ).fetchone()[0]
+        metadata = run.workspace.root.stat()
+        connection.execute(
+            """INSERT INTO assistant_autonomy_mutation_attempts(
+                public_id,request_key,proposal_id,binding_id,gate_id,
+                proposal_public_id,proposal_sha256,run_id,step_id,actor,
+                workspace_root,workspace_st_dev,workspace_st_ino,
+                workspace_mount_id,state,claimed_at,state_updated_at,
+                initial_blockade_sha256,initial_manifest_sha256,
+                manifest_sequence,manifest_tail_sha256
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,'claimed',?,?,?,?,0,?)""",
+            (
+                "attempt-foundation",
+                "apply-foundation",
+                proposal_id,
+                binding_id,
+                review.gate_id,
+                persisted.public_id,
+                persisted.proposal.proposal_sha256,
+                run_id,
+                "mutate",
+                "owner",
+                str(run.workspace.root),
+                metadata.st_dev,
+                metadata.st_ino,
+                1,
+                review.created_at.isoformat(),
+                review.created_at.isoformat(),
+                "1" * 64,
+                "2" * 64,
+                "2" * 64,
+            ),
+        )
+        with pytest.raises(sqlite3.IntegrityError, match="transition_invalid"):
+            connection.execute(
+                "UPDATE assistant_autonomy_mutation_attempts "
+                "SET state='publishing',publication_started_at=? WHERE public_id=?",
+                (datetime.now(UTC).isoformat(), "attempt-foundation"),
+            )
+        for terminal in ("expired", "stale", "failed_before_publication"):
+            with pytest.raises(sqlite3.IntegrityError):
+                connection.execute(
+                    "UPDATE assistant_autonomy_mutation_attempts "
+                    "SET state=?,terminal_at=? WHERE public_id=?",
+                    (terminal, datetime.now(UTC).isoformat(), "attempt-foundation"),
+                )
+        with pytest.raises(sqlite3.IntegrityError, match="identity_immutable"):
+            connection.execute(
+                "UPDATE assistant_autonomy_mutation_attempts SET actor='other' "
+                "WHERE public_id='attempt-foundation'"
+            )
+    with pytest.raises(PermissionError, match="liberación especializada"):
+        repository.transition(
+            run.run_id,
+            "cancelled",
+            actor="owner",
+            summary="must not cancel",
+        )
+    assert not hasattr(repository, "claim_mutation_application")
+
+
+def test_attempt_result_counts_and_stage_inode_write_once(tmp_path: Path) -> None:
+    database, repository, run, _proposal, persisted = _state(tmp_path)
+    review = _request(repository, persisted)
+    _resolve(repository, persisted, review.gate_id, "approved")
+    with database.connect() as connection:
+        proposal_row = connection.execute(
+            "SELECT id FROM assistant_autonomy_mutation_proposals WHERE public_id=?",
+            (persisted.public_id,),
+        ).fetchone()
+        proposal_id = proposal_row[0]
+        item_id = connection.execute(
+            "SELECT id FROM assistant_autonomy_mutation_items WHERE proposal_id=?",
+            (proposal_id,),
+        ).fetchone()[0]
+        binding_id = connection.execute(
+            "SELECT id FROM assistant_autonomy_mutation_gate_bindings WHERE gate_id=?",
+            (review.gate_id,),
+        ).fetchone()[0]
+        run_id = connection.execute(
+            "SELECT id FROM assistant_autonomy_runs WHERE public_id=?", (run.run_id,)
+        ).fetchone()[0]
+        metadata = run.workspace.root.stat()
+        connection.execute(
+            """INSERT INTO assistant_autonomy_mutation_attempts(
+                public_id,request_key,proposal_id,binding_id,gate_id,
+                proposal_public_id,proposal_sha256,run_id,step_id,actor,
+                workspace_root,workspace_st_dev,workspace_st_ino,
+                workspace_mount_id,state,claimed_at,state_updated_at,
+                initial_blockade_sha256,initial_manifest_sha256,
+                manifest_sequence,manifest_tail_sha256
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,'claimed',?,?,?,?,0,?)""",
+            (
+                "attempt-stage", "apply-stage", proposal_id, binding_id, review.gate_id,
+                persisted.public_id, persisted.proposal.proposal_sha256, run_id, "mutate",
+                "owner", str(run.workspace.root), metadata.st_dev, metadata.st_ino, 1,
+                review.created_at.isoformat(), review.created_at.isoformat(), "1" * 64,
+                "2" * 64, "2" * 64,
+            ),
+        )
+        attempt_id = connection.execute(
+            "SELECT id FROM assistant_autonomy_mutation_attempts WHERE public_id='attempt-stage'"
+        ).fetchone()[0]
+        connection.execute(
+            """INSERT INTO assistant_autonomy_mutation_attempt_files(
+                attempt_id,proposal_item_id,ordinal,relative_path,operation,
+                expected_preimage_sha256,expected_preimage_size,
+                expected_postimage_sha256,expected_postimage_size,
+                parent_st_dev,parent_st_ino,parent_mount_id,artifact_name,witness_name,
+                state,state_updated_at
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                attempt_id, item_id, 0, "src/new.py", "create", None, None,
+                persisted.proposal.items[0].proposed_sha256,
+                persisted.proposal.items[0].proposed_size,
+                metadata.st_dev, metadata.st_ino, 1, "stage", "witness", "planned",
+                review.created_at.isoformat(),
+            ),
+        )
+        with pytest.raises(sqlite3.IntegrityError, match="stage_immutable"):
+            connection.execute(
+                "UPDATE assistant_autonomy_mutation_attempt_files "
+                "SET stage_st_dev=? WHERE attempt_id=?",
+                (metadata.st_dev, attempt_id),
+            )
+        with pytest.raises(sqlite3.IntegrityError, match="stage_required"):
+            connection.execute(
+                "UPDATE assistant_autonomy_mutation_attempt_files "
+                "SET state='staged',state_updated_at=? WHERE attempt_id=?",
+                (datetime.now(UTC).isoformat(), attempt_id),
+            )
+        connection.execute(
+            "UPDATE assistant_autonomy_mutation_attempt_files "
+            "SET stage_st_dev=?,stage_st_ino=?,state='staged',state_updated_at=? "
+            "WHERE attempt_id=?",
+            (metadata.st_dev, 999, datetime.now(UTC).isoformat(), attempt_id),
+        )
+        with pytest.raises(sqlite3.IntegrityError, match="stage_immutable"):
+            connection.execute(
+                "UPDATE assistant_autonomy_mutation_attempt_files SET stage_st_ino=1000 "
+                "WHERE attempt_id=?",
+                (attempt_id,),
+            )
+
+        connection.execute(
+            "UPDATE assistant_autonomy_mutation_attempts "
+            "SET state='recovery_required' WHERE id=?",
+            (attempt_id,),
+        )
+        connection.execute(
+            """INSERT INTO assistant_autonomy_mutation_results(
+                public_id,attempt_id,outcome,published_count,restored_count,
+                final_manifest_sequence,final_manifest_sha256,summary,observed_at
+            ) VALUES(?,?,?,?,?,?,?,?,?)""",
+            (
+                "result-rollback", attempt_id, "rolled_back", 3, 3, 1, "3" * 64,
+                "rollback complete", datetime.now(UTC).isoformat(),
+            ),
+        )
+        connection.execute(
+            "UPDATE assistant_autonomy_mutation_attempts SET state='cleanup_pending' "
+            "WHERE id=?",
+            (attempt_id,),
+        )
+        connection.execute(
+            "UPDATE assistant_autonomy_mutation_attempts "
+            "SET state='rolled_back',terminal_at=? WHERE id=?",
+            (datetime.now(UTC).isoformat(), attempt_id),
+        )
