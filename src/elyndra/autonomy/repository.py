@@ -36,6 +36,11 @@ from elyndra.autonomy.mutations import (
     PersistedMutationProposal,
 )
 from elyndra.autonomy.scope import WorkspaceScope
+from elyndra.autonomy.workspace_lease import (
+    WorkspaceIdentity,
+    WorkspaceLeaseMode,
+    WorkspaceLeaseReceipt,
+)
 from elyndra.db import Database
 
 _STEP_ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
@@ -139,6 +144,204 @@ class AutonomyRepository:
                 "Los runs autónomos pertenecen al vault de la cuenta, no a la base root."
             )
         self.database = database
+
+    def _claim_mutation_application(
+        self,
+        *,
+        attempt_public_id: str,
+        apply_request_key: str,
+        proposal_public_id: str,
+        proposal_sha256: str,
+        gate_id: str,
+        actor: str,
+        workspace_identity: WorkspaceIdentity,
+        lease_receipt: WorkspaceLeaseReceipt,
+        initial_blockade_sha256: str,
+        initial_manifest_sha256: str,
+    ) -> tuple[dict[str, Any], PersistedMutationProposal, bool]:
+        """Consume one exact mutation review after durable filesystem preclaim."""
+
+        clean_attempt = _required_exact(attempt_public_id, "attempt_public_id", 128)
+        clean_key = _required_exact(apply_request_key, "apply_request_key", 128)
+        clean_proposal = _required_exact(proposal_public_id, "proposal_public_id", 128)
+        clean_sha = _required_sha256(proposal_sha256, "proposal_sha256")
+        clean_gate = _required_exact(gate_id, "gate_id", 128)
+        clean_actor = _required_exact(actor, "actor", 200)
+        blockade_sha = _required_sha256(initial_blockade_sha256, "initial_blockade_sha256")
+        manifest_sha = _required_sha256(initial_manifest_sha256, "initial_manifest_sha256")
+        lease_receipt.require_live(
+            mode=WorkspaceLeaseMode.EXCLUSIVE,
+            identity=workspace_identity,
+        )
+
+        with self.database.connect_mutation_durable() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            now = _utcnow()
+            existing = connection.execute(
+                "SELECT * FROM assistant_autonomy_mutation_attempts WHERE request_key=?",
+                (clean_key,),
+            ).fetchone()
+            if existing is not None:
+                exact = (
+                    str(existing["public_id"]) == clean_attempt
+                    and str(existing["proposal_public_id"]) == clean_proposal
+                    and hmac.compare_digest(str(existing["proposal_sha256"]), clean_sha)
+                    and str(existing["gate_id"]) == clean_gate
+                    and str(existing["actor"]) == clean_actor
+                    and str(existing["workspace_root"]) == workspace_identity.canonical_root
+                    and int(existing["workspace_st_dev"]) == workspace_identity.st_dev
+                    and int(existing["workspace_st_ino"]) == workspace_identity.st_ino
+                    and int(existing["workspace_mount_id"]) == workspace_identity.mount_id
+                    and hmac.compare_digest(
+                        str(existing["initial_blockade_sha256"]), blockade_sha
+                    )
+                    and hmac.compare_digest(
+                        str(existing["initial_manifest_sha256"]), manifest_sha
+                    )
+                )
+                if not exact:
+                    raise PermissionError("Replay de mutation application no coincide.")
+                proposal_row = connection.execute(
+                    "SELECT * FROM assistant_autonomy_mutation_proposals WHERE id=?",
+                    (int(existing["proposal_id"]),),
+                ).fetchone()
+                assert proposal_row is not None
+                return dict(existing), self._mutation_proposal_from_row(
+                    connection, proposal_row
+                ), True
+
+            proposal_row = connection.execute(
+                "SELECT * FROM assistant_autonomy_mutation_proposals WHERE public_id=?",
+                (clean_proposal,),
+            ).fetchone()
+            if proposal_row is None:
+                raise ValueError("MutationProposal no encontrada.")
+            proposal = self._mutation_proposal_from_row(connection, proposal_row)
+            if (
+                proposal.proposal.actor != clean_actor
+                or not hmac.compare_digest(proposal.proposal.proposal_sha256, clean_sha)
+                or proposal.proposal.workspace_root != workspace_identity.canonical_root
+            ):
+                raise PermissionError("Identidad de propuesta de mutación incorrecta.")
+            binding = connection.execute(
+                "SELECT * FROM assistant_autonomy_mutation_gate_bindings "
+                "WHERE proposal_id=? AND gate_id=?",
+                (int(proposal_row["id"]), clean_gate),
+            ).fetchone()
+            if binding is None:
+                raise PermissionError("Binding de mutation review incorrecto.")
+            review = self._mutation_review_from_row(connection, binding)
+            if review.gate_status != HumanGateStatus.APPROVED.value:
+                raise PermissionError("Mutation review no aprobada.")
+            run = self._owned_run(connection, review.run_id, actor=clean_actor)
+            if str(run["status"]) != AutonomyRunStatus.WAITING_HUMAN.value:
+                raise PermissionError("El run no permanece waiting_human.")
+            grant = _grant_from_json(str(run["grant_json"]))
+            grant.require(Capability.SELF_MODIFY, at=now)
+            if proposal.proposal.expires_at <= now:
+                raise PermissionError("La propuesta de mutación expiró.")
+            plan = _plan_from_json(str(run["plan_json"]))
+            step = self._first_incomplete_plan_step_connection(
+                connection, run_db_id=int(run["id"]), plan=plan
+            )
+            if (
+                step is None
+                or step.step_id != proposal.proposal.step_id
+                or step.capability is not Capability.SELF_MODIFY
+                or review.step_id != step.step_id
+            ):
+                raise PermissionError("Mutation step ya no es el primero incompleto exacto.")
+            self._require_no_execution_gap_connection(
+                connection, review.run_id, actor=clean_actor
+            )
+            lease_receipt.require_live(
+                mode=WorkspaceLeaseMode.EXCLUSIVE,
+                identity=workspace_identity,
+            )
+            consumed = connection.execute(
+                """SELECT request_key FROM assistant_autonomy_mutation_attempts
+                   WHERE proposal_id=? OR binding_id=? OR gate_id=?""",
+                (int(proposal_row["id"]), int(binding["id"]), clean_gate),
+            ).fetchone()
+            if consumed is not None:
+                raise PermissionError("Mutation review ya fue consumida.")
+            now_text = now.isoformat()
+            connection.execute(
+                """INSERT INTO assistant_autonomy_mutation_attempts(
+                       public_id,request_key,proposal_id,binding_id,gate_id,
+                       proposal_public_id,proposal_sha256,run_id,step_id,actor,
+                       workspace_root,workspace_st_dev,workspace_st_ino,workspace_mount_id,
+                       state,claimed_at,state_updated_at,initial_blockade_sha256,
+                       initial_manifest_sha256,manifest_sequence,manifest_tail_sha256)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,'claimed',?,?,?,?,0,?)""",
+                (
+                    clean_attempt,
+                    clean_key,
+                    int(proposal_row["id"]),
+                    int(binding["id"]),
+                    clean_gate,
+                    clean_proposal,
+                    clean_sha,
+                    int(run["id"]),
+                    review.step_id,
+                    clean_actor,
+                    workspace_identity.canonical_root,
+                    workspace_identity.st_dev,
+                    workspace_identity.st_ino,
+                    workspace_identity.mount_id,
+                    now_text,
+                    now_text,
+                    blockade_sha,
+                    manifest_sha,
+                    manifest_sha,
+                ),
+            )
+            row = connection.execute(
+                "SELECT * FROM assistant_autonomy_mutation_attempts WHERE public_id=?",
+                (clean_attempt,),
+            ).fetchone()
+            assert row is not None
+            return dict(row), proposal, False
+
+    def _mutation_application_replay(
+        self,
+        *,
+        apply_request_key: str,
+        proposal_public_id: str,
+        proposal_sha256: str,
+        gate_id: str,
+        actor: str,
+    ) -> dict[str, Any] | None:
+        """Return an exact historical application attempt without reauthorizing it."""
+
+        clean_key = _required_exact(apply_request_key, "apply_request_key", 128)
+        clean_proposal = _required_exact(proposal_public_id, "proposal_public_id", 128)
+        clean_sha = _required_sha256(proposal_sha256, "proposal_sha256")
+        clean_gate = _required_exact(gate_id, "gate_id", 128)
+        clean_actor = _required_exact(actor, "actor", 200)
+        with self.database.connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM assistant_autonomy_mutation_attempts WHERE request_key=?",
+                (clean_key,),
+            ).fetchone()
+            if row is None:
+                consumed = connection.execute(
+                    "SELECT 1 FROM assistant_autonomy_mutation_attempts "
+                    "WHERE proposal_public_id=? OR gate_id=?",
+                    (clean_proposal, clean_gate),
+                ).fetchone()
+                if consumed is not None:
+                    raise PermissionError("Mutation review ya fue consumida por otro request key.")
+                return None
+            exact = (
+                str(row["proposal_public_id"]) == clean_proposal
+                and hmac.compare_digest(str(row["proposal_sha256"]), clean_sha)
+                and str(row["gate_id"]) == clean_gate
+                and str(row["actor"]) == clean_actor
+            )
+            if not exact:
+                raise PermissionError("Apply request key ya pertenece a otra identidad.")
+            return dict(row)
 
     def create(self, run: AutonomyRun) -> dict[str, Any]:
         with self.database.connect() as connection:
