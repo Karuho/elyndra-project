@@ -219,7 +219,7 @@ def test_schema60_refreshes_old_file_transition_trigger_idempotently(tmp_path: P
     with database.connect() as connection:
         assert connection.execute(
             "SELECT value FROM schema_meta WHERE key='schema_version'"
-        ).fetchone()[0] == "62"
+        ).fetchone()[0] == "63"
         connection.execute(
             "UPDATE assistant_autonomy_mutation_attempt_files "
             "SET state='discarded' WHERE ordinal=1"

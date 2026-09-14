@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import hashlib
 import json
+import re
 import sqlite3
 import uuid
 from dataclasses import dataclass
@@ -16,6 +18,7 @@ from elyndra.autonomy import (
     HumanGateKind,
     HumanGateStatus,
     RunPlan,
+    RunStep,
     SupervisedAutonomyRunner,
     SupervisedTickOutcome,
 )
@@ -24,6 +27,7 @@ from elyndra.autonomy.mutation_recovery import (
     MutationRecoveryDisposition,
     MutationRecoveryInspector,
 )
+from elyndra.autonomy.mutations import _validated_relative_path
 from elyndra.autonomy.repository import _grant_from_json, _plan_from_json
 from elyndra.autonomy.workspace_lease import (
     WorkspaceIdentity,
@@ -49,6 +53,7 @@ _MAX_CONTEXT_ITEMS = 8
 _MAX_CONTEXT_BYTES = 8_000
 _MAX_OBSERVATION_CHARS = 4_000
 _MAX_REPLY_BYTES = 8_192
+_MODEL_SUCCESSOR_REPLY_HASH_DOMAIN = "elyndra.phase9b3.model-successor-reply.v1"
 
 
 @dataclass(frozen=True, slots=True)
@@ -61,6 +66,12 @@ class CognitiveAdvanceResult:
     disposition: str = ""
     step_id: str = ""
     source_request_id: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class _ModelDecision:
+    decision: str
+    successor_steps: tuple[dict[str, str], ...] | None = None
 
 
 class LocalCognitiveActionLoop:
@@ -216,13 +227,19 @@ class LocalCognitiveActionLoop:
             rows = connection.execute(
                 """SELECT h.*, w.public_id AS wait_public_id,
                           c.public_id AS cycle_public_id,
-                          successor.public_id AS successor_public_id
+                          successor.public_id AS successor_public_id,
+                          origin.model_reply_sha256,
+                          source.public_id AS model_source_turn_public_id
                    FROM assistant_cognitive_successor_handoffs h
                    JOIN assistant_cognitive_owner_waits w ON w.id=h.wait_id
                    JOIN assistant_cognitive_cycles c ON c.id=h.predecessor_cycle_id
                    JOIN assistant_autonomy_runs r ON r.id=c.autonomy_run_id
                    LEFT JOIN assistant_autonomy_runs successor
                      ON successor.id=h.successor_run_id
+                   LEFT JOIN assistant_cognitive_model_successor_origins origin
+                     ON origin.handoff_id=h.id
+                   LEFT JOIN assistant_cognitive_turns source
+                     ON source.id=origin.source_turn_id
                    WHERE c.actor=? AND r.actor=? ORDER BY h.id ASC""",
                 (clean_actor, clean_actor),
             ).fetchall()
@@ -236,13 +253,19 @@ class LocalCognitiveActionLoop:
             row = connection.execute(
                 """SELECT h.*, w.public_id AS wait_public_id,
                           c.public_id AS cycle_public_id,
-                          successor.public_id AS successor_public_id
+                          successor.public_id AS successor_public_id,
+                          origin.model_reply_sha256,
+                          source.public_id AS model_source_turn_public_id
                    FROM assistant_cognitive_successor_handoffs h
                    JOIN assistant_cognitive_owner_waits w ON w.id=h.wait_id
                    JOIN assistant_cognitive_cycles c ON c.id=h.predecessor_cycle_id
                    JOIN assistant_autonomy_runs r ON r.id=c.autonomy_run_id
                    LEFT JOIN assistant_autonomy_runs successor
                      ON successor.id=h.successor_run_id
+                   LEFT JOIN assistant_cognitive_model_successor_origins origin
+                     ON origin.handoff_id=h.id
+                   LEFT JOIN assistant_cognitive_turns source
+                     ON source.id=origin.source_turn_id
                    WHERE h.public_id=? AND c.actor=? AND r.actor=?""",
                 (_required(handoff_id, "handoff_id", 128), clean_actor, clean_actor),
             ).fetchone()
@@ -953,13 +976,19 @@ class LocalCognitiveActionLoop:
                 """SELECT h.*, w.public_id AS wait_public_id,
                           c.public_id AS cycle_public_id, r.public_id AS run_public_id,
                           c.actor AS cycle_actor, r.actor AS run_actor,
-                          successor.public_id AS successor_public_id
+                          successor.public_id AS successor_public_id,
+                          origin.model_reply_sha256,
+                          source.public_id AS model_source_turn_public_id
                    FROM assistant_cognitive_successor_handoffs h
                    JOIN assistant_cognitive_owner_waits w ON w.id=h.wait_id
                    JOIN assistant_cognitive_cycles c ON c.id=h.predecessor_cycle_id
                    JOIN assistant_autonomy_runs r ON r.id=c.autonomy_run_id
                    LEFT JOIN assistant_autonomy_runs successor
                      ON successor.id=h.successor_run_id
+                   LEFT JOIN assistant_cognitive_model_successor_origins origin
+                     ON origin.handoff_id=h.id
+                   LEFT JOIN assistant_cognitive_turns source
+                     ON source.id=origin.source_turn_id
                    WHERE h.request_key=?""",
                 (clean_key,),
             ).fetchone()
@@ -1038,12 +1067,18 @@ class LocalCognitiveActionLoop:
             row = connection.execute(
                 """SELECT h.*, w.public_id AS wait_public_id,
                           c.public_id AS cycle_public_id,
-                          successor.public_id AS successor_public_id
+                          successor.public_id AS successor_public_id,
+                          origin.model_reply_sha256,
+                          source.public_id AS model_source_turn_public_id
                    FROM assistant_cognitive_successor_handoffs h
                    JOIN assistant_cognitive_owner_waits w ON w.id=h.wait_id
                    JOIN assistant_cognitive_cycles c ON c.id=h.predecessor_cycle_id
                    LEFT JOIN assistant_autonomy_runs successor
                      ON successor.id=h.successor_run_id
+                   LEFT JOIN assistant_cognitive_model_successor_origins origin
+                     ON origin.handoff_id=h.id
+                   LEFT JOIN assistant_cognitive_turns source
+                     ON source.id=origin.source_turn_id
                    WHERE h.public_id=?""",
                 (public_id,),
             ).fetchone()
@@ -1066,6 +1101,10 @@ class LocalCognitiveActionLoop:
                    JOIN assistant_autonomy_runs r ON r.id=c.autonomy_run_id
                    LEFT JOIN assistant_autonomy_runs successor
                      ON successor.id=h.successor_run_id
+                   LEFT JOIN assistant_cognitive_model_successor_origins origin
+                     ON origin.handoff_id=h.id
+                   LEFT JOIN assistant_cognitive_turns source
+                     ON source.id=origin.source_turn_id
                    WHERE h.public_id=? AND c.actor=? AND r.actor=?""",
                 (clean_handoff, clean_actor, clean_actor),
             ).fetchone()
@@ -1081,12 +1120,18 @@ class LocalCognitiveActionLoop:
             updated = connection.execute(
                 """SELECT h.*, w.public_id AS wait_public_id,
                           c.public_id AS cycle_public_id,
-                          successor.public_id AS successor_public_id
+                          successor.public_id AS successor_public_id,
+                          origin.model_reply_sha256,
+                          source.public_id AS model_source_turn_public_id
                    FROM assistant_cognitive_successor_handoffs h
                    JOIN assistant_cognitive_owner_waits w ON w.id=h.wait_id
                    JOIN assistant_cognitive_cycles c ON c.id=h.predecessor_cycle_id
                    LEFT JOIN assistant_autonomy_runs successor
                      ON successor.id=h.successor_run_id
+                   LEFT JOIN assistant_cognitive_model_successor_origins origin
+                     ON origin.handoff_id=h.id
+                   LEFT JOIN assistant_cognitive_turns source
+                     ON source.id=origin.source_turn_id
                    WHERE h.id=?""",
                 (int(row["id"]),),
             ).fetchone()
@@ -1105,6 +1150,7 @@ class LocalCognitiveActionLoop:
                 or str(row["run_actor"]) != clean_actor
             ):
                 raise PermissionError("El actor no es propietario del handoff.")
+            self._require_model_origin_integrity_connection(connection, row)
             status = str(row["status"])
             if status == "accepted":
                 self.autonomy._require_accepted_successor_integrity_connection(
@@ -1202,7 +1248,9 @@ class LocalCognitiveActionLoop:
                       c.status AS cycle_status, c.actor AS cycle_actor,
                       r.id AS predecessor_run_db_id,
                       r.public_id AS run_public_id, r.status AS run_status,
-                      r.actor AS run_actor, successor.public_id AS successor_public_id
+                      r.actor AS run_actor, successor.public_id AS successor_public_id,
+                      origin.model_reply_sha256,
+                      source.public_id AS model_source_turn_public_id
                FROM assistant_cognitive_successor_handoffs h
                JOIN assistant_cognitive_owner_waits w ON w.id=h.wait_id
                JOIN assistant_cognitive_cycles c ON c.id=h.predecessor_cycle_id
@@ -1210,12 +1258,46 @@ class LocalCognitiveActionLoop:
                JOIN assistant_autonomy_runs r ON r.id=c.autonomy_run_id
                LEFT JOIN assistant_autonomy_runs successor
                     ON successor.id=h.successor_run_id
+               LEFT JOIN assistant_cognitive_model_successor_origins origin
+                    ON origin.handoff_id=h.id
+               LEFT JOIN assistant_cognitive_turns source
+                    ON source.id=origin.source_turn_id
                WHERE h.public_id=?""",
             (handoff_id,),
         ).fetchone()
         if row is None:
             raise PermissionError("Handoff exacto no encontrado.")
         return row
+
+    @staticmethod
+    def _require_model_origin_integrity_connection(
+        connection: sqlite3.Connection, row: sqlite3.Row
+    ) -> None:
+        origin = connection.execute(
+            """SELECT origin.*, turn.cycle_id AS source_cycle_id,
+                      turn.kind AS source_kind, turn.state AS source_state,
+                      turn.decision AS source_decision, wait.source_turn_id AS wait_source_turn_id,
+                      wait.reason AS origin_wait_reason
+               FROM assistant_cognitive_model_successor_origins origin
+               JOIN assistant_cognitive_turns turn ON turn.id=origin.source_turn_id
+               JOIN assistant_cognitive_owner_waits wait ON wait.id=?
+               WHERE origin.handoff_id=?""",
+            (int(row["wait_id"]), int(row["id"])),
+        ).fetchone()
+        if origin is None:
+            return
+        sha_pattern = re.compile(r"^[0-9a-f]{64}$")
+        if (
+            int(origin["wait_source_turn_id"]) != int(origin["source_turn_id"])
+            or int(origin["source_cycle_id"]) != int(row["predecessor_cycle_id"])
+            or str(origin["source_kind"]) not in {"reason", "evaluate"}
+            or str(origin["source_state"]) != "completed"
+            or str(origin["source_decision"]) != "propose_replan"
+            or str(origin["origin_wait_reason"]) != "replan_requested"
+            or str(origin["candidate_sha256"]) != str(row["candidate_sha256"])
+            or not sha_pattern.fullmatch(str(origin["model_reply_sha256"]))
+        ):
+            raise PermissionError("Provenance de propuesta del modelo inconsistente.")
 
     def _require_first_acceptance_invariants_connection(
         self,
@@ -1729,6 +1811,9 @@ class LocalCognitiveActionLoop:
 
     @staticmethod
     def _public_handoff(row: sqlite3.Row) -> dict[str, Any]:
+        fields = dict(row)
+        model_reply_sha256 = fields.get("model_reply_sha256")
+        model_source_turn_id = fields.get("model_source_turn_public_id")
         return {
             "public_id": str(row["public_id"]),
             "request_key": str(row["request_key"]),
@@ -1745,6 +1830,9 @@ class LocalCognitiveActionLoop:
             "created_at": str(row["created_at"]),
             "resolved_at": row["resolved_at"],
             "resolved_by": row["resolved_by"],
+            "proposal_origin": "model" if model_reply_sha256 is not None else "owner",
+            "source_model_turn_id": model_source_turn_id,
+            "model_reply_sha256": model_reply_sha256,
         }
 
     @staticmethod
@@ -1982,7 +2070,9 @@ class LocalCognitiveActionLoop:
                 cycle, turn, disposition="model_error", target="waiting_owner"
             )
         try:
-            decision = _parse_model_decision(reply.text, expected_step=step.step_id if step else "")
+            parsed = _parse_model_decision(
+                reply.text, expected_step=step.step_id if step else ""
+            )
         except (TypeError, ValueError):
             return self._complete_turn(
                 cycle,
@@ -1997,8 +2087,25 @@ class LocalCognitiveActionLoop:
             "insufficient_evidence": "waiting_owner",
             "propose_replan": "replan_proposed",
             "stop": "stopped",
-        }[decision]
-        return self._complete_turn(cycle, turn, decision=decision, target=target)
+        }[parsed.decision]
+        try:
+            return self._complete_turn(
+                cycle,
+                turn,
+                decision=parsed.decision,
+                target=target,
+                successor_steps=parsed.successor_steps,
+                raw_model_reply=reply.text if parsed.successor_steps is not None else None,
+            )
+        except (TypeError, ValueError, PermissionError, sqlite3.IntegrityError):
+            if parsed.successor_steps is None:
+                raise
+            return self._complete_turn(
+                cycle,
+                turn,
+                disposition="malformed_model_output",
+                target="waiting_owner",
+            )
 
     def _action_advance(
         self,
@@ -2220,14 +2327,227 @@ class LocalCognitiveActionLoop:
             )
         context = _bounded_context(blocks)
         step_id = step.step_id if step is not None else ""
+        constraints = self._model_successor_constraints(cycle)
         prompt = (
             "Devuelve solo JSON estricto sin campos adicionales. "
             "decision debe ser execute_next, request_human, insufficient_evidence, "
             "propose_replan o stop. step_id solo se permite con execute_next y debe "
-            f"ser exactamente {step_id!r}. No propongas comandos ni autoridad. "
+            f"ser exactamente {step_id!r}. propose_replan puede incluir successor con "
+            "1..4 steps restringidos: reuse_process solo con source_step_id; self_modify "
+            "solo con step_id, action y target. No propongas comandos ni autoridad. "
+            f"RESTRICCIONES AUTORITATIVAS HOST={constraints}. "
             f"Fase={kind}. Objetivo={objective}"
         )
         return prompt, context
+
+    def _model_successor_constraints(self, cycle: Any) -> str:
+        run = self.autonomy.get(str(cycle["autonomy_run_public_id"]))
+        if run is None or str(run["actor"]) != str(cycle["actor"]):
+            raise PermissionError("AutonomyRun no disponible para restricciones sucesoras.")
+        grant = run["grant"]
+        capabilities = frozenset(str(value) for value in grant["capabilities"])
+        reusable = [
+            {
+                "source_step_id": str(step["step_id"]),
+                "action": str(step["action"]),
+                "target": str(step["target"]),
+                "timeout_seconds": int(step["command"]["timeout_seconds"]),
+            }
+            for step in run["plan"]["steps"]
+            if step["capability"] == Capability.PROCESS_EXEC.value
+            and step["command"] is not None
+        ]
+        lineage = self.autonomy.lineage_budget_snapshot(
+            str(cycle["autonomy_run_public_id"]), actor=str(cycle["actor"])
+        )
+        payload = {
+            "process_exec_available": Capability.PROCESS_EXEC.value in capabilities,
+            "self_modify_available": Capability.SELF_MODIFY.value in capabilities,
+            "reusable_process_steps": reusable,
+            "predecessor_max_steps": int(grant["max_steps"]),
+            "lineage_generation": int(lineage["generation"]),
+            "lineage_max_successors": int(lineage["max_successors"]),
+            "lineage_process_remaining": {
+                "commands": int(lineage["remaining"]["commands"]),
+                "runtime_seconds": int(lineage["remaining"]["runtime_seconds"]),
+            },
+        }
+        return json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+    def _persist_model_successor_connection(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        cycle: Any,
+        turn: Any,
+        wait: sqlite3.Row,
+        successor_steps: tuple[dict[str, str], ...],
+        raw_model_reply: str,
+        created_at: str,
+    ) -> sqlite3.Row:
+        predecessor = connection.execute(
+            "SELECT * FROM assistant_autonomy_runs WHERE id=? AND actor=?",
+            (int(cycle["autonomy_run_id"]), str(cycle["actor"])),
+        ).fetchone()
+        if predecessor is None:
+            raise PermissionError("Predecesor exacto no encontrado.")
+        predecessor_plan = _plan_from_json(str(predecessor["plan_json"]))
+        predecessor_grant = _grant_from_json(str(predecessor["grant_json"]))
+        by_id = {step.step_id: step for step in predecessor_plan.steps}
+        reused: set[str] = set()
+        constructed: list[RunStep] = []
+        for specification in successor_steps:
+            if specification["type"] == "reuse_process":
+                source_id = specification["source_step_id"]
+                source = by_id.get(source_id)
+                if (
+                    source is None
+                    or source.capability is not Capability.PROCESS_EXEC
+                    or source.command is None
+                ):
+                    raise PermissionError("source_step_id no identifica process.exec congelado.")
+                if source_id in reused:
+                    raise PermissionError("reuse_process no admite source_step_id duplicado.")
+                if Capability.PROCESS_EXEC not in predecessor_grant.capabilities:
+                    raise PermissionError("El predecesor no conserva process.exec.")
+                reused.add(source_id)
+                constructed.append(source)
+                continue
+            if Capability.SELF_MODIFY not in predecessor_grant.capabilities:
+                raise PermissionError("El predecesor no conserva self.modify.")
+            target = _validated_relative_path(specification["target"])
+            step = RunStep(
+                step_id=specification["step_id"],
+                capability=Capability.SELF_MODIFY,
+                action=specification["action"],
+                target=target,
+                requires_human_gate=True,
+                command=None,
+            )
+            if (
+                step.step_id != specification["step_id"]
+                or step.action != specification["action"]
+                or step.target != specification["target"]
+            ):
+                raise ValueError("Metadata self_modify debe venir en forma canónica exacta.")
+            constructed.append(step)
+        if not 1 <= len(constructed) <= min(4, predecessor_grant.max_steps):
+            raise PermissionError("El plan sucesor excede max_steps del predecesor.")
+        plan = RunPlan(objective=str(predecessor["objective"]), steps=tuple(constructed))
+        process_steps = [
+            step for step in plan.steps if step.capability is Capability.PROCESS_EXEC
+        ]
+        runtime_seconds = sum(
+            step.command.timeout_seconds
+            for step in process_steps
+            if step.command is not None
+        )
+        original_duration = int(
+            (predecessor_grant.expires_at - predecessor_grant.issued_at).total_seconds()
+        )
+        grant_spec = {
+            "capabilities": sorted(value.value for value in plan.required_capabilities),
+            "allowed_executables": sorted(
+                {step.command.executable for step in process_steps if step.command is not None}
+            ),
+            "max_steps": len(plan.steps),
+            "max_commands": len(process_steps) if process_steps else 1,
+            "max_retries": 0,
+            "max_runtime_seconds": runtime_seconds if process_steps else 1,
+            "duration_seconds": min(original_duration, 3_600),
+        }
+        fingerprint = self.autonomy._predecessor_state_sha256(
+            connection,
+            str(predecessor["public_id"]),
+            str(cycle["public_id"]),
+            str(wait["public_id"]),
+            actor=str(cycle["actor"]),
+        )
+        candidate = self.autonomy._successor_candidate_connection(
+            connection,
+            run_id=str(predecessor["public_id"]),
+            cycle_id=str(cycle["public_id"]),
+            wait_id=str(wait["public_id"]),
+            actor=str(cycle["actor"]),
+            objective=str(predecessor["objective"]),
+            workspace_root=str(predecessor["workspace_root"]),
+            plan=plan,
+            grant_spec=grant_spec,
+            predecessor_state_sha256=fingerprint,
+        )
+        request_key = f"model-successor:{turn['public_id']}"
+        reply_sha256 = _model_reply_sha256(raw_model_reply)
+        existing = connection.execute(
+            """SELECT h.*, w.public_id AS wait_public_id,
+                      c.public_id AS cycle_public_id, r.public_id AS run_public_id
+               FROM assistant_cognitive_successor_handoffs h
+               JOIN assistant_cognitive_owner_waits w ON w.id=h.wait_id
+               JOIN assistant_cognitive_cycles c ON c.id=h.predecessor_cycle_id
+               JOIN assistant_autonomy_runs r ON r.id=c.autonomy_run_id
+               WHERE h.request_key=?""",
+            (request_key,),
+        ).fetchone()
+        if existing is not None:
+            self.autonomy._verify_successor_candidate_replay(
+                existing,
+                objective=str(predecessor["objective"]),
+                workspace_root=str(predecessor["workspace_root"]),
+                plan=plan,
+                grant_spec=grant_spec,
+            )
+            origin = connection.execute(
+                "SELECT * FROM assistant_cognitive_model_successor_origins WHERE handoff_id=?",
+                (int(existing["id"]),),
+            ).fetchone()
+            if (
+                origin is None
+                or int(origin["source_turn_id"]) != int(turn["id"])
+                or str(origin["candidate_sha256"]) != candidate["candidate_sha256"]
+                or str(origin["model_reply_sha256"]) != reply_sha256
+            ):
+                raise PermissionError("Reutilización conflictiva de propuesta del modelo.")
+            return existing
+        public_id = uuid.uuid4().hex
+        connection.execute(
+            """INSERT INTO assistant_cognitive_successor_handoffs(
+                   public_id, request_key, wait_id, predecessor_cycle_id,
+                   predecessor_state_sha256, objective, workspace_root, plan_json,
+                   grant_spec_json, candidate_sha256, status, successor_run_id,
+                   created_at, resolved_at, resolved_by)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'proposed', NULL, ?, NULL, NULL)""",
+            (
+                public_id,
+                request_key,
+                int(wait["id"]),
+                int(cycle["id"]),
+                fingerprint,
+                str(predecessor["objective"]),
+                candidate["workspace_root"],
+                candidate["plan_json"],
+                candidate["grant_spec_json"],
+                candidate["candidate_sha256"],
+                created_at,
+            ),
+        )
+        handoff = connection.execute(
+            "SELECT * FROM assistant_cognitive_successor_handoffs WHERE public_id=?",
+            (public_id,),
+        ).fetchone()
+        assert handoff is not None
+        connection.execute(
+            """INSERT INTO assistant_cognitive_model_successor_origins(
+                   handoff_id, source_turn_id, candidate_sha256,
+                   model_reply_sha256, created_at)
+               VALUES (?, ?, ?, ?, ?)""",
+            (
+                int(handoff["id"]),
+                int(turn["id"]),
+                candidate["candidate_sha256"],
+                reply_sha256,
+                created_at,
+            ),
+        )
+        return handoff
 
     def _reserve_turn(
         self,
@@ -2346,6 +2666,8 @@ class LocalCognitiveActionLoop:
         gate_id: str | None = None,
         wait_reason: str | None = None,
         wait_source_request_id: str | None = None,
+        successor_steps: tuple[dict[str, str], ...] | None = None,
+        raw_model_reply: str | None = None,
     ) -> CognitiveAdvanceResult:
         now = _now()
         reserved_status = {
@@ -2433,7 +2755,7 @@ class LocalCognitiveActionLoop:
                 wait_source = wait_source_request_id
                 if wait_source is None and str(turn["kind"]) == "evaluate":
                     wait_source = str(turn["source_request_id"])
-                self._create_wait_connection(
+                wait = self._create_wait_connection(
                     connection,
                     cycle_id=int(cycle["id"]),
                     source_turn_id=int(turn["id"]),
@@ -2452,6 +2774,18 @@ class LocalCognitiveActionLoop:
                     source_request_id=wait_source,
                     gate_id=gate_id,
                 )
+                if decision == "propose_replan" and successor_steps is not None:
+                    if raw_model_reply is None:
+                        raise ValueError("Falta el reply exacto para provenance del modelo.")
+                    self._persist_model_successor_connection(
+                        connection,
+                        cycle=cycle,
+                        turn=turn,
+                        wait=wait,
+                        successor_steps=successor_steps,
+                        raw_model_reply=raw_model_reply,
+                        created_at=now,
+                    )
             if final_target == "completed":
                 self._event(
                     connection,
@@ -2611,13 +2945,17 @@ class LocalCognitiveActionLoop:
         )
 
 
-def _parse_model_decision(text: str, *, expected_step: str) -> str:
+def _parse_model_decision(text: str, *, expected_step: str) -> _ModelDecision:
     if not isinstance(text, str) or len(text.encode("utf-8")) > _MAX_REPLY_BYTES:
         raise ValueError("Respuesta de modelo inválida o demasiado grande.")
-    payload = json.loads(text, object_pairs_hook=_unique_json_object)
+    payload = json.loads(
+        text,
+        object_pairs_hook=_unique_json_object,
+        parse_constant=_reject_json_constant,
+    )
     if not isinstance(payload, dict) or not payload:
         raise ValueError("La respuesta debe ser un objeto JSON.")
-    if set(payload) - {"decision", "step_id", "confidence"}:
+    if set(payload) - {"decision", "step_id", "confidence", "successor"}:
         raise ValueError("La respuesta contiene campos no permitidos.")
     decision = payload.get("decision")
     if not isinstance(decision, str) or decision not in _MODEL_DECISIONS:
@@ -2635,7 +2973,42 @@ def _parse_model_decision(text: str, *, expected_step: str) -> str:
             raise ValueError("step_id no coincide con el primer step incompleto.")
     elif supplied_step is not None:
         raise ValueError("step_id solo se admite con execute_next.")
-    return decision
+    successor = payload.get("successor")
+    if "successor" in payload and decision != "propose_replan":
+        raise ValueError("successor solo se admite con propose_replan.")
+    if "successor" not in payload:
+        return _ModelDecision(decision=decision)
+    if not isinstance(successor, dict) or frozenset(successor) != {"steps"}:
+        raise ValueError("successor requiere exactamente steps.")
+    raw_steps = successor["steps"]
+    if not isinstance(raw_steps, list) or not 1 <= len(raw_steps) <= 4:
+        raise ValueError("successor.steps requiere entre uno y cuatro steps.")
+    steps: list[dict[str, str]] = []
+    for raw_step in raw_steps:
+        if not isinstance(raw_step, dict):
+            raise ValueError("Cada successor step debe ser un objeto.")
+        step_type = raw_step.get("type")
+        if step_type == "reuse_process":
+            if frozenset(raw_step) != {"type", "source_step_id"}:
+                raise ValueError("reuse_process requiere solo source_step_id.")
+            source_step_id = _exact_model_text(
+                raw_step["source_step_id"], "source_step_id", 64
+            )
+            steps.append({"type": "reuse_process", "source_step_id": source_step_id})
+        elif step_type == "self_modify":
+            if frozenset(raw_step) != {"type", "step_id", "action", "target"}:
+                raise ValueError("self_modify requiere solo step_id, action y target.")
+            steps.append(
+                {
+                    "type": "self_modify",
+                    "step_id": _exact_model_text(raw_step["step_id"], "step_id", 64),
+                    "action": _exact_model_text(raw_step["action"], "action", 160),
+                    "target": _exact_model_text(raw_step["target"], "target", 2_000),
+                }
+            )
+        else:
+            raise ValueError("Tipo de successor step inválido.")
+    return _ModelDecision(decision=decision, successor_steps=tuple(steps))
 
 
 def _unique_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -2645,6 +3018,29 @@ def _unique_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
             raise ValueError("La respuesta contiene claves JSON duplicadas.")
         result[key] = value
     return result
+
+
+def _reject_json_constant(value: str) -> Any:
+    raise ValueError(f"Constante JSON no finita prohibida: {value}.")
+
+
+def _exact_model_text(value: Any, label: str, maximum: int) -> str:
+    if not isinstance(value, str):
+        raise TypeError(f"{label} debe ser texto.")
+    if not value or value != value.strip() or "\x00" in value:
+        raise ValueError(f"{label} debe venir en forma canónica exacta.")
+    if len(value) > maximum:
+        raise ValueError(f"{label} supera {maximum} caracteres.")
+    return value
+
+
+def _model_reply_sha256(raw_reply: str) -> str:
+    material = (
+        _MODEL_SUCCESSOR_REPLY_HASH_DOMAIN.encode("utf-8")
+        + b"\0"
+        + raw_reply.encode("utf-8")
+    )
+    return hashlib.sha256(material).hexdigest()
 
 
 def _exact_ordinary_gate_approved(run: dict[str, Any], gate_id: str) -> bool:

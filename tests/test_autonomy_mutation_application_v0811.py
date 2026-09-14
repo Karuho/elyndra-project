@@ -312,7 +312,7 @@ def test_schema61_and_no_generic_events_disclose_content(tmp_path: Path) -> None
     with database.connect() as connection:
         assert connection.execute(
             "SELECT value FROM schema_meta WHERE key='schema_version'"
-        ).fetchone()[0] == "62"
+        ).fetchone()[0] == "63"
         payloads = "".join(
             str(row[0])
             for row in connection.execute("SELECT payload_json FROM assistant_autonomy_events")

@@ -27,6 +27,10 @@ def _schema58(tmp_path: Path) -> Database:
             DROP TRIGGER IF EXISTS trg_cognitive_mutation_handoff_no_update;
             DROP TRIGGER IF EXISTS trg_cognitive_mutation_handoff_no_delete;
             DROP TABLE IF EXISTS assistant_cognitive_mutation_handoffs;
+            DROP TRIGGER IF EXISTS trg_cognitive_model_successor_origin_integrity;
+            DROP TRIGGER IF EXISTS trg_cognitive_model_successor_origin_no_update;
+            DROP TRIGGER IF EXISTS trg_cognitive_model_successor_origin_no_delete;
+            DROP TABLE IF EXISTS assistant_cognitive_model_successor_origins;
             DROP TABLE assistant_cognitive_successor_handoffs;
             DROP TABLE assistant_cognitive_owner_waits;
             UPDATE schema_meta SET value='58' WHERE key='schema_version';
@@ -278,7 +282,7 @@ def test_schema59_is_vault_only_preserves_58_and_is_idempotent(tmp_path: Path) -
     with root.connect() as connection:
         assert connection.execute(
             "SELECT value FROM schema_meta WHERE key='schema_version'"
-        ).fetchone()[0] == "62"
+        ).fetchone()[0] == "63"
         assert connection.execute(
             "SELECT 1 FROM sqlite_master WHERE name='assistant_cognitive_owner_waits'"
         ).fetchone() is None
@@ -325,7 +329,7 @@ def test_schema59_is_vault_only_preserves_58_and_is_idempotent(tmp_path: Path) -
     with database.connect() as connection:
         assert connection.execute(
             "SELECT value FROM schema_meta WHERE key='schema_version'"
-        ).fetchone()[0] == "62"
+        ).fetchone()[0] == "63"
         assert connection.execute(
             "SELECT COUNT(*) FROM assistant_autonomy_runs"
         ).fetchone()[0] == 1

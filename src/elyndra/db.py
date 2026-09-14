@@ -2385,8 +2385,9 @@ class Database:
                 self._migrate_cognitive_handoff_phase8b1(connection)
                 self._migrate_cognitive_mutation_handoff_phase9a6(connection)
                 self._migrate_autonomy_lineage_phase9b2(connection)
+                self._migrate_cognitive_model_successor_phase9b3(connection)
             connection.execute(
-                "INSERT OR REPLACE INTO schema_meta(key, value) VALUES('schema_version', '62')"
+                "INSERT OR REPLACE INTO schema_meta(key, value) VALUES('schema_version', '63')"
             )
         with suppress(PermissionError):
             self.path.chmod(0o600)
@@ -4702,6 +4703,66 @@ class Database:
         violations = connection.execute("PRAGMA foreign_key_check").fetchall()
         if violations:
             raise RuntimeError("Schema 62 dejó referencias foráneas inválidas.")
+
+    @staticmethod
+    def _migrate_cognitive_model_successor_phase9b3(
+        connection: sqlite3.Connection,
+    ) -> None:
+        """Install immutable provenance for model-authored successor candidates."""
+
+        connection.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS assistant_cognitive_model_successor_origins (
+                id INTEGER PRIMARY KEY,
+                handoff_id INTEGER NOT NULL UNIQUE,
+                source_turn_id INTEGER NOT NULL UNIQUE,
+                candidate_sha256 TEXT NOT NULL CHECK(
+                    length(candidate_sha256)=64
+                    AND candidate_sha256 NOT GLOB '*[^0-9a-f]*'),
+                model_reply_sha256 TEXT NOT NULL CHECK(
+                    length(model_reply_sha256)=64
+                    AND model_reply_sha256 NOT GLOB '*[^0-9a-f]*'),
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(handoff_id)
+                    REFERENCES assistant_cognitive_successor_handoffs(id)
+                    ON DELETE RESTRICT,
+                FOREIGN KEY(source_turn_id)
+                    REFERENCES assistant_cognitive_turns(id)
+                    ON DELETE RESTRICT
+            );
+
+            CREATE TRIGGER IF NOT EXISTS trg_cognitive_model_successor_origin_integrity
+            BEFORE INSERT ON assistant_cognitive_model_successor_origins
+            WHEN NOT EXISTS (
+                SELECT 1
+                FROM assistant_cognitive_successor_handoffs handoff
+                JOIN assistant_cognitive_owner_waits wait ON wait.id=handoff.wait_id
+                JOIN assistant_cognitive_turns turn ON turn.id=NEW.source_turn_id
+                WHERE handoff.id=NEW.handoff_id
+                  AND handoff.status='proposed'
+                  AND handoff.candidate_sha256=NEW.candidate_sha256
+                  AND wait.state='pending'
+                  AND wait.reason='replan_requested'
+                  AND wait.source_turn_id=NEW.source_turn_id
+                  AND turn.cycle_id=handoff.predecessor_cycle_id
+                  AND turn.kind IN ('reason','evaluate')
+                  AND turn.state='completed'
+                  AND turn.decision='propose_replan'
+            )
+            BEGIN SELECT RAISE(ABORT, 'cognitive_model_successor_origin_invalid'); END;
+
+            CREATE TRIGGER IF NOT EXISTS trg_cognitive_model_successor_origin_no_update
+            BEFORE UPDATE ON assistant_cognitive_model_successor_origins
+            BEGIN SELECT RAISE(ABORT, 'cognitive_model_successor_origin_immutable'); END;
+
+            CREATE TRIGGER IF NOT EXISTS trg_cognitive_model_successor_origin_no_delete
+            BEFORE DELETE ON assistant_cognitive_model_successor_origins
+            BEGIN SELECT RAISE(ABORT, 'cognitive_model_successor_origin_immutable'); END;
+            """
+        )
+        violations = connection.execute("PRAGMA foreign_key_check").fetchall()
+        if violations:
+            raise RuntimeError("Schema 63 dejó referencias foráneas inválidas.")
 
     @staticmethod
     def _backfill_autonomy_lineages_phase9b2(connection: sqlite3.Connection) -> None:

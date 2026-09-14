@@ -198,7 +198,7 @@ def test_schema61_cognitive_mutation_extension_is_idempotent_and_vault_only(
     with database.connect() as connection:
         assert connection.execute(
             "SELECT value FROM schema_meta WHERE key='schema_version'"
-        ).fetchone()[0] == "62"
+        ).fetchone()[0] == "63"
         turn_sql = connection.execute(
             "SELECT sql FROM sqlite_master WHERE name='assistant_cognitive_turns'"
         ).fetchone()[0]
@@ -222,7 +222,7 @@ def test_schema61_cognitive_mutation_extension_is_idempotent_and_vault_only(
     with root.connect() as connection:
         assert connection.execute(
             "SELECT value FROM schema_meta WHERE key='schema_version'"
-        ).fetchone()[0] == "62"
+        ).fetchone()[0] == "63"
         assert connection.execute(
             "SELECT 1 FROM sqlite_master "
             "WHERE name='assistant_cognitive_mutation_handoffs'"
