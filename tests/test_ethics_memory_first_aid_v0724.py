@@ -197,7 +197,7 @@ def test_schema_32_contains_memory_tier_tables(
             ).fetchall()
         }
 
-    assert version == "61"
+    assert version == "62"
     assert {
         "memory_cold_index",
         "memory_recall_events",

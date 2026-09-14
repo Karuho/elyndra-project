@@ -824,6 +824,7 @@ class AutonomyRepository:
 
     def create(self, run: AutonomyRun) -> dict[str, Any]:
         with self.database.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
             self._insert_run_connection(connection, run)
 
         item = self.get(run.run_id)
@@ -832,7 +833,11 @@ class AutonomyRepository:
         return item
 
     def _insert_run_connection(
-        self, connection: sqlite3.Connection, run: AutonomyRun
+        self,
+        connection: sqlite3.Connection,
+        run: AutonomyRun,
+        *,
+        create_lineage: bool = True,
     ) -> sqlite3.Row:
         """Insert one frozen planned run using the caller-owned transaction."""
         if run.status is not AutonomyRunStatus.PLANNED:
@@ -895,7 +900,134 @@ class AutonomyRepository:
             payload={},
             created_at=created_at,
         )
+        if create_lineage:
+            self._insert_root_lineage_connection(
+                connection, row=row, grant=run.grant, created_at=created_at
+            )
         return row
+
+    @staticmethod
+    def _insert_root_lineage_connection(
+        connection: sqlite3.Connection,
+        *,
+        row: sqlite3.Row,
+        grant: CapabilityGrant,
+        created_at: str,
+    ) -> None:
+        connection.execute(
+            """INSERT INTO assistant_autonomy_lineages(
+                   public_id, root_run_id, actor, objective, workspace_root,
+                   max_successors, max_commands_total, max_retries_total,
+                   max_runtime_seconds_total, created_at)
+               VALUES (?, ?, ?, ?, ?, 3, ?, ?, ?, ?)""",
+            (
+                uuid.uuid4().hex,
+                int(row["id"]),
+                str(row["actor"]),
+                str(row["objective"]),
+                str(row["workspace_root"]),
+                grant.max_commands,
+                grant.max_retries,
+                grant.max_runtime_seconds,
+                created_at,
+            ),
+        )
+        lineage_id = int(connection.execute("SELECT last_insert_rowid()").fetchone()[0])
+        connection.execute(
+            """INSERT INTO assistant_autonomy_lineage_runs(
+                   lineage_id, run_id, predecessor_run_id, source_handoff_id,
+                   generation, commands_reserved_before, retries_reserved_before,
+                   runtime_seconds_reserved_before, joined_at)
+               VALUES (?, ?, NULL, NULL, 0, 0, 0, 0, ?)""",
+            (lineage_id, int(row["id"]), created_at),
+        )
+
+    def lineage_budget_snapshot(self, run_id: str, *, actor: str) -> dict[str, Any]:
+        """Return authoritative lineage ceilings and reservation-derived usage."""
+
+        with self.database.connect() as connection:
+            row = self._owned_run(connection, run_id, actor=actor)
+            return self._lineage_budget_snapshot_connection(
+                connection, run_db_id=int(row["id"])
+            )
+
+    @staticmethod
+    def _lineage_budget_snapshot_connection(
+        connection: sqlite3.Connection, *, run_db_id: int
+    ) -> dict[str, Any]:
+        lineage = connection.execute(
+            """SELECT lineage.*, membership.generation,
+                      membership.id AS membership_id
+               FROM assistant_autonomy_lineage_runs membership
+               JOIN assistant_autonomy_lineages lineage
+                 ON lineage.id=membership.lineage_id
+               WHERE membership.run_id=?""",
+            (run_db_id,),
+        ).fetchone()
+        if lineage is None:
+            raise PermissionError("AutonomyRun sin lineage durable exacto.")
+        usage = connection.execute(
+            """SELECT COUNT(*) AS commands_reserved,
+                      COALESCE(SUM(reservation.is_retry), 0) AS retries_reserved,
+                      COALESCE(SUM(reservation.runtime_seconds), 0) AS runtime_reserved
+               FROM assistant_autonomy_execution_reservations reservation
+               JOIN assistant_autonomy_lineage_runs membership
+                 ON membership.run_id=reservation.run_id
+               WHERE membership.lineage_id=?""",
+            (int(lineage["id"]),),
+        ).fetchone()
+        limits = {
+            "commands": int(lineage["max_commands_total"]),
+            "retries": int(lineage["max_retries_total"]),
+            "runtime_seconds": int(lineage["max_runtime_seconds_total"]),
+        }
+        reserved = {
+            "commands": int(usage["commands_reserved"]),
+            "retries": int(usage["retries_reserved"]),
+            "runtime_seconds": int(usage["runtime_reserved"]),
+        }
+        return {
+            "lineage_id": str(lineage["public_id"]),
+            "lineage_db_id": int(lineage["id"]),
+            "membership_id": int(lineage["membership_id"]),
+            "root_run_db_id": int(lineage["root_run_id"]),
+            "generation": int(lineage["generation"]),
+            "max_successors": int(lineage["max_successors"]),
+            "limits": limits,
+            "reserved": reserved,
+            "remaining": {
+                name: max(0, limits[name] - reserved[name]) for name in limits
+            },
+        }
+
+    @staticmethod
+    def _require_successor_lineage_capacity(
+        snapshot: dict[str, Any], grant_spec: dict[str, Any]
+    ) -> None:
+        if snapshot["generation"] >= snapshot["max_successors"]:
+            raise PermissionError("El lineage agotó max_successors.")
+        if Capability.PROCESS_EXEC.value not in grant_spec["capabilities"]:
+            return
+        remaining = snapshot["remaining"]
+        requested = {
+            "commands": int(grant_spec["max_commands"]),
+            "retries": int(grant_spec["max_retries"]),
+            "runtime_seconds": int(grant_spec["max_runtime_seconds"]),
+        }
+        if any(requested[name] > remaining[name] for name in requested):
+            raise PermissionError("El grant sucesor excede el presupuesto lineage restante.")
+
+    @staticmethod
+    def _require_lineage_reservation_capacity(
+        snapshot: dict[str, Any], *, runtime_seconds: int, retry: bool
+    ) -> None:
+        remaining = snapshot["remaining"]
+        if (
+            remaining["commands"] < 1
+            or remaining["retries"] < int(retry)
+            or remaining["runtime_seconds"] < runtime_seconds
+        ):
+            raise PermissionError("La reserva excede el presupuesto lineage restante.")
 
     def get(self, run_id: str) -> dict[str, Any] | None:
         clean_id = _required(run_id, "run_id", 128)
@@ -2066,6 +2198,10 @@ class AutonomyRepository:
             workspace=candidate_workspace,
             grant_spec=canonical_grant,
         )
+        lineage_budget = self._lineage_budget_snapshot_connection(
+            connection, run_db_id=int(lineage["id"])
+        )
+        self._require_successor_lineage_capacity(lineage_budget, canonical_grant)
         plan_data = _plan_data(plan)
         plan_json = _json_dump(plan_data, maximum=262_144)
         grant_json = _json_dump(canonical_grant, maximum=65_536)
@@ -2179,6 +2315,10 @@ class AutonomyRepository:
         _validate_successor_plan(
             plan, workspace=candidate_workspace, grant_spec=canonical_grant
         )
+        lineage_budget = self._lineage_budget_snapshot_connection(
+            connection, run_db_id=int(predecessor["id"])
+        )
+        self._require_successor_lineage_capacity(lineage_budget, canonical_grant)
         issued_at = _utcnow()
         if predecessor_grant.is_expired(at=issued_at):
             raise PermissionError("El grant predecesor expiró antes de la aceptación.")
@@ -2269,7 +2409,138 @@ class AutonomyRepository:
             raise PermissionError("Autoridad durable del sucesor no coincide.")
         if _plan_data(_plan_from_json(str(successor["plan_json"]))) != stored_plan:
             raise PermissionError("Plan durable del sucesor no coincide.")
+        self._require_accepted_successor_lineage_integrity_connection(
+            connection,
+            row=row,
+            predecessor=predecessor,
+            successor=successor,
+            grant=grant,
+        )
         return successor
+
+    def _successor_lineage_snapshot_connection(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        predecessor_run_db_id: int,
+        grant: CapabilityGrant,
+    ) -> dict[str, Any]:
+        snapshot = self._lineage_budget_snapshot_connection(
+            connection, run_db_id=predecessor_run_db_id
+        )
+        self._require_successor_lineage_capacity(
+            snapshot,
+            {
+                "capabilities": sorted(item.value for item in grant.capabilities),
+                "max_commands": grant.max_commands,
+                "max_retries": grant.max_retries,
+                "max_runtime_seconds": grant.max_runtime_seconds,
+            },
+        )
+        return snapshot
+
+    @staticmethod
+    def _insert_successor_lineage_membership_connection(
+        connection: sqlite3.Connection,
+        *,
+        predecessor_run_db_id: int,
+        successor_run_db_id: int,
+        source_handoff_db_id: int,
+        snapshot: dict[str, Any],
+        joined_at: str,
+    ) -> None:
+        if snapshot["generation"] >= snapshot["max_successors"]:
+            raise PermissionError("El lineage agotó max_successors.")
+        connection.execute(
+            """INSERT INTO assistant_autonomy_lineage_runs(
+                   lineage_id, run_id, predecessor_run_id, source_handoff_id,
+                   generation, commands_reserved_before, retries_reserved_before,
+                   runtime_seconds_reserved_before, joined_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                snapshot["lineage_db_id"],
+                successor_run_db_id,
+                predecessor_run_db_id,
+                source_handoff_db_id,
+                snapshot["generation"] + 1,
+                snapshot["reserved"]["commands"],
+                snapshot["reserved"]["retries"],
+                snapshot["reserved"]["runtime_seconds"],
+                joined_at,
+            ),
+        )
+
+    def _require_accepted_successor_lineage_integrity_connection(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        row: sqlite3.Row,
+        predecessor: sqlite3.Row,
+        successor: sqlite3.Row,
+        grant: CapabilityGrant,
+    ) -> None:
+        membership = connection.execute(
+            """SELECT member.*, lineage.max_commands_total,
+                      lineage.max_retries_total, lineage.max_runtime_seconds_total,
+                      predecessor.generation AS predecessor_generation,
+                      predecessor.lineage_id AS predecessor_lineage_id
+               FROM assistant_autonomy_lineage_runs member
+               JOIN assistant_autonomy_lineages lineage
+                 ON lineage.id=member.lineage_id
+               JOIN assistant_autonomy_lineage_runs predecessor
+                 ON predecessor.run_id=member.predecessor_run_id
+               WHERE member.run_id=?""",
+            (int(successor["id"]),),
+        ).fetchone()
+        if membership is None or (
+            membership["predecessor_run_id"] is None
+            or membership["source_handoff_id"] is None
+            or int(membership["predecessor_run_id"]) != int(predecessor["id"])
+            or int(membership["source_handoff_id"]) != int(row["id"])
+            or int(membership["lineage_id"])
+            != int(membership["predecessor_lineage_id"])
+            or int(membership["generation"])
+            != int(membership["predecessor_generation"]) + 1
+        ):
+            raise PermissionError("Membership lineage del sucesor no coincide.")
+        historical = connection.execute(
+            """SELECT COUNT(*) AS commands_reserved,
+                      COALESCE(SUM(reservation.is_retry), 0) AS retries_reserved,
+                      COALESCE(SUM(reservation.runtime_seconds), 0) AS runtime_reserved
+               FROM assistant_autonomy_execution_reservations reservation
+               JOIN assistant_autonomy_lineage_runs prior
+                 ON prior.run_id=reservation.run_id
+               WHERE prior.lineage_id=? AND prior.generation<?""",
+            (int(membership["lineage_id"]), int(membership["generation"])),
+        ).fetchone()
+        snapshot = {
+            "commands": int(membership["commands_reserved_before"]),
+            "retries": int(membership["retries_reserved_before"]),
+            "runtime_seconds": int(membership["runtime_seconds_reserved_before"]),
+        }
+        observed = {
+            "commands": int(historical["commands_reserved"]),
+            "retries": int(historical["retries_reserved"]),
+            "runtime_seconds": int(historical["runtime_reserved"]),
+        }
+        if snapshot != observed:
+            raise PermissionError("Snapshot histórico lineage del sucesor no coincide.")
+        if Capability.PROCESS_EXEC in grant.capabilities:
+            ceilings = {
+                "commands": int(membership["max_commands_total"]),
+                "retries": int(membership["max_retries_total"]),
+                "runtime_seconds": int(membership["max_runtime_seconds_total"]),
+            }
+            authority = {
+                "commands": grant.max_commands,
+                "retries": grant.max_retries,
+                "runtime_seconds": grant.max_runtime_seconds,
+            }
+            if any(
+                authority[name] > ceilings[name] - snapshot[name]
+                for name in authority
+            ):
+                raise PermissionError("Grant sucesor excedía el presupuesto lineage histórico.")
 
     @staticmethod
     def _fingerprint_collection(
@@ -2417,6 +2688,12 @@ class AutonomyRepository:
                 retries_reserved=state.retries_reserved,
                 runtime_seconds_reserved=state.runtime_seconds_reserved,
             ).reserve(runtime_seconds=runtime_seconds, retry=True)
+            lineage_budget = self._lineage_budget_snapshot_connection(
+                connection, run_db_id=int(row["id"])
+            )
+            self._require_lineage_reservation_capacity(
+                lineage_budget, runtime_seconds=runtime_seconds, retry=True
+            )
 
             if connection.execute(
                 "SELECT 1 FROM assistant_autonomy_retry_reviews "
@@ -2884,6 +3161,15 @@ class AutonomyRepository:
                 ),
             )
             preflight_budget.reserve(
+                runtime_seconds=runtime_seconds,
+                retry=retry,
+            )
+
+            lineage_budget = self._lineage_budget_snapshot_connection(
+                connection, run_db_id=int(row["id"])
+            )
+            self._require_lineage_reservation_capacity(
+                lineage_budget,
                 runtime_seconds=runtime_seconds,
                 retry=retry,
             )

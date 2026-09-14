@@ -14,6 +14,14 @@ def _schema58(tmp_path: Path) -> Database:
     with database.connect() as connection:
         connection.executescript(
             """
+            DROP TRIGGER IF EXISTS trg_autonomy_lineages_no_update;
+            DROP TRIGGER IF EXISTS trg_autonomy_lineages_no_delete;
+            DROP TRIGGER IF EXISTS trg_autonomy_lineage_runs_integrity;
+            DROP TRIGGER IF EXISTS trg_autonomy_lineage_runs_no_update;
+            DROP TRIGGER IF EXISTS trg_autonomy_lineage_runs_no_delete;
+            DROP TRIGGER IF EXISTS trg_autonomy_reservation_lineage_budget;
+            DROP TABLE assistant_autonomy_lineage_runs;
+            DROP TABLE assistant_autonomy_lineages;
             DROP TRIGGER IF EXISTS trg_cognitive_mutation_evaluate_source;
             DROP TRIGGER IF EXISTS trg_cognitive_mutation_handoff_integrity;
             DROP TRIGGER IF EXISTS trg_cognitive_mutation_handoff_no_update;
@@ -57,12 +65,39 @@ def _run(connection: sqlite3.Connection, label: str) -> int:
         INSERT INTO assistant_autonomy_runs(
             public_id, actor, workspace_root, objective, status, grant_json,
             plan_json, created_at, updated_at, started_at, finished_at
-        ) VALUES (?, 'owner', '/workspace', 'goal', 'running', '{}', '{}',
+        ) VALUES (?, 'owner', '/workspace', 'goal', 'running',
+                  '{"max_commands":2,"max_retries":0,"max_runtime_seconds":2}', '{}',
                   'created', 'updated', 'started', NULL)
         """,
         (f"run-{label}",),
     )
-    return int(connection.execute("SELECT last_insert_rowid()").fetchone()[0])
+    run_id = int(connection.execute("SELECT last_insert_rowid()").fetchone()[0])
+    has_lineage_tables = connection.execute(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' "
+        "AND name IN ('assistant_autonomy_lineages', "
+        "'assistant_autonomy_lineage_runs')"
+    ).fetchone()[0]
+    if has_lineage_tables == 2:
+        connection.execute(
+            """INSERT INTO assistant_autonomy_lineages(
+                   public_id, root_run_id, actor, objective, workspace_root,
+                   max_successors, max_commands_total, max_retries_total,
+                   max_runtime_seconds_total, created_at)
+               VALUES (?, ?, 'owner', 'goal', '/workspace', 3, 2, 0, 2, 'created')""",
+            (f"lineage-{label}", run_id),
+        )
+        lineage_id = int(
+            connection.execute("SELECT last_insert_rowid()").fetchone()[0]
+        )
+        connection.execute(
+            """INSERT INTO assistant_autonomy_lineage_runs(
+                   lineage_id, run_id, predecessor_run_id, source_handoff_id,
+                   generation, commands_reserved_before, retries_reserved_before,
+                   runtime_seconds_reserved_before, joined_at)
+               VALUES (?, ?, NULL, NULL, 0, 0, 0, 0, 'created')""",
+            (lineage_id, run_id),
+        )
+    return run_id
 
 
 def _cycle(
@@ -243,7 +278,7 @@ def test_schema59_is_vault_only_preserves_58_and_is_idempotent(tmp_path: Path) -
     with root.connect() as connection:
         assert connection.execute(
             "SELECT value FROM schema_meta WHERE key='schema_version'"
-        ).fetchone()[0] == "61"
+        ).fetchone()[0] == "62"
         assert connection.execute(
             "SELECT 1 FROM sqlite_master WHERE name='assistant_cognitive_owner_waits'"
         ).fetchone() is None
@@ -290,7 +325,7 @@ def test_schema59_is_vault_only_preserves_58_and_is_idempotent(tmp_path: Path) -
     with database.connect() as connection:
         assert connection.execute(
             "SELECT value FROM schema_meta WHERE key='schema_version'"
-        ).fetchone()[0] == "61"
+        ).fetchone()[0] == "62"
         assert connection.execute(
             "SELECT COUNT(*) FROM assistant_autonomy_runs"
         ).fetchone()[0] == 1

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import secrets
 import sqlite3
 from contextlib import suppress
@@ -2383,8 +2384,9 @@ class Database:
                 self._migrate_cognitive_loop_phase8a(connection)
                 self._migrate_cognitive_handoff_phase8b1(connection)
                 self._migrate_cognitive_mutation_handoff_phase9a6(connection)
+                self._migrate_autonomy_lineage_phase9b2(connection)
             connection.execute(
-                "INSERT OR REPLACE INTO schema_meta(key, value) VALUES('schema_version', '61')"
+                "INSERT OR REPLACE INTO schema_meta(key, value) VALUES('schema_version', '62')"
             )
         with suppress(PermissionError):
             self.path.chmod(0o600)
@@ -4504,6 +4506,360 @@ class Database:
             BEGIN SELECT RAISE(ABORT, 'cognitive_mutation_handoff_immutable'); END;
             """
         )
+
+    @staticmethod
+    def _migrate_autonomy_lineage_phase9b2(connection: sqlite3.Connection) -> None:
+        """Install immutable lineage-wide execution ceilings and memberships."""
+
+        connection.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS assistant_autonomy_lineages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                public_id TEXT NOT NULL UNIQUE
+                    CHECK(length(public_id) BETWEEN 1 AND 128),
+                root_run_id INTEGER NOT NULL UNIQUE,
+                actor TEXT NOT NULL CHECK(length(actor) BETWEEN 1 AND 200),
+                objective TEXT NOT NULL CHECK(length(objective) BETWEEN 1 AND 4000),
+                workspace_root TEXT NOT NULL
+                    CHECK(length(workspace_root) BETWEEN 1 AND 4096),
+                max_successors INTEGER NOT NULL CHECK(max_successors >= 0),
+                max_commands_total INTEGER NOT NULL CHECK(max_commands_total >= 0),
+                max_retries_total INTEGER NOT NULL CHECK(max_retries_total >= 0),
+                max_runtime_seconds_total INTEGER NOT NULL
+                    CHECK(max_runtime_seconds_total >= 0),
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(root_run_id) REFERENCES assistant_autonomy_runs(id)
+                    ON DELETE RESTRICT
+            );
+
+            CREATE TABLE IF NOT EXISTS assistant_autonomy_lineage_runs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                lineage_id INTEGER NOT NULL,
+                run_id INTEGER NOT NULL UNIQUE,
+                predecessor_run_id INTEGER UNIQUE,
+                source_handoff_id INTEGER UNIQUE,
+                generation INTEGER NOT NULL CHECK(generation >= 0),
+                commands_reserved_before INTEGER NOT NULL
+                    CHECK(commands_reserved_before >= 0),
+                retries_reserved_before INTEGER NOT NULL
+                    CHECK(retries_reserved_before >= 0),
+                runtime_seconds_reserved_before INTEGER NOT NULL
+                    CHECK(runtime_seconds_reserved_before >= 0),
+                joined_at TEXT NOT NULL,
+                FOREIGN KEY(lineage_id) REFERENCES assistant_autonomy_lineages(id)
+                    ON DELETE RESTRICT,
+                FOREIGN KEY(run_id) REFERENCES assistant_autonomy_runs(id)
+                    ON DELETE RESTRICT,
+                FOREIGN KEY(predecessor_run_id) REFERENCES assistant_autonomy_runs(id)
+                    ON DELETE RESTRICT,
+                FOREIGN KEY(source_handoff_id)
+                    REFERENCES assistant_cognitive_successor_handoffs(id)
+                    ON DELETE RESTRICT,
+                UNIQUE(lineage_id, generation),
+                CHECK((generation=0 AND predecessor_run_id IS NULL
+                       AND source_handoff_id IS NULL
+                       AND commands_reserved_before=0
+                       AND retries_reserved_before=0
+                       AND runtime_seconds_reserved_before=0)
+                   OR (generation>0 AND predecessor_run_id IS NOT NULL
+                       AND source_handoff_id IS NOT NULL))
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_autonomy_lineage_runs_lineage
+            ON assistant_autonomy_lineage_runs(lineage_id, generation);
+            """
+        )
+
+        run_count = int(
+            connection.execute("SELECT COUNT(*) FROM assistant_autonomy_runs").fetchone()[0]
+        )
+        membership_count = int(
+            connection.execute(
+                "SELECT COUNT(*) FROM assistant_autonomy_lineage_runs"
+            ).fetchone()[0]
+        )
+        if membership_count == 0 and run_count:
+            Database._backfill_autonomy_lineages_phase9b2(connection)
+        elif membership_count != run_count:
+            raise RuntimeError("Backfill lineage parcial o ambiguo.")
+
+        Database._validate_autonomy_lineages_phase9b2(connection)
+        connection.executescript(
+            """
+            CREATE TRIGGER IF NOT EXISTS trg_autonomy_lineages_no_update
+            BEFORE UPDATE ON assistant_autonomy_lineages
+            BEGIN SELECT RAISE(ABORT, 'autonomy_lineage_immutable'); END;
+
+            CREATE TRIGGER IF NOT EXISTS trg_autonomy_lineages_no_delete
+            BEFORE DELETE ON assistant_autonomy_lineages
+            BEGIN SELECT RAISE(ABORT, 'autonomy_lineage_immutable'); END;
+
+            CREATE TRIGGER IF NOT EXISTS trg_autonomy_lineage_runs_integrity
+            BEFORE INSERT ON assistant_autonomy_lineage_runs
+            WHEN NOT EXISTS (
+                SELECT 1
+                FROM assistant_autonomy_lineages lineage
+                JOIN assistant_autonomy_runs run ON run.id=NEW.run_id
+                WHERE lineage.id=NEW.lineage_id
+                  AND run.actor=lineage.actor
+                  AND run.objective=lineage.objective
+                  AND run.workspace_root=lineage.workspace_root
+                  AND (
+                    (NEW.generation=0 AND lineage.root_run_id=NEW.run_id
+                     AND NEW.predecessor_run_id IS NULL
+                     AND NEW.source_handoff_id IS NULL
+                     AND NEW.commands_reserved_before=0
+                     AND NEW.retries_reserved_before=0
+                     AND NEW.runtime_seconds_reserved_before=0)
+                    OR
+                    (NEW.generation>0
+                     AND NEW.predecessor_run_id IS NOT NULL
+                     AND NEW.source_handoff_id IS NOT NULL
+                     AND NEW.generation<=lineage.max_successors
+                     AND EXISTS (
+                        SELECT 1
+                        FROM assistant_autonomy_lineage_runs predecessor
+                        JOIN assistant_cognitive_successor_handoffs handoff
+                          ON handoff.id=NEW.source_handoff_id
+                        JOIN assistant_cognitive_cycles cycle
+                          ON cycle.id=handoff.predecessor_cycle_id
+                        WHERE predecessor.lineage_id=NEW.lineage_id
+                          AND predecessor.run_id=NEW.predecessor_run_id
+                          AND predecessor.generation=NEW.generation-1
+                          AND handoff.status='accepted'
+                          AND handoff.successor_run_id=NEW.run_id
+                          AND cycle.autonomy_run_id=NEW.predecessor_run_id
+                     )
+                     AND NEW.commands_reserved_before=(
+                        SELECT COUNT(*)
+                        FROM assistant_autonomy_execution_reservations reservation
+                        JOIN assistant_autonomy_lineage_runs prior
+                          ON prior.run_id=reservation.run_id
+                        WHERE prior.lineage_id=NEW.lineage_id
+                          AND prior.generation<NEW.generation)
+                     AND NEW.retries_reserved_before=COALESCE((
+                        SELECT SUM(reservation.is_retry)
+                        FROM assistant_autonomy_execution_reservations reservation
+                        JOIN assistant_autonomy_lineage_runs prior
+                          ON prior.run_id=reservation.run_id
+                        WHERE prior.lineage_id=NEW.lineage_id
+                          AND prior.generation<NEW.generation), 0)
+                     AND NEW.runtime_seconds_reserved_before=COALESCE((
+                        SELECT SUM(reservation.runtime_seconds)
+                        FROM assistant_autonomy_execution_reservations reservation
+                        JOIN assistant_autonomy_lineage_runs prior
+                          ON prior.run_id=reservation.run_id
+                        WHERE prior.lineage_id=NEW.lineage_id
+                          AND prior.generation<NEW.generation), 0))
+                  )
+            )
+            BEGIN SELECT RAISE(ABORT, 'autonomy_lineage_membership_invalid'); END;
+
+            CREATE TRIGGER IF NOT EXISTS trg_autonomy_lineage_runs_no_update
+            BEFORE UPDATE ON assistant_autonomy_lineage_runs
+            BEGIN SELECT RAISE(ABORT, 'autonomy_lineage_membership_immutable'); END;
+
+            CREATE TRIGGER IF NOT EXISTS trg_autonomy_lineage_runs_no_delete
+            BEFORE DELETE ON assistant_autonomy_lineage_runs
+            BEGIN SELECT RAISE(ABORT, 'autonomy_lineage_membership_immutable'); END;
+
+            CREATE TRIGGER IF NOT EXISTS trg_autonomy_reservation_lineage_budget
+            BEFORE INSERT ON assistant_autonomy_execution_reservations
+            WHEN NOT EXISTS (
+                SELECT 1 FROM assistant_autonomy_lineage_runs membership
+                WHERE membership.run_id=NEW.run_id
+            ) OR EXISTS (
+                SELECT 1
+                FROM assistant_autonomy_lineage_runs membership
+                JOIN assistant_autonomy_lineages lineage
+                  ON lineage.id=membership.lineage_id
+                WHERE membership.run_id=NEW.run_id AND (
+                    (SELECT COUNT(*)
+                     FROM assistant_autonomy_execution_reservations reservation
+                     JOIN assistant_autonomy_lineage_runs member
+                       ON member.run_id=reservation.run_id
+                     WHERE member.lineage_id=lineage.id) + 1
+                        > lineage.max_commands_total
+                    OR
+                    COALESCE((SELECT SUM(reservation.is_retry)
+                     FROM assistant_autonomy_execution_reservations reservation
+                     JOIN assistant_autonomy_lineage_runs member
+                       ON member.run_id=reservation.run_id
+                     WHERE member.lineage_id=lineage.id), 0) + NEW.is_retry
+                        > lineage.max_retries_total
+                    OR
+                    COALESCE((SELECT SUM(reservation.runtime_seconds)
+                     FROM assistant_autonomy_execution_reservations reservation
+                     JOIN assistant_autonomy_lineage_runs member
+                       ON member.run_id=reservation.run_id
+                     WHERE member.lineage_id=lineage.id), 0) + NEW.runtime_seconds
+                        > lineage.max_runtime_seconds_total
+                )
+            )
+            BEGIN SELECT RAISE(ABORT, 'autonomy_lineage_budget_exceeded'); END;
+            """
+        )
+        violations = connection.execute("PRAGMA foreign_key_check").fetchall()
+        if violations:
+            raise RuntimeError("Schema 62 dejó referencias foráneas inválidas.")
+
+    @staticmethod
+    def _backfill_autonomy_lineages_phase9b2(connection: sqlite3.Connection) -> None:
+        runs = {
+            int(row["id"]): row
+            for row in connection.execute(
+                "SELECT * FROM assistant_autonomy_runs ORDER BY id"
+            ).fetchall()
+        }
+        edges = connection.execute(
+            """SELECT handoff.id AS handoff_id,
+                      cycle.autonomy_run_id AS predecessor_run_id,
+                      handoff.successor_run_id
+               FROM assistant_cognitive_successor_handoffs handoff
+               JOIN assistant_cognitive_cycles cycle
+                 ON cycle.id=handoff.predecessor_cycle_id
+               WHERE handoff.status='accepted'
+               ORDER BY handoff.id"""
+        ).fetchall()
+        by_predecessor: dict[int, tuple[int, int]] = {}
+        by_successor: dict[int, tuple[int, int]] = {}
+        for edge in edges:
+            predecessor_id = int(edge["predecessor_run_id"])
+            successor_raw = edge["successor_run_id"]
+            if successor_raw is None:
+                raise RuntimeError("Handoff accepted sin sucesor durante backfill lineage.")
+            successor_id = int(successor_raw)
+            if (
+                predecessor_id not in runs
+                or successor_id not in runs
+                or predecessor_id == successor_id
+                or predecessor_id in by_predecessor
+                or successor_id in by_successor
+            ):
+                raise RuntimeError("Grafo histórico successor ambiguo.")
+            link = (successor_id, int(edge["handoff_id"]))
+            by_predecessor[predecessor_id] = link
+            by_successor[successor_id] = (predecessor_id, int(edge["handoff_id"]))
+
+        visited: set[int] = set()
+        roots = [run_id for run_id in runs if run_id not in by_successor]
+        for root_id in roots:
+            chain: list[tuple[int, int | None]] = []
+            current = root_id
+            source_handoff_id: int | None = None
+            local: set[int] = set()
+            while True:
+                if current in local or current in visited:
+                    raise RuntimeError("Ciclo o convergencia histórica en lineage.")
+                local.add(current)
+                visited.add(current)
+                chain.append((current, source_handoff_id))
+                next_link = by_predecessor.get(current)
+                if next_link is None:
+                    break
+                current, source_handoff_id = next_link
+
+            root = runs[root_id]
+            for run_id, _handoff_id in chain:
+                run = runs[run_id]
+                if (
+                    str(run["actor"]) != str(root["actor"])
+                    or str(run["objective"]) != str(root["objective"])
+                    or str(run["workspace_root"]) != str(root["workspace_root"])
+                ):
+                    raise RuntimeError("Linaje histórico cambia actor, objetivo o workspace.")
+            usage_by_run: dict[int, tuple[int, int, int]] = {}
+            for run_id, _handoff_id in chain:
+                usage = connection.execute(
+                    """SELECT COUNT(*) AS commands_reserved,
+                              COALESCE(SUM(is_retry), 0) AS retries_reserved,
+                              COALESCE(SUM(runtime_seconds), 0) AS runtime_reserved
+                       FROM assistant_autonomy_execution_reservations
+                       WHERE run_id=?""",
+                    (run_id,),
+                ).fetchone()
+                usage_by_run[run_id] = (
+                    int(usage["commands_reserved"]),
+                    int(usage["retries_reserved"]),
+                    int(usage["runtime_reserved"]),
+                )
+            totals = tuple(
+                sum(values[index] for values in usage_by_run.values())
+                for index in range(3)
+            )
+            try:
+                root_grant = json.loads(str(root["grant_json"]))
+                grant_limits = (
+                    int(root_grant["max_commands"]),
+                    int(root_grant["max_retries"]),
+                    int(root_grant["max_runtime_seconds"]),
+                )
+            except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+                raise RuntimeError("Grant raíz histórico inválido para lineage.") from exc
+            connection.execute(
+                """INSERT INTO assistant_autonomy_lineages(
+                       public_id, root_run_id, actor, objective, workspace_root,
+                       max_successors, max_commands_total, max_retries_total,
+                       max_runtime_seconds_total, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    secrets.token_hex(16),
+                    root_id,
+                    str(root["actor"]),
+                    str(root["objective"]),
+                    str(root["workspace_root"]),
+                    max(3, len(chain) - 1),
+                    max(grant_limits[0], totals[0]),
+                    max(grant_limits[1], totals[1]),
+                    max(grant_limits[2], totals[2]),
+                    str(root["created_at"]),
+                ),
+            )
+            lineage_id = int(connection.execute("SELECT last_insert_rowid()").fetchone()[0])
+            reserved_before = [0, 0, 0]
+            predecessor_id: int | None = None
+            for generation, (run_id, handoff_id) in enumerate(chain):
+                connection.execute(
+                    """INSERT INTO assistant_autonomy_lineage_runs(
+                           lineage_id, run_id, predecessor_run_id, source_handoff_id,
+                           generation, commands_reserved_before, retries_reserved_before,
+                           runtime_seconds_reserved_before, joined_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        lineage_id,
+                        run_id,
+                        predecessor_id,
+                        handoff_id,
+                        generation,
+                        *reserved_before,
+                        str(runs[run_id]["created_at"]),
+                    ),
+                )
+                usage = usage_by_run[run_id]
+                reserved_before = [
+                    reserved_before[index] + usage[index] for index in range(3)
+                ]
+                predecessor_id = run_id
+        if visited != set(runs):
+            raise RuntimeError("El grafo histórico successor contiene un ciclo.")
+
+    @staticmethod
+    def _validate_autonomy_lineages_phase9b2(connection: sqlite3.Connection) -> None:
+        invalid = connection.execute(
+            """SELECT 1
+               FROM assistant_autonomy_runs run
+               LEFT JOIN assistant_autonomy_lineage_runs membership
+                 ON membership.run_id=run.id
+               LEFT JOIN assistant_autonomy_lineages lineage
+                 ON lineage.id=membership.lineage_id
+               WHERE membership.id IS NULL OR lineage.id IS NULL
+                  OR run.actor!=lineage.actor
+                  OR run.objective!=lineage.objective
+                  OR run.workspace_root!=lineage.workspace_root
+               LIMIT 1"""
+        ).fetchone()
+        if invalid is not None:
+            raise RuntimeError("Cada AutonomyRun requiere un lineage exacto.")
 
     @staticmethod
     def _rebuild_cognitive_check_table(

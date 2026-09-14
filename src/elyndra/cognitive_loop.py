@@ -1126,6 +1126,11 @@ class LocalCognitiveActionLoop:
             successor = self.autonomy._successor_run_from_handoff_connection(
                 connection, row, actor=clean_actor
             )
+            lineage_snapshot = self.autonomy._successor_lineage_snapshot_connection(
+                connection,
+                predecessor_run_db_id=int(row["predecessor_run_db_id"]),
+                grant=successor.grant,
+            )
             self.autonomy._require_no_execution_gap_connection(
                 connection, str(row["run_public_id"]), actor=clean_actor
             )
@@ -1140,7 +1145,9 @@ class LocalCognitiveActionLoop:
                 raise PermissionError("La propuesta sucesora quedó obsoleta.")
 
             accepted_at = successor.grant.issued_at.isoformat()
-            self.autonomy._insert_run_connection(connection, successor)
+            successor_row = self.autonomy._insert_run_connection(
+                connection, successor, create_lineage=False
+            )
             self.autonomy._transition_connection(
                 connection,
                 str(row["run_public_id"]),
@@ -1171,6 +1178,14 @@ class LocalCognitiveActionLoop:
                 actor=clean_actor,
                 now=accepted_at,
             )
+            self.autonomy._insert_successor_lineage_membership_connection(
+                connection,
+                predecessor_run_db_id=int(row["predecessor_run_db_id"]),
+                successor_run_db_id=int(successor_row["id"]),
+                source_handoff_db_id=int(row["id"]),
+                snapshot=lineage_snapshot,
+                joined_at=accepted_at,
+            )
             accepted = self._handoff_lineage_connection(connection, clean_handoff)
             self._require_first_acceptance_invariants_connection(
                 connection, accepted, successor_run_id=successor.run_id, actor=clean_actor
@@ -1185,6 +1200,7 @@ class LocalCognitiveActionLoop:
             """SELECT h.*, w.public_id AS wait_public_id, w.state AS wait_state,
                       w.reason AS wait_reason, c.public_id AS cycle_public_id,
                       c.status AS cycle_status, c.actor AS cycle_actor,
+                      r.id AS predecessor_run_db_id,
                       r.public_id AS run_public_id, r.status AS run_status,
                       r.actor AS run_actor, successor.public_id AS successor_public_id
                FROM assistant_cognitive_successor_handoffs h

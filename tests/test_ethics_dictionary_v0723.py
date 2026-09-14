@@ -296,7 +296,7 @@ def test_schema_31_contains_tutor_review_columns(
             for row in connection.execute("PRAGMA table_info(assistant_ethics_reviews)")
         }
 
-    assert version == "61"
+    assert version == "62"
     assert {
         "confidence",
         "review_stage",

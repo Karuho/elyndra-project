@@ -120,6 +120,9 @@ def _propose(
     capabilities: list[str] | None = None,
     allowed_executables: list[str] | None = None,
     duration_seconds: int = 1800,
+    max_commands: int = 4,
+    max_retries: int = 2,
+    max_runtime_seconds: int = 20,
 ) -> dict[str, object]:
     executable = run.grant.allowed_executables[0]
     return loop.propose_successor(
@@ -135,9 +138,9 @@ def _propose(
                 [executable] if allowed_executables is None else allowed_executables
             ),
             "max_steps": 4,
-            "max_commands": 4,
-            "max_retries": 2,
-            "max_runtime_seconds": 20,
+            "max_commands": max_commands,
+            "max_retries": max_retries,
+            "max_runtime_seconds": max_runtime_seconds,
             "duration_seconds": duration_seconds,
         },
     )
@@ -493,7 +496,13 @@ def test_preexisting_gap_is_denied_even_when_proposal_fingerprint_includes_it(
         predecessor.run_id, actor="owner"
     )
     contract.prepare("run")
-    proposed = _propose(loop, predecessor, wait_id)
+    proposed = _propose(
+        loop,
+        predecessor,
+        wait_id,
+        max_commands=3,
+        max_runtime_seconds=17,
+    )
     before = _rows(database)
     with pytest.raises(PermissionError, match="intento incompleto"):
         loop.accept_successor(str(proposed["public_id"]), actor="owner")

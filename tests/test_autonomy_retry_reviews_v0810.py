@@ -600,6 +600,14 @@ def test_exact_schema_56_upgrade_preserves_data_without_fake_reviews(
         )
         connection.executescript(
             """
+            DROP TRIGGER IF EXISTS trg_autonomy_lineages_no_update;
+            DROP TRIGGER IF EXISTS trg_autonomy_lineages_no_delete;
+            DROP TRIGGER IF EXISTS trg_autonomy_lineage_runs_integrity;
+            DROP TRIGGER IF EXISTS trg_autonomy_lineage_runs_no_update;
+            DROP TRIGGER IF EXISTS trg_autonomy_lineage_runs_no_delete;
+            DROP TRIGGER IF EXISTS trg_autonomy_reservation_lineage_budget;
+            DROP TABLE assistant_autonomy_lineage_runs;
+            DROP TABLE assistant_autonomy_lineages;
             DROP TRIGGER IF EXISTS trg_cognitive_mutation_evaluate_source;
             DROP TRIGGER IF EXISTS trg_cognitive_mutation_handoff_integrity;
             DROP TRIGGER IF EXISTS trg_cognitive_mutation_handoff_no_update;
@@ -676,7 +684,7 @@ def test_exact_schema_56_upgrade_preserves_data_without_fake_reviews(
     with database.connect() as connection:
         assert connection.execute(
             "SELECT value FROM schema_meta WHERE key='schema_version'"
-        ).fetchone()[0] == "61"
+        ).fetchone()[0] == "62"
         assert connection.execute(
             "SELECT COUNT(*) FROM assistant_autonomy_retry_reviews"
         ).fetchone()[0] == 0
