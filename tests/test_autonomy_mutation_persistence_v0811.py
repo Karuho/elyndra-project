@@ -123,7 +123,7 @@ def test_fresh_vault_and_root_migrate_to_schema_61_with_vault_only_tables(
         with database.connect() as connection:
             assert connection.execute(
                 "SELECT value FROM schema_meta WHERE key='schema_version'"
-            ).fetchone()[0] == "63"
+            ).fetchone()[0] == "64"
 
     assert "assistant_autonomy_mutation_proposals" not in _table_names(root)
     assert "assistant_autonomy_mutation_items" not in _table_names(root)
@@ -158,7 +158,7 @@ def test_schema_59_to_61_preserves_autonomy_rows_and_is_idempotent(
     with database.connect() as connection:
         assert connection.execute(
             "SELECT value FROM schema_meta WHERE key='schema_version'"
-        ).fetchone()[0] == "63"
+        ).fetchone()[0] == "64"
         assert connection.execute(
             "SELECT COUNT(*) FROM assistant_autonomy_runs WHERE public_id=?",
             (run.run_id,),

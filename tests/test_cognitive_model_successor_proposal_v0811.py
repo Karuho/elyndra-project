@@ -224,7 +224,7 @@ def test_model_origin_is_immutable_and_schema63_is_vault_only(tmp_path: Path) ->
     with database.connect() as connection:
         assert connection.execute(
             "SELECT value FROM schema_meta WHERE key='schema_version'"
-        ).fetchone()[0] == "63"
+        ).fetchone()[0] == "64"
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
     root = Database(tmp_path / "root.sqlite3", role="root")
     root.migrate()
@@ -232,7 +232,7 @@ def test_model_origin_is_immutable_and_schema63_is_vault_only(tmp_path: Path) ->
     with root.connect() as connection:
         assert connection.execute(
             "SELECT value FROM schema_meta WHERE key='schema_version'"
-        ).fetchone()[0] == "63"
+        ).fetchone()[0] == "64"
         assert connection.execute(
             "SELECT 1 FROM sqlite_master "
             "WHERE name='assistant_cognitive_model_successor_origins'"
@@ -281,7 +281,7 @@ def test_schema62_to_63_preserves_owner_handoffs_without_invented_origin(
     with database.connect() as connection:
         assert connection.execute(
             "SELECT value FROM schema_meta WHERE key='schema_version'"
-        ).fetchone()[0] == "63"
+        ).fetchone()[0] == "64"
         assert connection.execute(
             "SELECT COUNT(*) FROM assistant_cognitive_model_successor_origins"
         ).fetchone()[0] == 0

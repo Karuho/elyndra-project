@@ -240,7 +240,7 @@ def test_schema61_target_keeps_mutation_foundation_vault_only_and_idempotent(
             connection.execute(
                 "SELECT value FROM schema_meta WHERE key='schema_version'"
             ).fetchone()[0]
-            == "63"
+            == "64"
         )
     assert not {
         "assistant_autonomy_mutation_attempts",

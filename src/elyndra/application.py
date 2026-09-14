@@ -22,7 +22,7 @@ from elyndra.alexandria import (
 from elyndra.attachments import AttachmentRepository
 from elyndra.audit import AuditRepository
 from elyndra.automation import AutomationRepository, automation_query
-from elyndra.autonomy import RunPlan
+from elyndra.autonomy import PublicProjectMutationPolicy, RunPlan
 from elyndra.canonical import canonical_answer
 from elyndra.change_proposals import (
     AssistantChangePlanner,
@@ -499,6 +499,9 @@ class ElyndraApplication:
                 database,
                 language_engine=language_engine,
                 memory=tiered_memory,
+                mutation_workspace_policy=PublicProjectMutationPolicy(
+                    (Path(__file__).resolve(strict=True).parent,)
+                ),
             )
             if database.role == "vault"
             else None

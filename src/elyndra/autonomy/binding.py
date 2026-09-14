@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hmac
+import re
 from datetime import UTC, datetime
 from typing import Any
 
@@ -51,6 +53,7 @@ _STEP_KEYS_V1 = frozenset(
 )
 
 _STEP_KEYS_V2 = _STEP_KEYS_V1 | {"command"}
+_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
 class ExecutionBindingError(PermissionError):
@@ -193,6 +196,9 @@ class AutonomyExecutionBinding:
         approved_step_ids = _approved_step_ids(
             item,
             plan=plan,
+            repository=self.repository,
+            run_id=trusted_run_id,
+            actor=trusted_actor,
         )
 
         if started_at < created_at:
@@ -227,6 +233,9 @@ def _approved_step_ids(
     item: dict[str, Any],
     *,
     plan: RunPlan,
+    repository: AutonomyRepository,
+    run_id: str,
+    actor: str,
 ) -> frozenset[str]:
     events = item.get("events")
     gates = item.get("human_gates")
@@ -353,6 +362,18 @@ def _approved_step_ids(
                 "rechazado o cancelado."
             )
 
+        if kind is HumanGateKind.MUTATION_REVIEW:
+            _validate_approved_mutation_review(
+                repository,
+                events=events,
+                gate_id=gate_id,
+                run_id=run_id,
+                actor=actor,
+            )
+            # Specialized mutation approval validates publication lineage only.
+            # It never grants ordinary gated-step execution authority.
+            continue
+
         evidence = request_events.get(gate_id)
         if evidence is None:
             raise ExecutionBindingError(
@@ -395,6 +416,140 @@ def _approved_step_ids(
         approved.add(step_id)
 
     return frozenset(approved)
+
+
+def _validate_approved_mutation_review(
+    repository: AutonomyRepository,
+    *,
+    events: list[dict[str, Any]],
+    gate_id: str,
+    run_id: str,
+    actor: str,
+) -> None:
+    specialized = [
+        event
+        for event in events
+        if event.get("event_type")
+        in {"mutation_review_requested", "mutation_review_approved"}
+    ]
+    for event in specialized:
+        payload = event.get("payload")
+        if not isinstance(payload, dict):
+            raise ExecutionBindingError("Audit MUTATION_REVIEW sin payload válido.")
+        _required_str(payload.get("gate_id"), "mutation gate_id", 128)
+    requests = [
+        event
+        for event in events
+        if event.get("event_type") == "mutation_review_requested"
+        and isinstance(event.get("payload"), dict)
+        and event["payload"].get("gate_id") == gate_id
+    ]
+    approvals = [
+        event
+        for event in events
+        if event.get("event_type") == "mutation_review_approved"
+        and isinstance(event.get("payload"), dict)
+        and event["payload"].get("gate_id") == gate_id
+    ]
+    if len(requests) != 1 or len(approvals) != 1:
+        raise ExecutionBindingError(
+            "MUTATION_REVIEW aprobada requiere audit especializado exacto."
+        )
+    request, approval = requests[0], approvals[0]
+    request_payload = request["payload"]
+    approval_payload = approval["payload"]
+    assert isinstance(request_payload, dict) and isinstance(approval_payload, dict)
+    if frozenset(request_payload) != {
+        "proposal_id",
+        "proposal_sha256",
+        "gate_id",
+        "step_id",
+        "state",
+    } or frozenset(approval_payload) != {
+        "proposal_id",
+        "proposal_sha256",
+        "gate_id",
+        "step_id",
+        "decision",
+    }:
+        raise ExecutionBindingError("Payload especializado MUTATION_REVIEW inválido.")
+    request_sequence = _positive_int(request.get("sequence"), "mutation request sequence")
+    approval_sequence = _positive_int(
+        approval.get("sequence"), "mutation approval sequence"
+    )
+    request_step = _required_str(request.get("step_id"), "mutation step_id", 64)
+    approval_step = _required_str(approval.get("step_id"), "mutation step_id", 64)
+    proposal_id = _required_str(
+        request_payload.get("proposal_id"), "mutation proposal_id", 128
+    )
+    approval_proposal_id = _required_str(
+        approval_payload.get("proposal_id"), "mutation proposal_id", 128
+    )
+    proposal_sha256 = _required_sha256(
+        request_payload.get("proposal_sha256"), "mutation proposal_sha256"
+    )
+    approval_sha256 = _required_sha256(
+        approval_payload.get("proposal_sha256"), "mutation proposal_sha256"
+    )
+    if not (
+        request_sequence < approval_sequence
+        and request.get("from_status") == AutonomyRunStatus.RUNNING.value
+        and request.get("to_status") == AutonomyRunStatus.WAITING_HUMAN.value
+        and approval.get("from_status") == AutonomyRunStatus.WAITING_HUMAN.value
+        and approval.get("to_status") == AutonomyRunStatus.WAITING_HUMAN.value
+        and request_payload.get("state") == HumanGateStatus.PENDING.value
+        and approval_payload.get("decision") == HumanGateStatus.APPROVED.value
+        and request_payload.get("step_id") == request_step
+        and approval_payload.get("step_id") == approval_step
+        and request_step == approval_step
+        and proposal_id == approval_proposal_id
+        and hmac.compare_digest(proposal_sha256, approval_sha256)
+    ):
+        raise ExecutionBindingError("Audit especializado MUTATION_REVIEW inconsistente.")
+    with repository.database.connect() as connection:
+        rows = connection.execute(
+            """SELECT binding.gate_id,binding.step_id AS binding_step_id,
+                      binding.actor AS binding_actor,
+                      binding.proposal_id,
+                      binding.proposal_public_id AS binding_proposal_public_id,
+                      binding.proposal_sha256 AS binding_proposal_sha256,
+                      proposal.id AS durable_proposal_id,
+                      proposal.public_id AS proposal_public_id,
+                      proposal.proposal_sha256 AS proposal_sha256,
+                      proposal.step_id AS proposal_step_id,
+                      proposal.actor AS proposal_actor,proposal.run_id,
+                      run.id AS durable_run_id,run.actor AS run_actor,
+                      gate.kind,gate.status
+               FROM assistant_autonomy_mutation_gate_bindings binding
+               JOIN assistant_autonomy_mutation_proposals proposal
+                 ON proposal.id=binding.proposal_id
+               JOIN assistant_autonomy_runs run ON run.id=binding.run_id
+                 AND proposal.run_id=run.id
+               JOIN assistant_autonomy_human_gates gate ON gate.public_id=binding.gate_id
+                 AND gate.run_id=run.id
+               WHERE run.public_id=? AND binding.gate_id=?""",
+            (run_id, gate_id),
+        ).fetchall()
+    if len(rows) != 1:
+        raise ExecutionBindingError("MUTATION_REVIEW sin linaje durable exacto.")
+    lineage = rows[0]
+    if not (
+        str(lineage["gate_id"]) == gate_id
+        and str(lineage["kind"]) == HumanGateKind.MUTATION_REVIEW.value
+        and str(lineage["status"]) == HumanGateStatus.APPROVED.value
+        and int(lineage["proposal_id"]) == int(lineage["durable_proposal_id"])
+        and str(lineage["binding_proposal_public_id"]) == proposal_id
+        and str(lineage["proposal_public_id"]) == proposal_id
+        and str(lineage["binding_proposal_sha256"]) == proposal_sha256
+        and str(lineage["proposal_sha256"]) == proposal_sha256
+        and str(lineage["binding_step_id"]) == request_step
+        and str(lineage["proposal_step_id"]) == request_step
+        and int(lineage["run_id"]) == int(lineage["durable_run_id"])
+        and str(lineage["binding_actor"]) == actor
+        and str(lineage["proposal_actor"]) == actor
+        and str(lineage["run_actor"]) == actor
+    ):
+        raise ExecutionBindingError("Linaje durable MUTATION_REVIEW inconsistente.")
 
 
 def _rebuild_grant(raw: object) -> CapabilityGrant:
@@ -593,6 +748,20 @@ def _exact_int(value: object, label: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int):
         raise ExecutionBindingError(f"{label} debe ser un entero.")
     return value
+
+
+def _positive_int(value: object, label: str) -> int:
+    result = _exact_int(value, label)
+    if result <= 0:
+        raise ExecutionBindingError(f"{label} debe ser positivo.")
+    return result
+
+
+def _required_sha256(value: object, label: str) -> str:
+    result = _required_str(value, label, 64)
+    if not _SHA256_RE.fullmatch(result):
+        raise ExecutionBindingError(f"{label} debe ser SHA-256 hexadecimal minúsculo.")
+    return result
 
 
 def _required_str(value: object, label: str, maximum: int) -> str:

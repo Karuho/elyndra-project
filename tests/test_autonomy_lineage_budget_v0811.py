@@ -624,14 +624,14 @@ def test_schema62_is_vault_only_and_idempotent(tmp_path: Path) -> None:
     with root.connect() as connection:
         assert connection.execute(
             "SELECT value FROM schema_meta WHERE key='schema_version'"
-        ).fetchone()[0] == "63"
+        ).fetchone()[0] == "64"
         assert connection.execute(
             "SELECT 1 FROM sqlite_master WHERE name='assistant_autonomy_lineages'"
         ).fetchone() is None
     with vault.connect() as connection:
         assert connection.execute(
             "SELECT value FROM schema_meta WHERE key='schema_version'"
-        ).fetchone()[0] == "63"
+        ).fetchone()[0] == "64"
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
 
 

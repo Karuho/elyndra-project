@@ -234,12 +234,29 @@ class PersistedMutationProposal:
     public_id: str
     request_key: str
     proposal: MutationProposal
+    proposal_origin: str = "owner"
+    source_model_turn_id: str | None = None
+    model_reply_sha256: str | None = None
+    source_snapshot_sha256: str | None = None
 
     def __post_init__(self) -> None:
         _required_exact(self.public_id, "public_id", 128)
         _required_exact(self.request_key, "request_key", 128)
         if not isinstance(self.proposal, MutationProposal):
             raise TypeError("proposal debe ser MutationProposal.")
+        if self.proposal_origin not in {"owner", "model"}:
+            raise ValueError("proposal_origin inválido.")
+        provenance = (
+            self.source_model_turn_id,
+            self.model_reply_sha256,
+            self.source_snapshot_sha256,
+        )
+        if self.proposal_origin == "owner" and any(value is not None for value in provenance):
+            raise ValueError("Propuesta owner no admite provenance del modelo.")
+        if self.proposal_origin == "model":
+            _required_exact(self.source_model_turn_id, "source_model_turn_id", 128)
+            _require_sha256(self.model_reply_sha256, "model_reply_sha256")
+            _require_sha256(self.source_snapshot_sha256, "source_snapshot_sha256")
 
 
 @dataclass(frozen=True, slots=True)

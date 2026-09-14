@@ -6,6 +6,22 @@ import secrets
 import sqlite3
 from contextlib import suppress
 from pathlib import Path
+from types import TracebackType
+
+
+class _ClosingSQLiteConnection(sqlite3.Connection):
+    """Apply SQLite transaction context semantics, then release the handle."""
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> bool:
+        try:
+            return bool(super().__exit__(exc_type, exc_value, traceback))
+        finally:
+            self.close()
 
 
 class Database:
@@ -17,12 +33,16 @@ class Database:
 
     def connect(self) -> sqlite3.Connection:
         self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        connection = sqlite3.connect(self.path)
-        connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA foreign_keys = ON")
-        connection.execute("PRAGMA journal_mode = WAL")
-        connection.execute("PRAGMA synchronous = NORMAL")
-        return connection
+        connection = sqlite3.connect(self.path, factory=_ClosingSQLiteConnection)
+        try:
+            connection.row_factory = sqlite3.Row
+            connection.execute("PRAGMA foreign_keys = ON")
+            connection.execute("PRAGMA journal_mode = WAL")
+            connection.execute("PRAGMA synchronous = NORMAL")
+            return connection
+        except BaseException:
+            connection.close()
+            raise
 
     def connect_mutation_durable(self) -> sqlite3.Connection:
         """Open a vault connection with FULL durability before any transaction."""
@@ -2386,8 +2406,9 @@ class Database:
                 self._migrate_cognitive_mutation_handoff_phase9a6(connection)
                 self._migrate_autonomy_lineage_phase9b2(connection)
                 self._migrate_cognitive_model_successor_phase9b3(connection)
+                self._migrate_cognitive_model_mutation_phase9b4(connection)
             connection.execute(
-                "INSERT OR REPLACE INTO schema_meta(key, value) VALUES('schema_version', '63')"
+                "INSERT OR REPLACE INTO schema_meta(key, value) VALUES('schema_version', '64')"
             )
         with suppress(PermissionError):
             self.path.chmod(0o600)
@@ -4763,6 +4784,66 @@ class Database:
         violations = connection.execute("PRAGMA foreign_key_check").fetchall()
         if violations:
             raise RuntimeError("Schema 63 dejó referencias foráneas inválidas.")
+
+    @staticmethod
+    def _migrate_cognitive_model_mutation_phase9b4(
+        connection: sqlite3.Connection,
+    ) -> None:
+        """Install immutable provenance for model-authored mutation proposals."""
+
+        connection.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS assistant_cognitive_model_mutation_origins (
+                id INTEGER PRIMARY KEY,
+                proposal_id INTEGER NOT NULL UNIQUE,
+                source_turn_id INTEGER NOT NULL UNIQUE,
+                proposal_sha256 TEXT NOT NULL CHECK(
+                    length(proposal_sha256)=64
+                    AND proposal_sha256 NOT GLOB '*[^0-9a-f]*'),
+                model_reply_sha256 TEXT NOT NULL CHECK(
+                    length(model_reply_sha256)=64
+                    AND model_reply_sha256 NOT GLOB '*[^0-9a-f]*'),
+                source_snapshot_sha256 TEXT NOT NULL CHECK(
+                    length(source_snapshot_sha256)=64
+                    AND source_snapshot_sha256 NOT GLOB '*[^0-9a-f]*'),
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(proposal_id)
+                    REFERENCES assistant_autonomy_mutation_proposals(id)
+                    ON DELETE RESTRICT,
+                FOREIGN KEY(source_turn_id)
+                    REFERENCES assistant_cognitive_turns(id)
+                    ON DELETE RESTRICT
+            );
+
+            CREATE TRIGGER IF NOT EXISTS trg_cognitive_model_mutation_origin_integrity
+            BEFORE INSERT ON assistant_cognitive_model_mutation_origins
+            WHEN NOT EXISTS (
+                SELECT 1
+                FROM assistant_autonomy_mutation_proposals proposal
+                JOIN assistant_cognitive_turns turn ON turn.id=NEW.source_turn_id
+                JOIN assistant_cognitive_cycles cycle ON cycle.id=turn.cycle_id
+                WHERE proposal.id=NEW.proposal_id
+                  AND proposal.proposal_sha256=NEW.proposal_sha256
+                  AND turn.kind IN ('reason','evaluate')
+                  AND turn.state='completed'
+                  AND turn.decision='execute_next'
+                  AND turn.step_id=proposal.step_id
+                  AND cycle.autonomy_run_id=proposal.run_id
+            )
+            BEGIN SELECT RAISE(ABORT, 'cognitive_model_mutation_origin_invalid'); END;
+
+            CREATE TRIGGER IF NOT EXISTS trg_cognitive_model_mutation_origin_no_update
+            BEFORE UPDATE ON assistant_cognitive_model_mutation_origins
+            BEGIN SELECT RAISE(ABORT, 'cognitive_model_mutation_origin_immutable'); END;
+
+            CREATE TRIGGER IF NOT EXISTS trg_cognitive_model_mutation_origin_no_delete
+            BEFORE DELETE ON assistant_cognitive_model_mutation_origins
+            BEGIN SELECT RAISE(ABORT, 'cognitive_model_mutation_origin_immutable'); END;
+            """
+        )
+        violations = connection.execute("PRAGMA foreign_key_check").fetchall()
+        if violations:
+            raise RuntimeError("Schema 64 dejó referencias foráneas inválidas.")
 
     @staticmethod
     def _backfill_autonomy_lineages_phase9b2(connection: sqlite3.Connection) -> None:

@@ -312,7 +312,7 @@ def test_schema61_and_no_generic_events_disclose_content(tmp_path: Path) -> None
     with database.connect() as connection:
         assert connection.execute(
             "SELECT value FROM schema_meta WHERE key='schema_version'"
-        ).fetchone()[0] == "63"
+        ).fetchone()[0] == "64"
         payloads = "".join(
             str(row[0])
             for row in connection.execute("SELECT payload_json FROM assistant_autonomy_events")
@@ -1080,6 +1080,11 @@ def test_manifest_inode_replacement_fails_closed(
                 if path.is_dir()
             )
             manifest = attempt_dir / "manifest.jsonl"
+
+            # Keep the original inode allocated so the replacement cannot
+            # nondeterministically reuse the same inode on Linux.
+            held_manifest = tmp_path / "held-original-manifest"
+            held_manifest.hardlink_to(manifest)
             manifest.unlink()
             manifest.write_text("foreign\n")
             manifest.chmod(0o600)

@@ -68,6 +68,10 @@ from elyndra.autonomy.workspace_lease import (
     WorkspaceLeaseMode,
     WorkspaceLeaseReceipt,
 )
+from elyndra.autonomy.workspace_policy import (
+    MutationWorkspacePolicy,
+    PublicProjectMutationPolicy,
+)
 
 __all__ = [
     "AutonomyExecutionBinding",
@@ -105,8 +109,10 @@ __all__ = [
     "MutationOperation",
     "MutationProposal",
     "MutationReviewRecord",
+    "MutationWorkspacePolicy",
     "PersistedMutationProposal",
     "PreparedExecution",
+    "PublicProjectMutationPolicy",
     "RunPlan",
     "RunStep",
     "WorkspaceScope",
