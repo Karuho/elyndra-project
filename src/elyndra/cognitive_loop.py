@@ -1236,6 +1236,10 @@ class LocalCognitiveActionLoop:
             "assistant_autonomy_execution_results",
             "assistant_autonomy_human_gates",
             "assistant_autonomy_retry_reviews",
+            "assistant_autonomy_mutation_proposals",
+            "assistant_autonomy_mutation_gate_bindings",
+            "assistant_autonomy_mutation_attempts",
+            "assistant_cognitive_mutation_handoffs",
             "assistant_cognitive_cycles",
         )
         for table in forbidden:
@@ -1252,6 +1256,23 @@ class LocalCognitiveActionLoop:
             (successor_db_id,),
         ).fetchone():
             raise PermissionError("El sucesor heredó consumo retry prohibido.")
+        mutation_children = (
+            """SELECT 1 FROM assistant_autonomy_mutation_items item
+               JOIN assistant_autonomy_mutation_proposals proposal
+                 ON proposal.id=item.proposal_id
+               WHERE proposal.run_id=? LIMIT 1""",
+            """SELECT 1 FROM assistant_autonomy_mutation_attempt_files file
+               JOIN assistant_autonomy_mutation_attempts attempt
+                 ON attempt.id=file.attempt_id
+               WHERE attempt.run_id=? LIMIT 1""",
+            """SELECT 1 FROM assistant_autonomy_mutation_results result
+               JOIN assistant_autonomy_mutation_attempts attempt
+                 ON attempt.id=result.attempt_id
+               WHERE attempt.run_id=? LIMIT 1""",
+        )
+        for query in mutation_children:
+            if connection.execute(query, (successor_db_id,)).fetchone():
+                raise PermissionError("El sucesor heredó estado mutation prohibido.")
 
     def continue_abandoned_action(
         self, wait_id: str, *, actor: str

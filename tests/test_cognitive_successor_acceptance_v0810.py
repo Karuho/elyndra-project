@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 
+import elyndra.autonomy.repository as repository_module
 import elyndra.cognitive_loop as cognitive_module
 from elyndra.autonomy import (
     AutonomyExecutionBinding,
@@ -17,6 +18,9 @@ from elyndra.autonomy import (
     Capability,
     CapabilityGrant,
     CommandSpec,
+    MutationItem,
+    MutationOperation,
+    MutationProposal,
     RunPlan,
     RunStep,
     WorkspaceScope,
@@ -42,35 +46,44 @@ class _Memory:
         return type("Recall", (), {"items": []})()
 
 
-def _fixture(tmp_path: Path) -> tuple[Database, LocalCognitiveActionLoop, AutonomyRun, str]:
+def _fixture(
+    tmp_path: Path,
+    *,
+    capabilities: frozenset[Capability] = frozenset({Capability.PROCESS_EXEC}),
+    duration_seconds: int = 1800,
+    include_self_modify_step: bool = False,
+) -> tuple[Database, LocalCognitiveActionLoop, AutonomyRun, str]:
     workspace = tmp_path / "project"
     workspace.mkdir()
     executable = str(Path(sys.executable).resolve(strict=True))
     now = datetime.now(UTC)
+    process_step = RunStep(
+        step_id="run",
+        capability=Capability.PROCESS_EXEC,
+        action="run tests",
+        target=".",
+        command=CommandSpec(
+            executable=executable,
+            argv=(executable, "-c", "print('ok')"),
+            cwd=".",
+            timeout_seconds=3,
+        ),
+    )
     plan = RunPlan(
         objective="Inspect project",
         steps=(
-            RunStep(
-                step_id="run",
-                capability=Capability.PROCESS_EXEC,
-                action="run tests",
-                target=".",
-                command=CommandSpec(
-                    executable=executable,
-                    argv=(executable, "-c", "print('ok')"),
-                    cwd=".",
-                    timeout_seconds=3,
-                ),
-            ),
+            (_self_modify_step(), process_step)
+            if include_self_modify_step
+            else (process_step,)
         ),
     )
     run = AutonomyRun(
         actor="owner",
         workspace=WorkspaceScope.from_root(workspace),
         grant=CapabilityGrant(
-            capabilities=frozenset({Capability.PROCESS_EXEC}),
+            capabilities=capabilities,
             issued_at=now,
-            expires_at=now + timedelta(minutes=30),
+            expires_at=now + timedelta(seconds=duration_seconds),
             max_steps=4,
             max_commands=4,
             max_retries=2,
@@ -99,7 +112,14 @@ def _fixture(tmp_path: Path) -> tuple[Database, LocalCognitiveActionLoop, Autono
 
 
 def _propose(
-    loop: LocalCognitiveActionLoop, run: AutonomyRun, wait_id: str
+    loop: LocalCognitiveActionLoop,
+    run: AutonomyRun,
+    wait_id: str,
+    *,
+    plan: RunPlan | None = None,
+    capabilities: list[str] | None = None,
+    allowed_executables: list[str] | None = None,
+    duration_seconds: int = 1800,
 ) -> dict[str, object]:
     executable = run.grant.allowed_executables[0]
     return loop.propose_successor(
@@ -108,16 +128,28 @@ def _propose(
         request_key="acceptance-request",
         objective=run.plan.objective,
         workspace_root=str(run.workspace.root),
-        plan=run.plan,
+        plan=plan or run.plan,
         grant_spec={
-            "capabilities": ["process.exec"],
-            "allowed_executables": [executable],
+            "capabilities": capabilities or ["process.exec"],
+            "allowed_executables": (
+                [executable] if allowed_executables is None else allowed_executables
+            ),
             "max_steps": 4,
             "max_commands": 4,
             "max_retries": 2,
             "max_runtime_seconds": 20,
-            "duration_seconds": 1800,
+            "duration_seconds": duration_seconds,
         },
+    )
+
+
+def _self_modify_step() -> RunStep:
+    return RunStep(
+        step_id="modify",
+        capability=Capability.SELF_MODIFY,
+        action="apply reviewed patch",
+        target="src/generated.py",
+        requires_human_gate=True,
     )
 
 
@@ -180,7 +212,10 @@ def test_happy_acceptance_is_one_complete_handoff(tmp_path: Path) -> None:
         assert grant[key] == spec[key]
     issued = datetime.fromisoformat(grant["issued_at"])
     expires = datetime.fromisoformat(grant["expires_at"])
-    assert int((expires - issued).total_seconds()) == spec["duration_seconds"]
+    assert expires == min(
+        issued + timedelta(seconds=spec["duration_seconds"]),
+        predecessor.grant.expires_at,
+    )
     assert grant["allowed_hosts"] == []
 
     predecessor_row = loop.autonomy.get(predecessor.run_id)
@@ -215,6 +250,10 @@ def test_happy_acceptance_is_one_complete_handoff(tmp_path: Path) -> None:
             ("assistant_autonomy_execution_results", "run_id"),
             ("assistant_autonomy_human_gates", "run_id"),
             ("assistant_autonomy_retry_reviews", "run_id"),
+            ("assistant_autonomy_mutation_proposals", "run_id"),
+            ("assistant_autonomy_mutation_gate_bindings", "run_id"),
+            ("assistant_autonomy_mutation_attempts", "run_id"),
+            ("assistant_cognitive_mutation_handoffs", "run_id"),
             ("assistant_cognitive_cycles", "autonomy_run_id"),
         ):
             assert connection.execute(
@@ -226,6 +265,174 @@ def test_happy_acceptance_is_one_complete_handoff(tmp_path: Path) -> None:
                WHERE rr.run_id=?""",
             (successor_db_id,),
         ).fetchone()[0] == 0
+
+
+def test_accepts_fresh_successor_with_process_and_supervised_self_modify(
+    tmp_path: Path,
+) -> None:
+    database, loop, predecessor, wait_id = _fixture(
+        tmp_path,
+        capabilities=frozenset({Capability.PROCESS_EXEC, Capability.SELF_MODIFY}),
+    )
+    plan = RunPlan(
+        objective=predecessor.plan.objective,
+        steps=(*predecessor.plan.steps, _self_modify_step()),
+    )
+    proposed = _propose(
+        loop,
+        predecessor,
+        wait_id,
+        plan=plan,
+        capabilities=["process.exec", "self.modify"],
+    )
+    accepted = loop.accept_successor(str(proposed["public_id"]), actor="owner")
+    successor = loop.autonomy.get(str(accepted["successor_run_id"]))
+    assert successor is not None
+    assert successor["status"] == "planned"
+    assert successor["grant"]["capabilities"] == ["process.exec", "self.modify"]
+    with database.connect() as connection:
+        successor_db_id = connection.execute(
+            "SELECT id FROM assistant_autonomy_runs WHERE public_id=?",
+            (accepted["successor_run_id"],),
+        ).fetchone()[0]
+        for query in (
+            "SELECT 1 FROM assistant_autonomy_mutation_proposals WHERE run_id=?",
+            "SELECT 1 FROM assistant_autonomy_mutation_gate_bindings WHERE run_id=?",
+            "SELECT 1 FROM assistant_autonomy_mutation_attempts WHERE run_id=?",
+            "SELECT 1 FROM assistant_cognitive_mutation_handoffs WHERE run_id=?",
+        ):
+            assert connection.execute(query, (successor_db_id,)).fetchone() is None
+
+
+def test_self_modify_successor_does_not_inherit_predecessor_mutation_state(
+    tmp_path: Path,
+) -> None:
+    database, loop, predecessor, wait_id = _fixture(
+        tmp_path,
+        capabilities=frozenset({Capability.PROCESS_EXEC, Capability.SELF_MODIFY}),
+        include_self_modify_step=True,
+    )
+    proposal = MutationProposal(
+        run_id=predecessor.run_id,
+        step_id="modify",
+        actor="owner",
+        workspace_root=str(predecessor.workspace.root),
+        items=(
+            MutationItem(
+                "src/generated.py",
+                MutationOperation.CREATE,
+                False,
+                None,
+                None,
+                b"VALUE = 1\n",
+            ),
+        ),
+        created_at=predecessor.grant.issued_at,
+        expires_at=predecessor.grant.issued_at + timedelta(minutes=20),
+    )
+    loop.autonomy.create_mutation_proposal(
+        proposal, request_key="predecessor-mutation", actor="owner"
+    )
+    successor_plan = RunPlan(
+        objective=predecessor.plan.objective,
+        steps=(_self_modify_step(),),
+    )
+    proposed = _propose(
+        loop,
+        predecessor,
+        wait_id,
+        plan=successor_plan,
+        capabilities=["self.modify"],
+        allowed_executables=[],
+    )
+    accepted = loop.accept_successor(str(proposed["public_id"]), actor="owner")
+    with database.connect() as connection:
+        predecessor_db_id = connection.execute(
+            "SELECT id FROM assistant_autonomy_runs WHERE public_id=?",
+            (predecessor.run_id,),
+        ).fetchone()[0]
+        successor_db_id = connection.execute(
+            "SELECT id FROM assistant_autonomy_runs WHERE public_id=?",
+            (accepted["successor_run_id"],),
+        ).fetchone()[0]
+        assert connection.execute(
+            "SELECT COUNT(*) FROM assistant_autonomy_mutation_proposals WHERE run_id=?",
+            (predecessor_db_id,),
+        ).fetchone()[0] == 1
+        assert connection.execute(
+            "SELECT COUNT(*) FROM assistant_autonomy_mutation_proposals WHERE run_id=?",
+            (successor_db_id,),
+        ).fetchone()[0] == 0
+
+
+@pytest.mark.parametrize(
+    ("capabilities", "self_modify_only"),
+    ((["process.exec"], False), (["self.modify"], True)),
+)
+def test_combined_predecessor_accepts_attenuated_successor(
+    tmp_path: Path,
+    capabilities: list[str],
+    self_modify_only: bool,
+) -> None:
+    _database, loop, predecessor, wait_id = _fixture(
+        tmp_path,
+        capabilities=frozenset({Capability.PROCESS_EXEC, Capability.SELF_MODIFY}),
+    )
+    plan = (
+        RunPlan(objective=predecessor.plan.objective, steps=(_self_modify_step(),))
+        if self_modify_only
+        else predecessor.plan
+    )
+    proposed = _propose(
+        loop,
+        predecessor,
+        wait_id,
+        plan=plan,
+        capabilities=capabilities,
+        allowed_executables=[] if self_modify_only else None,
+    )
+    accepted = loop.accept_successor(str(proposed["public_id"]), actor="owner")
+    successor = loop.autonomy.get(str(accepted["successor_run_id"]))
+    assert successor is not None
+    assert successor["status"] == "planned"
+    assert successor["grant"]["capabilities"] == capabilities
+    assert successor["grant"]["allowed_executables"] == (
+        [] if self_modify_only else list(predecessor.grant.allowed_executables)
+    )
+
+
+def test_successor_expiry_is_clipped_to_predecessor_absolute_expiry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _database, loop, predecessor, wait_id = _fixture(tmp_path)
+    proposed = _propose(loop, predecessor, wait_id)
+    acceptance_time = predecessor.grant.expires_at - timedelta(seconds=2)
+    monkeypatch.setattr(repository_module, "_utcnow", lambda: acceptance_time)
+    accepted = loop.accept_successor(str(proposed["public_id"]), actor="owner")
+    successor = loop.autonomy.get(str(accepted["successor_run_id"]))
+    assert successor is not None
+    grant = successor["grant"]
+    assert datetime.fromisoformat(grant["issued_at"]) == acceptance_time
+    assert datetime.fromisoformat(grant["expires_at"]) == predecessor.grant.expires_at
+    assert datetime.fromisoformat(grant["expires_at"]) - acceptance_time == timedelta(
+        seconds=2
+    )
+
+
+def test_expired_predecessor_cannot_mint_successor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database, loop, predecessor, wait_id = _fixture(tmp_path)
+    proposed = _propose(loop, predecessor, wait_id)
+    monkeypatch.setattr(
+        repository_module,
+        "_utcnow",
+        lambda: predecessor.grant.expires_at,
+    )
+    before = _rows(database)
+    with pytest.raises(PermissionError, match="expiró"):
+        loop.accept_successor(str(proposed["public_id"]), actor="owner")
+    assert _rows(database) == before
 
 
 def test_accepted_replay_is_read_only_after_start_and_missing_workspace(
@@ -331,8 +538,8 @@ def test_candidate_identity_tampering_is_rejected_by_schema(
         )
 
 
-@pytest.mark.parametrize("defect", ("host", "fractional_duration"))
-def test_accepted_replay_rejects_host_or_inexact_duration_authority(
+@pytest.mark.parametrize("defect", ("host", "fractional_duration", "capability"))
+def test_accepted_replay_rejects_tampered_authority(
     tmp_path: Path, defect: str
 ) -> None:
     database, loop, predecessor, wait_id = _fixture(tmp_path)
@@ -340,7 +547,11 @@ def test_accepted_replay_rejects_host_or_inexact_duration_authority(
     issued = datetime.now(UTC)
     extra = timedelta(microseconds=1) if defect == "fractional_duration" else timedelta()
     bad_grant = CapabilityGrant(
-        capabilities=frozenset({Capability.PROCESS_EXEC}),
+        capabilities=frozenset(
+            {Capability.PROCESS_EXEC, Capability.SELF_MODIFY}
+            if defect == "capability"
+            else {Capability.PROCESS_EXEC}
+        ),
         issued_at=issued,
         expires_at=issued + timedelta(seconds=1800) + extra,
         max_steps=4,

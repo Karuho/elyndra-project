@@ -51,6 +51,7 @@ def _fixture(
     max_steps: int = 4,
     max_commands: int = 4,
     extra_executable: bool = False,
+    capabilities: frozenset[Capability] = frozenset({Capability.PROCESS_EXEC}),
 ) -> tuple[Database, LocalCognitiveActionLoop, AutonomyRun, str]:
     workspace = tmp_path / "project"
     workspace.mkdir()
@@ -65,7 +66,7 @@ def _fixture(
         actor="owner",
         workspace=WorkspaceScope.from_root(workspace),
         grant=CapabilityGrant(
-            capabilities=frozenset({Capability.PROCESS_EXEC}),
+            capabilities=capabilities,
             issued_at=now,
             expires_at=now + timedelta(seconds=duration_seconds),
             max_steps=max_steps,
@@ -113,6 +114,31 @@ def _plan(objective: str, executable: str, *, cwd: str = ".", timeout: int = 3) 
             ),
         ),
     )
+
+
+def _self_modify_step(*, requires_human_gate: bool = True) -> RunStep:
+    return RunStep(
+        step_id="modify",
+        capability=Capability.SELF_MODIFY,
+        action="apply reviewed patch",
+        target="src/generated.py",
+        requires_human_gate=requires_human_gate,
+    )
+
+
+def _successor_plan(
+    objective: str,
+    executable: str,
+    capabilities: frozenset[Capability],
+    *,
+    self_modify_gate: bool = True,
+) -> RunPlan:
+    steps: list[RunStep] = []
+    if Capability.PROCESS_EXEC in capabilities:
+        steps.extend(_plan(objective, executable).steps)
+    if Capability.SELF_MODIFY in capabilities:
+        steps.append(_self_modify_step(requires_human_gate=self_modify_gate))
+    return RunPlan(objective=objective, steps=tuple(steps))
 
 
 def _grant(executable: str, **changes: object) -> dict[str, object]:
@@ -184,6 +210,135 @@ def test_happy_proposal_is_metadata_only_and_canonical(tmp_path: Path) -> None:
         assert connection.execute(
             "SELECT COUNT(*) FROM assistant_autonomy_runs"
         ).fetchone()[0] == 1
+
+
+@pytest.mark.parametrize(
+    ("capabilities", "allowed_executables"),
+    (
+        (
+            frozenset({Capability.PROCESS_EXEC, Capability.SELF_MODIFY}),
+            "inherited",
+        ),
+        (frozenset({Capability.PROCESS_EXEC}), "inherited"),
+        (frozenset({Capability.SELF_MODIFY}), "empty"),
+    ),
+)
+def test_successor_capabilities_are_exact_attenuated_plan_authority(
+    tmp_path: Path,
+    capabilities: frozenset[Capability],
+    allowed_executables: str,
+) -> None:
+    _database, loop, run, wait_id = _fixture(
+        tmp_path,
+        capabilities=frozenset({Capability.PROCESS_EXEC, Capability.SELF_MODIFY}),
+    )
+    executable = run.grant.allowed_executables[0]
+    executables = [executable] if allowed_executables == "inherited" else []
+    proposed = _propose(
+        loop,
+        run,
+        wait_id,
+        plan=_successor_plan(run.plan.objective, executable, capabilities),
+        grant=_grant(
+            executable,
+            capabilities=sorted(capability.value for capability in capabilities),
+            allowed_executables=executables,
+        ),
+    )
+    assert proposed["grant_spec"]["capabilities"] == sorted(
+        capability.value for capability in capabilities
+    )
+    assert proposed["grant_spec"]["allowed_executables"] == executables
+
+
+def test_successor_cannot_gain_or_carry_disallowed_capabilities(tmp_path: Path) -> None:
+    _database, loop, run, wait_id = _fixture(tmp_path)
+    executable = run.grant.allowed_executables[0]
+    with pytest.raises(PermissionError):
+        _propose(
+            loop,
+            run,
+            wait_id,
+            plan=_successor_plan(
+                run.plan.objective,
+                executable,
+                frozenset({Capability.PROCESS_EXEC, Capability.SELF_MODIFY}),
+            ),
+            grant=_grant(executable, capabilities=["process.exec", "self.modify"]),
+        )
+    for capability in (
+        Capability.NETWORK_MODEL.value,
+        Capability.GIT_COMMIT.value,
+        Capability.GITHUB_PR.value,
+        Capability.BACKGROUND_RUN.value,
+        Capability.WORKSPACE_READ.value,
+        "future.unknown",
+    ):
+        with pytest.raises(PermissionError):
+            _propose(
+                loop,
+                run,
+                wait_id,
+                key=f"disallowed-{capability}",
+                grant=_grant(executable, capabilities=[capability]),
+            )
+
+
+def test_self_modify_successor_requires_gate_and_exact_capabilities(tmp_path: Path) -> None:
+    _database, loop, run, wait_id = _fixture(
+        tmp_path,
+        capabilities=frozenset({Capability.PROCESS_EXEC, Capability.SELF_MODIFY}),
+    )
+    executable = run.grant.allowed_executables[0]
+    with pytest.raises(PermissionError, match="HumanGate"):
+        _propose(
+            loop,
+            run,
+            wait_id,
+            plan=_successor_plan(
+                run.plan.objective,
+                executable,
+                frozenset({Capability.SELF_MODIFY}),
+                self_modify_gate=False,
+            ),
+            grant=_grant(
+                executable,
+                capabilities=["self.modify"],
+                allowed_executables=[],
+            ),
+        )
+    with pytest.raises(PermissionError, match="coincidir exactamente"):
+        _propose(
+            loop,
+            run,
+            wait_id,
+            key="unused-authority",
+            grant=_grant(executable, capabilities=["process.exec", "self.modify"]),
+        )
+
+
+def test_request_key_replay_rejects_different_capabilities(tmp_path: Path) -> None:
+    _database, loop, run, wait_id = _fixture(
+        tmp_path,
+        capabilities=frozenset({Capability.PROCESS_EXEC, Capability.SELF_MODIFY}),
+    )
+    first = _propose(loop, run, wait_id)
+    executable = run.grant.allowed_executables[0]
+    with pytest.raises(PermissionError, match="request_key"):
+        _propose(
+            loop,
+            run,
+            wait_id,
+            plan=_successor_plan(
+                run.plan.objective, executable, frozenset({Capability.SELF_MODIFY})
+            ),
+            grant=_grant(
+                executable,
+                capabilities=["self.modify"],
+                allowed_executables=[],
+            ),
+        )
+    assert loop.successor_handoff(str(first["public_id"]), actor="owner") == first
 
 
 def test_objective_and_workspace_must_be_exact(tmp_path: Path) -> None:
@@ -575,3 +730,17 @@ def test_multiple_executables_have_deterministic_canonical_order(tmp_path: Path)
     assert proposed["grant_spec"]["allowed_executables"] == sorted(
         run.grant.allowed_executables
     )
+
+
+def test_successor_executable_allowlist_cannot_expand(tmp_path: Path) -> None:
+    _database, loop, run, wait_id = _fixture(tmp_path)
+    with pytest.raises(PermissionError, match="grant predecesor"):
+        _propose(
+            loop,
+            run,
+            wait_id,
+            grant=_grant(
+                run.grant.allowed_executables[0],
+                allowed_executables=[str(Path("/bin/echo").resolve(strict=True))],
+            ),
+        )

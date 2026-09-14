@@ -2180,10 +2180,20 @@ class AutonomyRepository:
             plan, workspace=candidate_workspace, grant_spec=canonical_grant
         )
         issued_at = _utcnow()
+        if predecessor_grant.is_expired(at=issued_at):
+            raise PermissionError("El grant predecesor expiró antes de la aceptación.")
+        requested_expires_at = issued_at + timedelta(
+            seconds=canonical_grant["duration_seconds"]
+        )
+        expires_at = min(requested_expires_at, predecessor_grant.expires_at)
+        if expires_at <= issued_at:
+            raise PermissionError("No queda vigencia positiva para el grant sucesor.")
         grant = CapabilityGrant(
-            capabilities=frozenset({Capability.PROCESS_EXEC}),
+            capabilities=frozenset(
+                Capability(value) for value in canonical_grant["capabilities"]
+            ),
             issued_at=issued_at,
-            expires_at=issued_at + timedelta(seconds=canonical_grant["duration_seconds"]),
+            expires_at=expires_at,
             max_steps=canonical_grant["max_steps"],
             max_commands=canonical_grant["max_commands"],
             max_retries=canonical_grant["max_retries"],
@@ -2223,6 +2233,10 @@ class AutonomyRepository:
         ):
             raise PermissionError("Snapshots inmutables del sucesor no coinciden.")
         grant = _grant_from_json(str(successor["grant_json"]))
+        predecessor = self._owned_run(
+            connection, str(row["run_public_id"]), actor=actor
+        )
+        predecessor_grant = _grant_from_json(str(predecessor["grant_json"]))
         authority = {
             "capabilities": sorted(item.value for item in grant.capabilities),
             "allowed_executables": list(grant.allowed_executables),
@@ -2242,11 +2256,15 @@ class AutonomyRepository:
                 "max_runtime_seconds",
             )
         }
-        duration = grant.expires_at - grant.issued_at
+        expected_expires_at = min(
+            grant.issued_at + timedelta(seconds=stored_grant["duration_seconds"]),
+            predecessor_grant.expires_at,
+        )
         if (
             authority != expected
             or grant.allowed_hosts != ()
-            or duration != timedelta(seconds=stored_grant["duration_seconds"])
+            or grant.issued_at >= predecessor_grant.expires_at
+            or grant.expires_at != expected_expires_at
         ):
             raise PermissionError("Autoridad durable del sucesor no coincide.")
         if _plan_data(_plan_from_json(str(successor["plan_json"]))) != stored_plan:
@@ -4336,8 +4354,11 @@ def _validate_successor_grant_spec(
     raw: dict[str, Any], *, predecessor_grant: CapabilityGrant
 ) -> dict[str, Any]:
     canonical = _canonicalize_successor_grant_spec(raw)
-    if Capability.PROCESS_EXEC not in predecessor_grant.capabilities:
-        raise PermissionError("El predecesor no concede process.exec.")
+    successor_capabilities = frozenset(
+        Capability(value) for value in canonical["capabilities"]
+    )
+    if not successor_capabilities <= predecessor_grant.capabilities:
+        raise PermissionError("El sucesor no puede ampliar capabilities del predecesor.")
     if any(
         value not in predecessor_grant.allowed_executables
         for value in canonical["allowed_executables"]
@@ -4432,13 +4453,15 @@ def _canonicalize_successor_grant_spec(raw: dict[str, Any]) -> dict[str, Any]:
         normalized_capabilities = sorted(Capability(value).value for value in capabilities)
     except (TypeError, ValueError) as exc:
         raise PermissionError("Capability sucesora inválida.") from exc
-    if normalized_capabilities != [Capability.PROCESS_EXEC.value]:
-        raise PermissionError("Phase 8B solo admite exactamente process.exec.")
-    if not executables:
-        raise ValueError("allowed_executables requiere rutas exactas no vacías.")
+    permitted = frozenset({Capability.PROCESS_EXEC, Capability.SELF_MODIFY})
+    capability_set = frozenset(Capability(value) for value in normalized_capabilities)
+    if not capability_set or not capability_set <= permitted:
+        raise PermissionError("Capability sucesora fuera del conjunto permitido.")
+    if Capability.PROCESS_EXEC not in capability_set and executables:
+        raise PermissionError("Sin process.exec, allowed_executables debe estar vacío.")
     # CapabilityGrant performs the existing exact lexical executable validation.
     normalized_executables = CapabilityGrant(
-        capabilities=frozenset({Capability.PROCESS_EXEC}),
+        capabilities=capability_set,
         issued_at=datetime(2000, 1, 1, tzinfo=UTC),
         expires_at=datetime(2000, 1, 2, tzinfo=UTC),
         max_steps=1,
@@ -4472,15 +4495,26 @@ def _validate_successor_plan(
 ) -> None:
     if not 1 <= len(plan.steps) <= min(int(grant_spec["max_steps"]), 4):
         raise PermissionError("El plan sucesor excede max_steps.")
+    granted = frozenset(Capability(value) for value in grant_spec["capabilities"])
+    if plan.required_capabilities != granted:
+        raise PermissionError(
+            "Las capabilities sucesoras deben coincidir exactamente con el RunPlan."
+        )
     allowed = frozenset(grant_spec["allowed_executables"])
     for step in plan.steps:
-        if step.capability is not Capability.PROCESS_EXEC or step.command is None:
-            raise PermissionError("Todos los steps sucesores deben ser process.exec.")
-        if step.command.executable not in allowed:
-            raise PermissionError("Ejecutable del plan fuera del grant_spec.")
-        if step.command.timeout_seconds > int(grant_spec["max_runtime_seconds"]):
-            raise PermissionError("Timeout del plan excede max_runtime_seconds.")
-        workspace.resolve(step.command.cwd)
+        if step.capability is Capability.PROCESS_EXEC:
+            if step.command is None:
+                raise PermissionError("process.exec sucesor requiere CommandSpec.")
+            if step.command.executable not in allowed:
+                raise PermissionError("Ejecutable del plan fuera del grant_spec.")
+            if step.command.timeout_seconds > int(grant_spec["max_runtime_seconds"]):
+                raise PermissionError("Timeout del plan excede max_runtime_seconds.")
+            workspace.resolve(step.command.cwd)
+        elif step.capability is Capability.SELF_MODIFY:
+            if not step.requires_human_gate:
+                raise PermissionError("self.modify sucesor requiere HumanGate explícito.")
+        else:
+            raise PermissionError("Capability del plan sucesor no permitida.")
 
 
 def _public_event(event: dict[str, Any]) -> dict[str, Any]:
